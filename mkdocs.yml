@@ -1,3 +1,18 @@
 site_name: lab-actions
 plugins:
   - techdocs-core
+exclude_docs: |
+  superpowers/
+  handoffs/
+  proposals/
+  audits/
+  design/
+  plans/
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+  links:
+    unrecognized_links: warn
+nav:
+  - Overview: index.md

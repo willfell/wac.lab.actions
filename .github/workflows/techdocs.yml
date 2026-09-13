@@ -1,0 +1,52 @@
+name: techdocs
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      mkdocs: ${{ steps.probe.outputs.mkdocs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: probe
+        run: |
+          set -euo pipefail
+          if [ -f mkdocs.yml ]; then
+            echo "mkdocs=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mkdocs=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no mkdocs.yml in this repo, so the docs gate has nothing to check"
+          fi
+
+  gate:
+    needs: detect
+    if: needs.detect.outputs.mkdocs == 'true'
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ github.job_workflow_sha }}
+          path: .techdocs-gate
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: Nav matches the fleet category standard
+        run: bash .techdocs-gate/scripts/check-docs-nav.sh mkdocs.yml
+      - name: Strict TechDocs build
+        run: |
+          set -euo pipefail
+          uvx --from mkdocs-techdocs-core==1.6.1 --with mkdocs==1.6.0 \
+            mkdocs build --strict --site-dir "${RUNNER_TEMP}/site"
