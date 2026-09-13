@@ -74,8 +74,9 @@ def check(path):
                 fail(f"exclude_docs is missing the standing entry `{tree}`")
 
     for i, ln in enumerate(lines, 1):
-        if ln.lstrip().startswith("#"):
-            fail(f"line {i} is a comment; this file carries config and nothing else")
+        bare = re.sub(r"'[^']*'|\"[^\"]*\"", "", ln)
+        if "#" in bare:
+            fail(f"line {i} carries a comment; this file is config and nothing else")
 
     if "validation:" not in body:
         fail(
@@ -89,6 +90,19 @@ def check(path):
             ):
                 fail(f"validation block is missing `{section}.{key}: {level}`")
 
+    order = [
+        ln.split(":")[0]
+        for ln in lines
+        if re.match(r"^[a-z_]+:", ln)
+    ]
+    expected = ["site_name", "plugins", "exclude_docs", "validation", "nav"]
+    present = [k for k in order if k in expected]
+    if present != [k for k in expected if k in present]:
+        fail(
+            "top-level keys are out of order; the standing shape is "
+            + " -> ".join(expected)
+        )
+
     try:
         start = next(i for i, ln in enumerate(lines) if re.match(r"^nav:\s*$", ln))
     except StopIteration:
@@ -98,54 +112,75 @@ def check(path):
     seen = []
     pages = {}
     current = None
+    cat_indent = None
+    child_indent = None
     for ln in lines[start + 1:]:
         if ln.strip() == "":
             continue
         if not ln.startswith(" "):
             break
-        child = re.match(r"^ {6}- ([^:]+):(.*)$", ln)
-        if child:
-            title, target = child.group(1).strip(), child.group(2).strip()
-            if not target:
-                fail(
-                    f"`{title}` under `{current}` is a sub-group; categories are one "
-                    "level deep, and per-repo sub-grouping is the divergence the "
-                    "fixed categories exist to stop"
-                )
-            else:
-                pages.setdefault(target, []).append(current)
-            continue
-        if re.match(r"^ {7,}", ln):
-            fail(f"nav is nested deeper than one level: {ln!r}")
-            continue
-
-        m = re.match(r"^  - ([^:]+):(.*)$", ln)
+        m = re.match(r"^( +)- (.*)$", ln)
         if not m:
-            if re.match(r"^ {3,}", ln):
+            if re.match(r"^ +\S", ln):
                 continue
             fail(f"nav entry is not in the standard shape: {ln!r}")
             continue
-        name, rest = m.group(1).strip(), m.group(2).strip()
-        if name not in CATEGORIES:
+        indent, rest_raw = len(m.group(1)), m.group(2)
+        km = re.match(r"^([^:]+):(.*)$", rest_raw)
+        if not km:
+            fail(f"nav entry is not a `- Title: path` mapping: {ln!r}")
+            continue
+        name, rest = km.group(1).strip(), km.group(2).strip()
+
+        if cat_indent is None:
+            cat_indent = indent
+        if indent == cat_indent:
+            if name not in CATEGORIES:
+                fail(
+                    f"`{name}` is not one of the seven categories "
+                    f"({', '.join(CATEGORIES)}); categories are fixed, not per-repo"
+                )
+                continue
+            if name in seen:
+                fail(f"`{name}` appears more than once")
+                continue
+            if name == "Overview" and rest != "index.md":
+                got = rest if rest else "a nested group"
+                fail(
+                    f"Overview must be the flat mapping `- Overview: index.md`, got {got}"
+                )
+            if name != "Overview" and rest:
+                fail(
+                    f"`{name}` must be a group with pages nested under it, not a single page"
+                )
+            seen.append(name)
+            current = name
+            child_indent = None
+            if name == "Overview" and rest:
+                pages.setdefault(rest, []).append(name)
+            continue
+
+        if indent < cat_indent:
+            fail(f"nav entry is outdented past its category: {ln!r}")
+            continue
+
+        if child_indent is None:
+            child_indent = indent
+        if indent > child_indent:
             fail(
-                f"`{name}` is not one of the seven categories "
-                f"({', '.join(CATEGORIES)}); categories are fixed, not per-repo",
+                f"`{name}` is nested below `{current}` more than one level deep; "
+                "per-repo sub-grouping is the divergence the fixed categories exist "
+                "to stop"
             )
             continue
-        if name in seen:
-            fail(f"`{name}` appears more than once")
-            continue
-        if name == "Overview" and rest != "index.md":
-            got = rest if rest else "a nested group"
+        if not rest:
             fail(
-                f"Overview must be the flat mapping `- Overview: index.md`, got {got}"
+                f"`{name}` under `{current}` is a sub-group; categories are one "
+                "level deep, and per-repo sub-grouping is the divergence the "
+                "fixed categories exist to stop"
             )
-        if name != "Overview" and rest:
-            fail(f"`{name}` must be a group with pages nested under it, not a single page")
-        seen.append(name)
-        current = name
-        if name == "Overview" and rest:
-            pages.setdefault(rest, []).append(name)
+            continue
+        pages.setdefault(rest, []).append(current)
 
     for target, cats in pages.items():
         if len(cats) > 1:
