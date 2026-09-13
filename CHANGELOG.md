@@ -19,6 +19,7 @@ Reading the table:
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.12.0` | 2026-09-13 | `techdocs` | new reusable workflow running the pinned strict MkDocs build and the fleet nav-category check |
 | `v1.11.0` | 2026-09-12 | `lab-gitops-deploy` | new optional `extra_images` input pins additional images inside the commit-back retry loop |
 | `v1.10.8` | 2026-09-07 | `lab-gitops-deploy` | `argo-await-sync` proves a frozen hook by the Job itself |
 | `v1.10.7` | 2026-09-07 | `lab-gitops-deploy` | `argo-await-sync` trusts the hook, not the operation's initiator |

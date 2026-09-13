@@ -44,6 +44,13 @@ jobs:
     permissions:
       contents: read
 
+  techdocs:
+    uses: ./.github/workflows/techdocs.yml
+    with:
+      runner: lab-actions
+    permissions:
+      contents: read
+
   smoke:
     runs-on: lab-actions
     steps:
