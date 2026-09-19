@@ -56,6 +56,7 @@ jobs:
         working-directory: ${{ inputs.app_dir }}
     steps:
       - name: Require a bucket
+        working-directory: .
         env:
           BUCKET: ${{ inputs.bucket || secrets.s3_bucket }}
         run: |
@@ -81,6 +82,18 @@ jobs:
             fi
           fi
           command -v yarn >/dev/null 2>&1 || sudo npm install -g yarn
+      - name: Provide the aws CLI the sync and invalidation steps shell out to
+        working-directory: .
+        run: |
+          set -eu
+          if ! command -v aws >/dev/null 2>&1; then
+            tmp="$(mktemp -d)"
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "$tmp/awscliv2.zip"
+            unzip -q "$tmp/awscliv2.zip" -d "$tmp"
+            sudo "$tmp/aws/install"
+            rm -rf "$tmp"
+          fi
+          aws --version
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
