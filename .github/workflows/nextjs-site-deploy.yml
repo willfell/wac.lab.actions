@@ -65,6 +65,22 @@ jobs:
             exit 1
           fi
       - uses: actions/checkout@v4
+      - name: Provide the yarn setup-node's cache probe shells out to
+        run: |
+          set -eu
+          install=""
+          command -v node >/dev/null 2>&1 || install=yes
+          command -v npm >/dev/null 2>&1 || install=yes
+          if [ -n "$install" ]; then
+            if command -v apt-get >/dev/null 2>&1; then
+              export DEBIAN_FRONTEND=noninteractive
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends nodejs npm
+            else
+              echo "::warning::node/npm absent and no apt-get here; setup-node's yarn cache probe will fail"
+            fi
+          fi
+          command -v yarn >/dev/null 2>&1 || sudo npm install -g yarn
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
