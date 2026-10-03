@@ -81,6 +81,13 @@ drop_line() {
   rewrite '$0 != line { print }' -v line="$1"
 }
 
+# rewrite_catalog_description TEXT: set the fixture Component's description.
+rewrite_catalog_description() {
+  awk -v d="$1" '/^  description:/ { print "  description: \"" d "\""; next } { print }' \
+    "$repo/catalog-info.yaml" >"$workdir/catalog.tmp"
+  mv "$workdir/catalog.tmp" "$repo/catalog-info.yaml"
+}
+
 snapshot() {
   cp "$repo/AGENTS.md" "$workdir/before"
 }
@@ -140,6 +147,18 @@ same() {
   fi
 }
 
+# rendered: render, as most cases do to get a valid tail before breaking one
+# thing. A render that fails here is reported, not left to abort the run.
+rendered() {
+  local status=0
+  gate render || status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "  FAIL: render exited $status"
+    sed 's/^/      /' "$workdir/out"
+    failures=$((failures + 1))
+  fi
+}
+
 # passes / fails: run check and assert its exit code.
 passes() {
   local status=0
@@ -166,7 +185,7 @@ render_refuses() {
 # --------------------------------------------------------------------------
 echo "a rendered repo passes"
 setup basic
-gate render
+rendered
 passes
 contains "reports ok" "agents-md check: ok"
 same "the fleet rules are copied verbatim" \
@@ -175,7 +194,7 @@ teardown
 
 echo "render is idempotent"
 setup basic
-gate render
+rendered
 snapshot
 status=0
 gate render || status=$?
@@ -209,9 +228,9 @@ teardown
 echo "render replaces only the tail"
 setup basic
 prose="$(cat "$repo/AGENTS.md")"
-gate render
+rendered
 printf '    - resource:ecosystem-postgres\n' >>"$repo/catalog-info.yaml"
-gate render
+rendered
 cp "$repo/AGENTS.md" "$workdir/out"
 contains "picks up the catalog change" "- Depends on: \`resource:ecosystem-postgres\`, \`resource:traefik\`"
 rendered="$(cat "$repo/AGENTS.md")"
@@ -225,7 +244,7 @@ teardown
 
 echo "a multi-Component catalog renders one block per Component, in file order"
 setup multi
-gate render
+rendered
 passes
 same "the Dependencies section matches expected-dependencies.md" \
   "$(cat "$FIXTURES/multi/expected-dependencies.md")" \
@@ -242,7 +261,7 @@ teardown
 
 echo "a symlinked AGENTS.md fails, and render will not write through it"
 setup basic
-gate render
+rendered
 mv "$repo/AGENTS.md" "$repo/real.md"
 ln -s real.md "$repo/AGENTS.md"
 fails
@@ -257,7 +276,7 @@ teardown
 
 echo "no catalog-info.yaml fails"
 setup basic
-gate render
+rendered
 rm "$repo/catalog-info.yaml"
 fails
 contains "names the missing catalog" "::error file=catalog-info.yaml::no \`catalog-info.yaml\`"
@@ -266,7 +285,7 @@ teardown
 for shape in empty separators resource-only; do
   echo "a catalog with no Component fails, and render refuses it: $shape"
   setup basic
-  gate render
+  rendered
   case "$shape" in
     empty) : >"$repo/catalog-info.yaml" ;;
     separators) printf -- '---\n---\n' >"$repo/catalog-info.yaml" ;;
@@ -294,7 +313,7 @@ malformed() {
   local label="$1" needle="$2"
   echo "a malformed catalog is a finding, not a traceback: $label"
   setup basic
-  gate render
+  rendered
   cat >"$repo/catalog-info.yaml"
   fails
   contains "annotates the catalog" "::error file=catalog-info.yaml::"
@@ -365,10 +384,48 @@ kind: Component
 metadata: {name: [unclosed
 EOF
 
+malformed "a name YAML reads as a number" "\`metadata.name\` is 123, which YAML reads as int, not a string; quote it" <<'EOF'
+kind: Component
+metadata:
+  name: 123
+spec:
+  type: service
+EOF
+
+echo "YAML 1.1 boolean words stay strings, as Backstage's YAML 1.2 parser reads them"
+setup basic
+cat >"$repo/catalog-info.yaml" <<'EOF'
+kind: Component
+metadata:
+  name: on
+spec:
+  type: service
+  dependsOn:
+    - no
+    - yes
+EOF
+rendered
+passes
+cp "$repo/AGENTS.md" "$workdir/out"
+contains "renders the name as written" "### Component \`on\`"
+contains "renders bare refs as written" "- Depends on: \`component:no\`, \`component:yes\`"
+contains "links the name as written" "https://docs.wacwini.com/catalog/default/component/on"
+teardown
+
+echo "a catalog description that would read as a heading is refused, not written"
+setup basic
+rendered
+rewrite_catalog_description "# Not a heading"
+render_refuses
+contains "says the tail would not survive a second render" "would not survive a second render"
+fails
+contains "check reports the same" "would not survive a second render"
+teardown
+
 # --------------------------------------------------------------------------
 echo "a tracked root CLAUDE.md fails"
 setup basic
-gate render
+rendered
 echo "# old context" >"$repo/CLAUDE.md"
 git -C "$repo" add CLAUDE.md
 fails
@@ -377,7 +434,7 @@ teardown
 
 echo "a tracked nested CLAUDE.md fails"
 setup basic
-gate render
+rendered
 mkdir -p "$repo/app/.claude"
 echo "# old context" >"$repo/app/CLAUDE.md"
 echo "# old context" >"$repo/app/.claude/CLAUDE.md"
@@ -389,7 +446,7 @@ teardown
 
 echo "an untracked CLAUDE.md is ignored"
 setup basic
-gate render
+rendered
 mkdir -p "$repo/.worktrees/old-branch"
 echo "# old context" >"$repo/.worktrees/old-branch/CLAUDE.md"
 echo "# local only" >"$repo/CLAUDE.md"
@@ -399,7 +456,7 @@ teardown
 
 echo "a tracked CLAUDE.local.md fails"
 setup basic
-gate render
+rendered
 echo "# local context" >"$repo/CLAUDE.local.md"
 git -C "$repo" add CLAUDE.local.md
 fails
@@ -409,7 +466,7 @@ teardown
 # --------------------------------------------------------------------------
 echo "a missing H1 fails"
 setup basic
-gate render
+rendered
 drop_line "# fixture-basic"
 fails
 contains "says the file must open with its H1" "must open with its one H1"
@@ -417,7 +474,7 @@ teardown
 
 echo "a second H1 fails"
 setup basic
-gate render
+rendered
 insert_before "## Layout" "# Another title" ""
 fails
 contains "names the extra H1" "extra H1 \`# Another title\`"
@@ -425,7 +482,7 @@ teardown
 
 echo "a missing required section fails"
 setup basic
-gate render
+rendered
 drop_line "## Boundaries"
 fails
 contains "names the section" "missing required section \`## Boundaries\`"
@@ -433,7 +490,7 @@ teardown
 
 echo "required sections out of order fail"
 setup basic
-gate render
+rendered
 rewrite '$0 == "## Layout" { print "## Invariants"; next } $0 == "## Invariants" { print "## Layout"; next } { print }'
 fails
 contains "says out of order" "\`## Layout\` is out of order"
@@ -441,7 +498,7 @@ teardown
 
 echo "a section after Fleet rules fails, and render will not overwrite it"
 setup basic
-gate render
+rendered
 printf '\n## Notes\n\nHand-written, after the generated tail.\n' >>"$repo/AGENTS.md"
 fails
 contains "names the section" "\`## Notes\` comes after \`## Fleet rules\`"
@@ -452,7 +509,7 @@ teardown
 
 echo "a section between Dependencies and Fleet rules fails, and render will not overwrite it"
 setup basic
-gate render
+rendered
 insert_before "## Fleet rules" "## Notes" "" "Hand-written, inside the generated tail." ""
 fails
 contains "names the section" "\`## Notes\` comes after \`## Dependencies\`"
@@ -462,16 +519,54 @@ teardown
 
 echo "a setext H2 after the tail is a section too"
 setup basic
-gate render
+rendered
 printf '\nMy notes\n--------\n\nHand-written.\n' >>"$repo/AGENTS.md"
 fails
 contains "names the section" "\`## My notes\` comes after \`## Fleet rules\`"
 render_refuses
 teardown
 
+echo "a hand-written Dependencies section is never overwritten"
+setup basic
+printf '\n## Dependencies\n\n### Upstream\n\nHand-written notes on what this repo leans on.\n' >>"$repo/AGENTS.md"
+render_refuses
+contains "render says the section is hand-written" "was not written by render"
+fails
+contains "check reports the same" "was not written by render"
+lacks "check does not also ask for a re-render" "is not what \`render\` writes"
+teardown
+
+echo "bare Dependencies and Fleet rules headings are an outline, and render fills them"
+setup basic
+printf '\n## Dependencies\n\n## Fleet rules\n' >>"$repo/AGENTS.md"
+status=0
+gate render || status=$?
+check "render exits 0" 0 "$status"
+passes "check passes after render"
+teardown
+
+echo "hand edits inside a generated tail are overwritten by render, after check has failed on them"
+setup basic
+rendered
+insert_before "Incoming edges (what depends on this repo) are not listed here. They live in the catalog at docs.wacwini.com." \
+  "### Hand-added" "" "A paragraph render did not write." ""
+fails
+contains "check diffs the hand edit out" "-### Hand-added"
+status=0
+gate render || status=$?
+check "render exits 0" 0 "$status"
+if grep -qF "Hand-added" "$repo/AGENTS.md"; then
+  echo "  FAIL: render kept the hand edit"
+  failures=$((failures + 1))
+else
+  echo "  ok: render replaced the generated tail"
+fi
+passes "check passes after render"
+teardown
+
 echo "an unclosed code fence fails, and render will not guess"
 setup basic
-gate render
+rendered
 line="$(grep -n '^## Layout$' "$repo/AGENTS.md" | cut -d: -f1)"
 rewrite '{ print } $0 == "## Layout" { print ""; print "```sh"; print "npm run build" }'
 fails
@@ -479,9 +574,37 @@ contains "names the opening line" "unclosed code fence opened at line $((line + 
 render_refuses
 teardown
 
+echo "a paragraph line underlined with --- or === is a heading"
+setup basic
+rendered
+rewrite '$0 == "## Boundaries" { print "Boundaries"; print "----------"; next } { print }'
+passes "a setext Boundaries satisfies the contract"
+teardown
+setup basic
+rendered
+insert_before "## Layout" "Another title" "=============" ""
+fails
+contains "a setext H1 is an extra H1" "extra H1 \`# Another title\`"
+teardown
+
+echo "a --- under a list item and its continuation line is a rule, not a heading"
+setup basic
+rendered
+rewrite '{ print } $0 == "## Commands" { print ""; print "- run these from the repo root,"; print "  and nowhere else"; print "---" }'
+passes
+lacks "no false Commands finding" "has no fenced shell block"
+teardown
+
+echo "a --- under a blank line is a rule, not a heading"
+setup basic
+rendered
+rewrite '{ print } $0 == "## Commands" { print ""; print "Run these from the repo root."; print ""; print "---" }'
+passes
+teardown
+
 echo "a # line inside the Commands fence is not an H1"
 setup basic
-gate render
+rendered
 add_command "# a note about the commands, not a heading"
 passes
 lacks "reports no extra H1" "extra H1"
@@ -490,13 +613,13 @@ teardown
 # --------------------------------------------------------------------------
 echo "a UTF-8 BOM fails with its own finding, and render strips it"
 setup basic
-gate render
+rendered
 { printf '\357\273\277'; cat "$repo/AGENTS.md"; } >"$workdir/bom"
 mv "$workdir/bom" "$repo/AGENTS.md"
 fails
 contains "names the BOM" "starts with a UTF-8 BOM"
 lacks "the BOM does not hide the H1" "must open with its one H1"
-gate render
+rendered
 if [ "$(head -c 3 "$repo/AGENTS.md" | od -An -tx1 | tr -d ' ')" = "efbbbf" ]; then
   echo "  FAIL: render kept the BOM"
   failures=$((failures + 1))
@@ -508,13 +631,13 @@ teardown
 
 echo "CRLF line endings fail with their own finding, and render converts them"
 setup basic
-gate render
+rendered
 awk '{ printf "%s\r\n", $0 }' "$repo/AGENTS.md" >"$workdir/crlf"
 mv "$workdir/crlf" "$repo/AGENTS.md"
 fails
 contains "names CRLF" "AGENTS.md has CRLF line endings"
 lacks "line endings alone produce no diff finding" "is not what \`render\` writes"
-gate render
+rendered
 check "render leaves no CR" 0 "$(tr -cd '\r' <"$repo/AGENTS.md" | wc -c | tr -d ' ')"
 passes "check passes after render"
 teardown
@@ -522,18 +645,18 @@ teardown
 # --------------------------------------------------------------------------
 echo "stale dependencies fail until re-rendered"
 setup basic
-gate render
+rendered
 printf '    - resource:ecosystem-postgres\n' >>"$repo/catalog-info.yaml"
 fails
 contains "says the file is not what render writes" "AGENTS.md is not what \`render\` writes"
 contains "diffs the new dependency in" "+- Depends on: \`resource:ecosystem-postgres\`, \`resource:traefik\`"
-gate render
+rendered
 passes "re-render makes it pass"
 teardown
 
 echo "stale fleet rules fail until re-rendered from the new rules"
 setup basic
-gate render
+rendered
 mkdir -p "$workdir/gate/scripts"
 cp "$SUBJECT" "$workdir/gate/scripts/agents-md.py"
 cp -R "$RULES_DIR" "$workdir/gate/agents-md"
@@ -543,7 +666,7 @@ GATE_SCRIPT="$workdir/gate/scripts/agents-md.py" gate check || status=$?
 check "the newer gate fails the old tail" 1 "$status"
 contains "says the file is not what render writes" "AGENTS.md is not what \`render\` writes"
 contains "diffs the new rule in" "+7. A rule added upstream."
-GATE_SCRIPT="$workdir/gate/scripts/agents-md.py" gate render
+GATE_SCRIPT="$workdir/gate/scripts/agents-md.py" rendered
 status=0
 GATE_SCRIPT="$workdir/gate/scripts/agents-md.py" gate check || status=$?
 check "re-rendering from the newer gate passes it" 0 "$status"
@@ -553,7 +676,7 @@ teardown
 
 echo "a hand-edited tail fails"
 setup basic
-gate render
+rendered
 printf '7. A hand-written rule.\n' >>"$repo/AGENTS.md"
 fails
 contains "says the file is not what render writes" "AGENTS.md is not what \`render\` writes"
@@ -563,7 +686,7 @@ teardown
 # --------------------------------------------------------------------------
 echo "Commands with no fenced shell block fails"
 setup basic
-gate render
+rendered
 rewrite '$0 == "```sh" { skip = 1; next } skip && $0 == "```" { skip = 0; next } !skip { print }'
 fails
 contains "names the section" "\`## Commands\` has no fenced shell block"
@@ -571,7 +694,7 @@ teardown
 
 echo "Commands whose only fence is text fails"
 setup basic
-gate render
+rendered
 rewrite '$0 == "```sh" { print "```text"; next } { print }'
 fails
 contains "names the section" "\`## Commands\` has no fenced shell block"
@@ -579,14 +702,14 @@ teardown
 
 echo "a non-shell fence in Commands is not checked"
 setup basic
-gate render
+rendered
 insert_before "## Layout" '```yaml' "npm run nope" '```' ""
 passes
 teardown
 
 echo "a console fence checks its prompt lines and skips their output"
 setup basic
-gate render
+rendered
 insert_before "## Layout" '```console' '$ npm run nope' "npm run also-nope" '```' ""
 fails
 contains "checks the prompt line" "\`npm run nope\`: \`package.json\` has no \`nope\` script"
@@ -595,7 +718,7 @@ teardown
 
 echo "an unresolved npm run fails"
 setup basic
-gate render
+rendered
 add_command "npm run nope"
 fails
 contains "names the script" "\`package.json\` has no \`nope\` script"
@@ -603,12 +726,12 @@ teardown
 
 echo "cd app && npm test resolves inside app/, not at the root"
 setup basic
-gate render
+rendered
 add_command "cd app && npm test && npm start"
 passes
 teardown
 setup basic
-gate render
+rendered
 add_command "npm test"
 fails "the same script at the root exits 1"
 contains "names the root package.json" "\`package.json\` has no \`test\` script"
@@ -616,7 +739,7 @@ teardown
 
 echo "cd into a missing directory fails"
 setup basic
-gate render
+rendered
 add_command "cd missing && npm test"
 fails
 contains "names the directory" "\`cd missing\`: \`missing\` is not a directory holding any tracked file"
@@ -624,12 +747,12 @@ teardown
 
 echo "pushd moves into a directory and popd moves back"
 setup basic
-gate render
+rendered
 add_command "pushd app && npm test && popd && npm run lint"
 passes
 teardown
 setup basic
-gate render
+rendered
 add_command "pushd app && popd && npm test"
 fails "a script only app/ has fails after popd"
 contains "resolves at the root after popd" "\`package.json\` has no \`test\` script"
@@ -637,7 +760,7 @@ teardown
 
 echo "a line with a placeholder is skipped"
 setup basic
-gate render
+rendered
 add_command "npm run <script-name>"
 add_command "cd <stack> && make <target>"
 passes
@@ -645,7 +768,7 @@ teardown
 
 echo "an unknown command passes"
 setup basic
-gate render
+rendered
 add_command "kubectl get pods -A"
 add_command "tofu init && tofu plan"
 add_command "npm ci"
@@ -654,12 +777,12 @@ teardown
 
 echo "make resolves targets present in the Makefile and fails on absent ones"
 setup basic
-gate render
+rendered
 add_command "make build test"
 passes "present targets exit 0"
 teardown
 setup basic
-gate render
+rendered
 add_command "make deploy"
 fails "an absent target exits 1"
 contains "names the target" "\`Makefile\` has no rule for \`deploy\`"
@@ -667,7 +790,7 @@ teardown
 
 echo "every recognised form resolves when its path is tracked"
 setup basic
-gate render
+rendered
 add_command "./scripts/hello.sh"
 add_command "scripts/hello.sh --verbose"
 add_command "python3 scripts/hello.py"
@@ -684,7 +807,7 @@ teardown
 
 echo "every recognised form fails closed when its path is not tracked"
 setup basic
-gate render
+rendered
 add_command "bash scripts/missing.sh"
 add_command "./scripts/missing.sh"
 add_command "uv run scripts/missing.py"
@@ -706,12 +829,12 @@ teardown
 
 echo "bash -euo pipefail checks the script, not the option value"
 setup basic
-gate render
+rendered
 add_command "bash -euo pipefail scripts/hello.sh"
 passes
 teardown
 setup basic
-gate render
+rendered
 add_command "bash -euo pipefail scripts/nope.sh"
 fails
 contains "names the script" "\`scripts/nope.sh\` is not a tracked file"
@@ -720,12 +843,12 @@ teardown
 
 echo "node --test checks every path it is given"
 setup basic
-gate render
+rendered
 add_command "node --test app/math.test.mjs --test-reporter spec"
 passes
 teardown
 setup basic
-gate render
+rendered
 add_command "node --test app/math.test.mjs app/missing.test.mjs"
 fails
 contains "names the missing test file" "\`app/missing.test.mjs\` is not a tracked file or directory"
@@ -737,7 +860,7 @@ echo "a gitignored build output is left unchecked (claw's pulse-doctor shape)"
 setup basic
 printf 'dist/\n' >"$repo/app/.gitignore"
 git -C "$repo" add app/.gitignore
-gate render
+rendered
 add_command "cd app && npm run build && node dist/bin/doctor.js"
 add_command "node app/dist/*.js"
 add_command "cd app/dist && node doctor.js"
@@ -750,7 +873,7 @@ teardown
 
 echo "a file on disk that git does not track fails"
 setup basic
-gate render
+rendered
 printf '#!/usr/bin/env bash\necho local\n' >"$repo/scripts/local.sh"
 mkdir -p "$repo/scratch"
 : >"$repo/scratch/notes.txt"
@@ -763,7 +886,7 @@ teardown
 
 echo "a tracked file passes even where the local disk has lost it"
 setup basic
-gate render
+rendered
 rm "$repo/scripts/hello.sh"
 add_command "bash scripts/hello.sh"
 passes
@@ -771,23 +894,39 @@ teardown
 
 echo "paths that leave the repo are unchecked"
 setup basic
-gate render
+rendered
 add_command "bash ../outside.sh"
 add_command "cd .. && make nope"
 add_command "node /opt/tool/index.js"
 passes
 teardown
 
+echo "a tracked path with brackets resolves literally, quoted or not"
+setup basic
+rendered
+add_command 'node --test "app/trips/[id]/route.test.mjs"'
+add_command "node --test app/trips/[id]/route.test.mjs"
+add_command "bash 'scripts/[slug]/run.sh'"
+add_command "cd 'app/trips/[id]' && node --test route.test.mjs"
+passes
+teardown
+setup basic
+rendered
+add_command 'node --test "app/trips/[id]/missing.test.mjs"'
+fails
+contains "names the missing bracketed path" "\`app/trips/[id]/missing.test.mjs\` matches no tracked file"
+teardown
+
 echo "a glob passes when it matches a tracked file and fails when it matches none"
 setup basic
-gate render
+rendered
 add_command "bash scripts/*.sh"
 add_command "node --test app/*.test.mjs"
 add_command "node --test 'app/**/*.test.mjs'"
 passes
 teardown
 setup basic
-gate render
+rendered
 add_command "node --test app/*.spec.mjs"
 fails
 contains "names the glob" "\`app/*.spec.mjs\` matches no tracked file"

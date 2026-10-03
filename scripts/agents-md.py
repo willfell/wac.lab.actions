@@ -20,9 +20,12 @@ Both operate on the current directory as the target repo root, or on
 tracked or ignored; it never touches the network.
 
 Command paths are resolved against what git tracks, not against the local
-disk, so a check that passes on a developer's machine passes on a fresh CI
-checkout too. A path git ignores is treated as a build output and left
-unchecked.
+disk, so a file that exists only on one machine cannot make the check pass
+there. A path git ignores is treated as a build output and left unchecked.
+Ignore rules come from the repo's .gitignore files and from the clone's
+.git/info/exclude; the user's global excludes file is switched off. A path
+ignored only through .git/info/exclude therefore passes locally and fails on
+a fresh CI checkout.
 
 The contract itself is the design doc's, in wac.docs:
 docs/superpowers/specs/2026-10-02-agents-md-knowledge-layer-design.md.
@@ -76,6 +79,12 @@ TAIL_PREAMBLE = (
     "`scripts/agents-md.py render`. Change the catalog and re-render; do not "
     "edit this section or the next by hand."
 )
+#: Every preamble line a released `render` has written. The line under
+#: `## Dependencies` is how render tells a tail it generated (safe to
+#: overwrite) from a hand-written section (never overwritten). A change to
+#: TAIL_PREAMBLE's wording appends the new line here and keeps the old ones, or
+#: every existing tail stops re-rendering.
+PREAMBLES = (TAIL_PREAMBLE,)
 INCOMING_NOTE = (
     "Incoming edges (what depends on this repo) are not listed here. They live "
     "in the catalog at docs.wacwini.com."
@@ -89,7 +98,7 @@ REF_FIELDS = (
 )
 COMPONENT_FACTS = ("system", "type", "lifecycle")
 
-BOM = "﻿"
+BOM = "\ufeff"
 
 
 class GateError(Exception):
@@ -111,8 +120,10 @@ ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 #: an H2 (`-`). GitHub renders these as headings, so the contract reads them too.
 SETEXT_UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
 THEMATIC_BREAK = re.compile(r"^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$")
-#: Lines that open some other block -- list items, block quotes, HTML, table
-#: rows -- and so end a paragraph rather than becoming part of a heading.
+#: Lines that open a container (list item, block quote) or a block that runs
+#: to the next blank line (HTML, table). They end a paragraph rather than
+#: joining it, and the lines inside them are never a top-level paragraph, so a
+#: `---` under them is a thematic break, not a setext underline.
 BLOCK_START = re.compile(r"^ {0,3}(?:[-*+](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)|>|<|\|)")
 #: Indented code: cannot start a paragraph, but continues one.
 INDENTED = re.compile(r"^(?: {4}|\t)")
@@ -156,7 +167,14 @@ def scan_markdown(lines: list[str]) -> Markdown:
     headings: list[Heading] = []
     fences: list[Fence] = []
     open_fence: tuple[str, int, Fence] | None = None
+    # The top-level paragraph in progress, which a setext underline would
+    # turn into a heading: its first line number and its lines.
     paragraph: tuple[int, list[str]] | None = None
+    # Inside a list item, block quote, HTML block or table. Its lines,
+    # including indented and lazy continuation lines, are not top-level
+    # paragraphs, as CommonMark has it.
+    in_container = False
+    after_blank = False
     for number, line in enumerate(lines, 1):
         if open_fence is not None:
             char, length, fence = open_fence
@@ -175,11 +193,30 @@ def scan_markdown(lines: list[str]) -> Markdown:
             info = opening.group(2).strip()
             open_fence = (opening.group(1)[0], len(opening.group(1)), Fence(number, info))
             paragraph = None
+            after_blank = False
+            if not line[:1].isspace():
+                # An unindented fence ends a list; an indented one sits in it.
+                in_container = False
             continue
 
         if not line.strip():
             paragraph = None
+            after_blank = True
             continue
+
+        follows_blank = after_blank
+        after_blank = False
+        if in_container:
+            if line[:1].isspace():
+                # The container's own content: a continuation line, or a
+                # nested block, heading or underline that belongs to it.
+                continue
+            if not follows_blank and not (
+                ATX_HEADING.match(line) or THEMATIC_BREAK.match(line) or BLOCK_START.match(line)
+            ):
+                # A lazy continuation line of the container's paragraph.
+                continue
+            in_container = False
 
         atx = ATX_HEADING.match(line)
         if atx:
@@ -203,6 +240,7 @@ def scan_markdown(lines: list[str]) -> Markdown:
             # A list item or quote ends any paragraph above it, and a setext
             # underline below it is a thematic break, not a heading.
             paragraph = None
+            in_container = True
         elif paragraph is None:
             if not INDENTED.match(line):
                 paragraph = (number, [line.strip()])
@@ -243,6 +281,33 @@ def tail_intruders(md: Markdown) -> list[Heading]:
     return intruders
 
 
+def tail_not_generated(lines: list[str], md: Markdown) -> str | None:
+    """Why the section under `## Dependencies` is not one render wrote, if it is not.
+
+    Render overwrites a tail it generated, which it recognises by the preamble
+    line directly under the heading. A `## Dependencies` without it was written
+    by hand, and whatever follows it is prose that a render would destroy.
+    Bare headings with nothing under them (an outline waiting for its first
+    render) hold nothing to lose, so they are not refused.
+    """
+    tail = first_tail_heading(md)
+    if tail is None:
+        return None
+    rest = lines[tail.line :]
+    first = next((line for line in rest if line.strip()), None)
+    if first in PREAMBLES:
+        return None
+    content = [line for line in rest if line.strip() and line.strip() != f"## {LAST_H2}"]
+    if not content:
+        return None
+    return (
+        f"the `## Dependencies` at line {tail.line} was not written by render: the "
+        "line under it is not the generated preamble, so what follows it is "
+        "hand-written; move that content above `## Dependencies` (or delete it), "
+        "then render"
+    )
+
+
 def normalize(text: str) -> str:
     """Drop a UTF-8 byte-order mark and convert CRLF line endings to LF."""
     if text.startswith(BOM):
@@ -253,6 +318,28 @@ def normalize(text: str) -> str:
 # --------------------------------------------------------------------------
 # The catalog
 # --------------------------------------------------------------------------
+
+
+class CatalogLoader(yaml.SafeLoader):
+    """PyYAML's safe loader with YAML 1.2 booleans instead of YAML 1.1's.
+
+    Backstage reads catalog files with a YAML 1.2 parser, where only `true`
+    and `false` are booleans. PyYAML follows YAML 1.1, where `on`, `off`,
+    `yes`, `no`, `y` and `n` are too, so `name: on` would arrive here as True
+    while the catalog shows a Component called `on`. Reading it the way
+    Backstage does keeps the rendered names identical to the catalog's.
+    """
+
+
+CatalogLoader.yaml_implicit_resolvers = {
+    first: [(tag, pattern) for tag, pattern in resolvers if tag != "tag:yaml.org,2002:bool"]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+CatalogLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+    list("tTfF"),
+)
 
 
 def _split_ref(ref: str, default_kind: str) -> tuple[str, str]:
@@ -306,7 +393,14 @@ def _validate_entity(index: int, doc: object) -> list[str]:
     if not isinstance(metadata, dict):
         return [f"{where} (`{kind}`): `metadata` is missing or not a mapping"]
     name = metadata.get("name")
-    if not isinstance(name, str) or not name.strip():
+    if name is None or name == "":
+        return [f"{where} (`{kind}`): `metadata.name` is missing or not a string"]
+    if not isinstance(name, str):
+        return [
+            f"{where} (`{kind}`): `metadata.name` is {name!r}, which YAML reads as "
+            f"{type(name).__name__}, not a string; quote it"
+        ]
+    if not name.strip():
         return [f"{where} (`{kind}`): `metadata.name` is missing or not a string"]
 
     where = f"`{kind.lower()}:{name}`"
@@ -348,7 +442,7 @@ def load_catalog(root: Path) -> list[dict]:
     if not path.is_file():
         raise GateError(f"no `{CATALOG}` at the repo root")
     try:
-        docs = list(yaml.safe_load_all(path.read_text(encoding="utf-8-sig")))
+        docs = list(yaml.load_all(path.read_text(encoding="utf-8-sig"), Loader=CatalogLoader))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise GateError(f"`{CATALOG}` does not parse: {exc}") from exc
     problems = []
@@ -463,6 +557,11 @@ def _intruder_list(intruders: list[Heading]) -> str:
 def render_text(text: str, entities: list[dict], fleet_rules: str) -> str:
     """What `render` writes for `text`. Raises GateError rather than lose prose.
 
+    It refuses when it cannot tell prose from the tail: an unclosed fence, a
+    `## Dependencies` it did not write, or an H1 or H2 below it. Inside a tail
+    it did write, everything is replaced, hand edits included; those are what
+    `check` exists to catch before they are lost.
+
     The output is re-read before it is returned: if a second render would not
     reproduce it byte for byte, nothing is written.
     """
@@ -473,6 +572,9 @@ def render_text(text: str, entities: list[dict], fleet_rules: str) -> str:
             f"unclosed code fence opened at line {md.unclosed}; close it first, or "
             "render cannot tell prose from the generated tail"
         )
+    hand_written = tail_not_generated(norm.split("\n"), md)
+    if hand_written:
+        raise GateError(hand_written)
     intruders = tail_intruders(md)
     if intruders:
         raise GateError(
@@ -587,8 +689,9 @@ class Repo:
     def is_ignored(self, path: str, *, is_dir: bool = False) -> bool:
         """Whether git ignores `path` or one of its parent directories.
 
-        The user's global excludes file is switched off, so the answer is the
-        repo's own .gitignore files, the same on every machine.
+        The user's global excludes file is switched off, so the answer comes
+        from the repo's .gitignore files, which every checkout shares, and from
+        the clone's own .git/info/exclude, which it does not.
         """
         candidates = [path + "/" if is_dir else path]
         parent = posixpath.dirname(path)
@@ -617,15 +720,16 @@ class Repo:
         if path == ".." or path.startswith("../"):
             # Outside the repo, so outside what this check can know.
             return Lookup()
-        if any(c in token for c in "*?["):
-            return self._glob(path, token, kind)
-
+        # The literal path first: `app/[id]/route.js` is a real file name in a
+        # Next.js tree, and only a miss makes it worth reading as a glob.
         if kind in (FILE, ANY, NODE) and path in self.files:
             return Lookup(path=path)
         if kind in (DIR, ANY, NODE) and path in self.dirs:
             return Lookup(path=path)
         if kind == NODE and any(path + suffix in self.files for suffix in NODE_SUFFIXES):
             return Lookup(path=path)
+        if any(c in token for c in "*?["):
+            return self._glob(path, token, kind)
         if self.is_ignored(path, is_dir=(kind == DIR)):
             return Lookup()
         what = {
@@ -635,7 +739,10 @@ class Repo:
         return Lookup(problem=f"`{path}` is not {what}, and is not gitignored as a build output")
 
     def _glob(self, pattern: str, token: str, kind: str) -> Lookup:
-        """A glob passes when it matches at least one tracked path."""
+        """A glob passes when it matches at least one tracked path.
+
+        Reached only once the token has missed as a literal path.
+        """
         parts = pattern.split("/")
         pool = self.dirs if kind == DIR else self.files
         if kind in (ANY, NODE):
@@ -648,9 +755,11 @@ class Repo:
                 break
             literal.append(part)
         prefix = "/".join(literal)
-        if prefix and self.is_ignored(prefix, is_dir=True):
+        if self.is_ignored(pattern, is_dir=(kind == DIR)) or (prefix and self.is_ignored(prefix, is_dir=True)):
             return Lookup()
-        return Lookup(problem=f"`{token}` matches no tracked file, and is not under a gitignored directory")
+        return Lookup(
+            problem=f"`{token}` matches no tracked file, literally or as a glob, and is not gitignored as a build output"
+        )
 
 
 def _glob_match(pattern: list[str], path: list[str]) -> bool:
@@ -1268,6 +1377,10 @@ def check_contract(lines: list[str], md: Markdown) -> list[Finding]:
             )
         highest = max(highest, rank)
 
+    hand_written = tail_not_generated(lines, md)
+    if hand_written:
+        findings.append(Finding(AGENTS_MD, first_tail_heading(md).line, hand_written))
+
     last = seen.get(LAST_H2)
     for heading in tail_intruders(md):
         if heading.level == 1:
@@ -1427,7 +1540,12 @@ def cmd_check(root: Path) -> int:
         findings += check_contract(lines, md)
         # A file render would refuse to touch gets the contract findings above,
         # not a diff that tells the reader to re-render.
-        if entities is not None and md.unclosed is None and not tail_intruders(md):
+        if (
+            entities is not None
+            and md.unclosed is None
+            and not tail_intruders(md)
+            and not tail_not_generated(lines, md)
+        ):
             findings += check_render(norm, entities, fleet_rules)
         if repo.error is None:
             command_findings, checked = check_commands(repo, lines, md)
