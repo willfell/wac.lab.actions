@@ -26,9 +26,9 @@ which consumers have adopted it; an open bump PR does not change a row.
 | `lab-gitops-deploy` | wac | `.github/workflows/ci.yml` | `v1.14.0` |
 | `lab-kubeconform` | wac | `.github/workflows/ci.yml` | `v1.14.0` |
 | `techdocs` | wac | `.github/workflows/ci.yml` | `v1.14.0` |
-| `actionlint` | wac.app.claw | `.github/workflows/ci.yml` | `v1.10.5` |
-| `agents-md` | wac.app.claw | `.github/workflows/ci.yml` | `v1.13.0` |
-| `techdocs` | wac.app.claw | `.github/workflows/ci.yml` | `v1.12.0` |
+| `actionlint` | wac.app.claw | `.github/workflows/ci.yml` | `v1.14.0` |
+| `agents-md` | wac.app.claw | `.github/workflows/ci.yml` | `v1.14.0` |
+| `techdocs` | wac.app.claw | `.github/workflows/ci.yml` | `v1.14.0` |
 | `actionlint` | wac.app.finance | `.github/workflows/ci.yml` | `v1.14.0` |
 | `agents-md` | wac.app.finance | `.github/workflows/ci.yml` | `v1.14.0` |
 | `lab-gitops-deploy` | wac.app.finance | `.github/workflows/ci.yml` | `v1.14.0` |
