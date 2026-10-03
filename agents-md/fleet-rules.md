@@ -4,5 +4,6 @@
 4. No secret or token in a tracked file. Secrets are declared in lab's secrets registry and reach the cluster as Secrets.
 5. Fleet procedures live as skills in `willfell/wac.plugins` under `plugins/wac/skills/<name>/SKILL.md`. Read the matching one before onboarding a repo, deploying, releasing the UI kit, or changing CI runners.
 6. Catalog entity names are load-bearing; see the `docs-onboard-repo` skill before touching `catalog-info.yaml`.
+7. Before changing a shared Resource, a provided API, or a cross-repo dependency, use the local `docs` MCP tool `query-catalog-entities` to check its owner and affected consumers. Query one entity by `kind` and `name` with `verbose: true`; incoming consumers are in its `dependencyOf` and `apiConsumedBy` relations. The Mac mini endpoint is `http://localhost/api/mcp-actions/v1`, exposing catalog reads only; TechDocs tools are deferred. Keep incoming edges in the catalog rather than copying them into AGENTS.md. If the tool is unavailable or the entity is missing, report the gap and inspect the relevant repos' `catalog-info.yaml` files; a failed or empty query is not proof of no dependents.
 
 Where a fleet rule and this repo's Invariants disagree, the Invariants win; fix the rule upstream in wac.lab.actions.
