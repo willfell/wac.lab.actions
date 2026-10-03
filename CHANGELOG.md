@@ -31,8 +31,11 @@ Reading the table:
 | Tag | Date | Components changed | What |
 |---|---|---|---|
 | `v1.13.0` | 2026-10-02 | `agents-md` | new reusable workflow gating each repo's AGENTS.md: no tracked CLAUDE.md, the section contract, a tail rendered from `catalog-info.yaml` and the fleet rules, and resolvable commands |
+| `v1.12.2` | 2026-09-19 | `nextjs-site-deploy` | the bucket check runs from the workspace root, so it no longer dies before checkout on a fresh runner; installs the aws CLI the S3 sync and CloudFront invalidation need when the image lacks it |
+| `v1.12.1` | 2026-09-19 | `nextjs-site-check`, `nextjs-site-deploy` | provision node, npm and yarn when absent, so setup-node's yarn cache probe survives a minimal runner image |
 | `v1.12.0` | 2026-09-13 | `techdocs` | new reusable workflow running the pinned strict MkDocs build and the fleet nav-category check |
 | `v1.11.0` | 2026-09-12 | `lab-gitops-deploy` | new optional `extra_images` input pins additional images inside the commit-back retry loop |
+| `v1.10.9` | 2026-09-07 | `lab-gitops-deploy` | `argo-await-sync` stops reading Argo's operation record for hook proof and waits for Synced at the pinned revision; `require_hook` is retired, accepted and ignored, and migration proof moves to the app's schema-aware health route |
 | `v1.10.8` | 2026-09-07 | `lab-gitops-deploy` | `argo-await-sync` proves a frozen hook by the Job itself |
 | `v1.10.7` | 2026-09-07 | `lab-gitops-deploy` | `argo-await-sync` trusts the hook, not the operation's initiator |
 | `v1.10.6` | 2026-09-05 | `lab-gitops-deploy` | `argo-await-sync` rejects torn reads and Running hooks it cannot prove |
@@ -51,10 +54,19 @@ Reading the table:
 | `v1.7.1` | | `nextjs-site-check`, `nextjs-site-deploy` | — |
 | `v1.7.0` | | `lab-tofu-apply`, `lab-tofu-plan`, `lab-tofu-validate`, `nextjs-site-deploy` | — |
 | `v1.6.0` | | `nextjs-site-check`, `nextjs-site-deploy` | — |
+| `v1.5.0` | 2026-09-01 | `lab-gitops-deploy`, `lab-kubeconform` | new composites: the build-to-served GitOps deploy and the kubeconform manifest check |
+| `v1.4.0` | 2026-09-01 | `actionlint`, `lab-build`, `lab-deploy`, `lab-tools` | new `lab-tools` installer and `actionlint` reusable workflow; `lab-build` and `lab-deploy` install crane and kubectl through `scripts/install-tools.sh` |
+| `v1.3.0` | 2026-08-31 | `lab-tofu-apply`, `lab-tofu-plan` | new composites extracting the OpenTofu plan and apply pipeline |
+| `v1.2.0` | 2026-08-12 | `lab-deploy` | the caller can pin the Application's chart version |
+| `v1.1.0` | 2026-08-11 | `lab-build`, `lab-deploy` | first tag: `lab-build` versions, builds, pushes, promotes and releases; `lab-deploy` points an Argo Application at a new image |
 
-Entries at and below `v1.8.0` were reconstructed from tag diffs on 2026-09-06;
+Entries `v1.6.0` to `v1.8.0` were reconstructed from tag diffs on 2026-09-06;
 the components are derived from the diffs and are reliable, the prose is not
 recorded and is left blank rather than guessed.
+
+Entries `v1.1.0` to `v1.5.0` were added on 2026-10-02 from tag diffs, with
+the prose taken from the commit subjects. `v1.1.1` is not listed: it only
+removed comments from `lab-build` and `lab-deploy`, so no behaviour changed.
 
 ## Adding an entry
 
