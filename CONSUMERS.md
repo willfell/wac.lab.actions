@@ -33,10 +33,10 @@ because the walk it drives silently skips whatever it forgot.
 | `actionlint` | wac.app.finance | `.github/workflows/ci.yml` | `v1.10.8` |
 | `lab-gitops-deploy` | wac.app.finance | `.github/workflows/ci.yml` | `v1.10.8` |
 | `lab-kubeconform` | wac.app.finance | `.github/workflows/ci.yml` | `v1.10.8` |
-| `actionlint` | wac.app.flights | `.github/workflows/ci.yml` | `v1.12.2` |
-| `lab-gitops-deploy` | wac.app.flights | `.github/workflows/ci.yml` | `v1.12.2` |
-| `lab-kubeconform` | wac.app.flights | `.github/workflows/ci.yml` | `v1.12.2` |
-| `techdocs` | wac.app.flights | `.github/workflows/ci.yml` | `v1.12.2` |
+| `actionlint` | wac.app.flights | `.github/workflows/ci.yml` | `v1.13.0` |
+| `lab-gitops-deploy` | wac.app.flights | `.github/workflows/ci.yml` | `v1.13.0` |
+| `lab-kubeconform` | wac.app.flights | `.github/workflows/ci.yml` | `v1.13.0` |
+| `techdocs` | wac.app.flights | `.github/workflows/ci.yml` | `v1.13.0` |
 | `actionlint` | wac.app.travel | `.github/workflows/ci.yml` | `v1.10.9` |
 | `lab-gitops-deploy` | wac.app.travel | `.github/workflows/ci.yml` | `v1.10.9` |
 | `lab-kubeconform` | wac.app.travel | `.github/workflows/ci.yml` | `v1.10.9` |
