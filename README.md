@@ -639,3 +639,84 @@ before its docs exist.
 schema does not yet know. The same file has to enumerate this repo's
 self-hosted labels, because actionlint only checks labels once a config file
 exists.
+
+### agents-md
+
+Gates the calling repo's `AGENTS.md`, the one repo context file every fleet repo
+carries for Claude Code and Codex. The file is hand-written prose on top and a
+generated tail underneath, and the gate fails the moment the file and the repo
+disagree: a stale context file is worse than none, because an agent trusts it.
+
+```yaml
+jobs:
+  agents-md:
+    uses: willfell/wac.lab.actions/.github/workflows/agents-md.yml@v1.13.0
+    with:
+      runner: lab
+    permissions:
+      contents: read
+```
+
+| Input | Meaning | Default |
+| --- | --- | --- |
+| `runner` | `runs-on` label the job is sent to, in the caller's repo | `ubuntu-latest` |
+
+The job checks this repo out a second time at `github.job_workflow_sha`, into
+`.agents-md-gate`, exactly as `techdocs` does, and runs
+`uv run .agents-md-gate/scripts/agents-md.py check`. The script declares its
+own Python and PyYAML pin inline (PEP 723), so `uv run` builds its environment
+from that block and ignores any project in the calling repo. `check` reads only
+the working tree and `git ls-files`; it makes no network calls of its own.
+
+It fails, with a `::error file=...,line=...::` annotation for each finding, on:
+
+1. A tracked `CLAUDE.md` or `CLAUDE.local.md` at any depth. Claude Code reads
+   `AGENTS.md` only when no such file exists in the working directory or above
+   it, so one tracked CLAUDE.md silently turns the whole file off. Untracked
+   files, such as old branches under `.worktrees/`, are ignored.
+2. No `AGENTS.md` at the root, or no `catalog-info.yaml`.
+3. A broken section contract: the first non-blank line must be the only H1,
+   then the H2s `The one thing to understand`, `Commands`, `Layout`,
+   `Invariants`, `Boundaries`, `Dependencies` and `Fleet rules` must all be
+   present, in that relative order. A repo may add its own H2s anywhere before
+   `## Dependencies`, and nothing may follow `## Fleet rules`. Headings are read
+   outside fenced code blocks only, so a `# note` line in a command block is not
+   an H1.
+4. A file that differs from what `render` would write, with a unified diff.
+   Everything from `## Dependencies` to the end of the file is generated from
+   the repo's `catalog-info.yaml` and from `agents-md/fleet-rules.md` here; a
+   hand edit there fails.
+5. A command in `## Commands` that does not resolve. Each line of each fenced
+   block is read as a command run from the repo root: a trailing `# note` is
+   dropped, a line holding a `<placeholder>` is skipped, segments split on
+   `&&`, `||` and `;`, and `cd <dir>` is followed (the directory must exist).
+   `npm run <x>`, `npm test|start|stop|restart` and `npm --prefix <dir> ...`
+   must name a script in that directory's `package.json`; `make <target>` a rule
+   in its Makefile; `bash|sh|node|python|python3 <path>`, `uv run <path>` and a
+   bare `./<path>` or `scripts/<path>` a file that exists. Anything else
+   (`tofu`, `npx`, `kubectl`, `npm install`) is not checked: recognised forms
+   fail closed, unrecognised ones pass.
+
+There is no detect step. Unlike `techdocs`, a fleet repo without the file is a
+failure rather than a skip, so add the job in the same PR as the `AGENTS.md`.
+
+**Render from the tag you pin.** The fleet rules are part of the tail, and they
+change between tags. A tail rendered from `main`, or from whatever a local
+checkout happens to be on, is rejected by a gate pinned elsewhere. From the
+repo being rendered:
+
+```sh
+git -C <wac.lab.actions-checkout> worktree add --detach <gate-dir> v1.13.0
+uv run <gate-dir>/scripts/agents-md.py render
+uv run <gate-dir>/scripts/agents-md.py check
+```
+
+`render` keeps everything above `## Dependencies` byte-for-byte (trailing blank
+lines become exactly one), rewrites the rest, and appends the tail if there is
+none yet. Running it twice changes nothing. Both subcommands take `--root PATH`
+in place of the current directory.
+
+The consequence is deliberate: bumping a repo's pin to a tag that changed
+`agents-md/fleet-rules.md` fails its gate until the bump PR re-renders, so the
+new rules ride the bump and cannot go stale silently. A `CHANGELOG.md` row for
+such a tag says so.

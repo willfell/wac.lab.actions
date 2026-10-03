@@ -23,9 +23,10 @@ consuming repository.
 | `lab-tofu-validate` | Check formatting and validate every OpenTofu root under a directory, no credentials needed |
 | `lab-tools` | Install the fleet's k8s and registry tooling, arch-aware, onto `PATH` |
 
-Three reusable workflows ride the same tags: `actionlint.yml` (the fleet's
-shared lint and runner-policy gate), `nextjs-site-check.yml`, and
-`nextjs-site-deploy.yml`.
+Five reusable workflows ride the same tags: `actionlint.yml` (the fleet's
+shared lint and runner-policy gate), `nextjs-site-check.yml`,
+`nextjs-site-deploy.yml`, `techdocs.yml` (the fleet TechDocs gate), and
+`agents-md.yml` (the fleet AGENTS.md gate).
 
 ## The pinning rule
 
