@@ -104,9 +104,12 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    and `agents-md` gates check this repo out at `github.job_workflow_sha`, so a
    consumer runs the script from the tag it pinned; that needs no token only
    because the repo is public.
-7. Gates fail closed. A check that finds nothing to check fails rather than
-   passing vacuously (`lab-tofu-validate` discovering zero roots,
-   `check_actions.py` finding no actions or no reusable workflows).
+7. A gate that discovers its own inputs fails when it discovers none, rather
+   than passing vacuously: `lab-tofu-validate` with zero roots,
+   `check_actions.py` with no actions or no reusable workflows, `agents-md`
+   with no Component in the catalog or no command in `## Commands`. The
+   documented exception is `techdocs`: its `detect` job skips a repo with no
+   `mkdocs.yml`, so the workflow can be wired in before the docs exist.
 8. `lab-gitops-deploy` keeps `push_registry` and `pull_registry` as two
    addresses, verifies the served build against the source sha (never the bump
    sha), and marks its pin commit `[skip ci]`. The README's `lab-gitops-deploy`
