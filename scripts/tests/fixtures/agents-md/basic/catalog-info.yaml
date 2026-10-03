@@ -1,0 +1,12 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: fixture-basic
+  description: A fixture repo for the agents-md gate
+spec:
+  type: service
+  lifecycle: experimental
+  owner: group:default/owners
+  system: platform
+  dependsOn:
+    - resource:traefik

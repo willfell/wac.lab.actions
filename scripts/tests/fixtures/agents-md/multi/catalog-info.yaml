@@ -1,0 +1,54 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: front
+  description: The suite front door
+spec:
+  type: website
+  lifecycle: production
+  owner: group:default/owners
+  system: suite
+  dependsOn:
+    - resource:default/traefik
+    - resource:oci-registry
+    - Resource:traefik
+    - front-ui
+  providesApis:
+    - bridge-front.thing.get
+  consumesApis:
+    - api:default/bridge-other.Thing.list
+    - bridge-other.thing.create
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: bridge-front.thing.get
+  description: Read a thing
+spec:
+  type: bridge-capability
+  lifecycle: production
+  owner: group:default/owners
+  system: suite
+  definition: |
+    GET /api/internal/thing
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: front-ui
+  description: >-
+    The design system,
+    folded across two lines.
+spec:
+  type: library
+  lifecycle: production
+  owner: group:default/owners
+---
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: front-cache
+spec:
+  type: cache
+  owner: group:default/owners
+---
