@@ -709,13 +709,22 @@ It fails, with a `::error file=...,line=...::` annotation for each finding, on:
      `uv run <path>` and a bare `./<path>` or `scripts/<path>` must name a path
      that exists.
 
-   "Exists" means **tracked by git**, not present on the local disk, so a check
-   that passes on a laptop passes on a fresh CI checkout too. A path git does
-   not track but does ignore (`dist/`, `node_modules/`) is a build output and
-   is left unchecked, as is a path that leaves the repo, an absolute path, or
-   one built from a shell variable. A glob (`*`, `?`, `[`) must match at least
-   one tracked file. Anything else (`tofu`, `npx`, `kubectl`, `npm install`)
-   is not checked: recognised forms fail closed, unrecognised ones pass.
+   "Exists" means **tracked by git**, not present on the local disk, so a file
+   that exists only on one machine cannot make the check pass there. A path
+   git does not track but does ignore (`dist/`, `node_modules/`) is a build
+   output and is left unchecked, as is a path that leaves the repo, an
+   absolute path, or one built from a shell variable. A path is matched
+   literally first, so a tracked `app/[id]/route.test.mjs` resolves as written;
+   only a path that misses and holds `*`, `?` or `[` is read as a glob, which
+   must then match at least one tracked file. Anything else (`tofu`, `npx`,
+   `kubectl`, `npm install`) is not checked: recognised forms fail closed,
+   unrecognised ones pass.
+
+   Ignore rules come from the repo's `.gitignore` files and from the clone's
+   own `.git/info/exclude`. The user's global excludes file
+   (`core.excludesFile`) is switched off, but `.git/info/exclude` is not, so a
+   path ignored only there passes locally and fails on a fresh CI checkout.
+   Put build outputs in a committed `.gitignore`.
 
 There is no detect step. Unlike `techdocs`, a fleet repo without the file is a
 failure rather than a skip, so add the job in the same PR as the `AGENTS.md`.
@@ -737,12 +746,31 @@ written, with three normalisations: a UTF-8 byte-order mark is dropped, CRLF
 line endings become LF, and trailing blank lines become exactly one before
 `## Dependencies`. Running it twice changes nothing.
 
-`render` never destroys prose, so it writes nothing and exits non-zero when it
-cannot tell prose from the tail: an H1 or H2 below `## Dependencies` (it names
-each one to move above it), an unclosed code fence, a catalog problem, or a
-tail that would not survive a second render (a catalog description that reads
-as a heading or a code fence). It also refuses a symlinked `AGENTS.md`. Both
-subcommands take `--root PATH` in place of the current directory.
+What `render` overwrites, exactly: a tail it generated, which it recognises by
+the generated preamble line directly under `## Dependencies`. Everything in
+that tail is replaced, including any hand edit made inside it; `check` fails on
+such an edit, and that failure is the only warning before a render discards
+it. A `## Dependencies` with anything else under it was written by hand, and
+render will not touch it.
+
+So `render` writes nothing and exits non-zero when:
+
+- `## Dependencies` exists but the line under it is not the generated
+  preamble, and anything other than a bare `## Fleet rules` heading follows it
+  (bare `## Dependencies` and `## Fleet rules` headings, an outline waiting for
+  its first render, are filled in);
+- an H1 or H2 other than the generated `## Fleet rules` sits below
+  `## Dependencies` (it names each one to move above it);
+- a code fence is left unclosed;
+- `AGENTS.md` is a symlink, or the catalog has any problem listed above;
+- its own output would not survive a second render (a catalog description
+  that reads as a heading or a code fence).
+
+`catalog-info.yaml` is read as YAML 1.2 reads booleans, the way Backstage
+reads it: only `true` and `false` are booleans, so `name: on` is the
+Component `on`, not `True`. A name YAML reads as a number (`name: 123`) is a
+finding that says to quote it. Both subcommands take `--root PATH` in place of
+the current directory.
 
 The consequence is deliberate: bumping a repo's pin to a tag that changed
 `agents-md/fleet-rules.md` fails its gate until the bump PR re-renders, so the
