@@ -50,7 +50,7 @@ inputs:
     description: Seconds to wait on each Argo condition
     default: "300"
   require_hook:
-    description: Hook type (e.g. PreSync) that must have run inside the sync operation; empty skips the check
+    description: Retired since v1.10.9; accepted for compatibility and ignored, because migration proof is the app's schema-aware health route
     default: ""
   kubectl_version:
     description: kubectl release for the deploy steps
@@ -175,7 +175,7 @@ runs:
           echo "application not onboarded yet, stopping after image push"
           echo "onboarded=false" >> "$GITHUB_OUTPUT"
         fi
-    - name: Sync the pinned revision and require the ci-initiated operation to succeed
+    - name: Request a sync of the pinned revision and wait until Synced at it
       if: steps.onboarded.outputs.onboarded == 'true'
       shell: bash
       env:

@@ -252,7 +252,7 @@ finance, flight-checker, and wac each carried and drifted independently.
 | `health_url` | In-cluster health endpoint returning `{sha,...}`; empty skips verification | `""` |
 | `health_expect_db_ok` | Also assert the health payload reports `db == ok` | `"true"` |
 | `wait_timeout` | Seconds to wait on each Argo condition | `"300"` |
-| `require_hook` | Hook type (e.g. `PreSync`) that must have run inside the sync operation; empty skips the check | `""` |
+| `require_hook` | Retired since `v1.10.9`; accepted for compatibility and ignored, because migration proof is the app's schema-aware health route | `""` |
 | `kubectl_version` / `kustomize_version` / `crane_version` | Tool releases for the deploy and pin steps | `v1.35.0` / `v5.7.1` / `v0.20.6` |
 
 Output: `bump_sha`, the `main`-branch commit carrying the image pin.

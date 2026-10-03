@@ -31,8 +31,11 @@ Reading the table:
 | Tag | Date | Components changed | What |
 |---|---|---|---|
 | `v1.13.0` | 2026-10-02 | `agents-md` | new reusable workflow gating each repo's AGENTS.md: no tracked CLAUDE.md, the section contract, a tail rendered from `catalog-info.yaml` and the fleet rules, and resolvable commands |
+| `v1.12.2` | 2026-09-19 | `nextjs-site-deploy` | the bucket check runs from the workspace root, so it no longer dies before checkout on a fresh runner; installs the aws CLI the S3 sync and CloudFront invalidation need when the image lacks it |
+| `v1.12.1` | 2026-09-19 | `nextjs-site-check`, `nextjs-site-deploy` | provision node, npm and yarn when absent, so setup-node's yarn cache probe survives a minimal runner image |
 | `v1.12.0` | 2026-09-13 | `techdocs` | new reusable workflow running the pinned strict MkDocs build and the fleet nav-category check |
 | `v1.11.0` | 2026-09-12 | `lab-gitops-deploy` | new optional `extra_images` input pins additional images inside the commit-back retry loop |
+| `v1.10.9` | 2026-09-07 | `lab-gitops-deploy` | `argo-await-sync` stops reading Argo's operation record for hook proof and waits for Synced at the pinned revision; `require_hook` is retired, accepted and ignored, and migration proof moves to the app's schema-aware health route |
 | `v1.10.8` | 2026-09-07 | `lab-gitops-deploy` | `argo-await-sync` proves a frozen hook by the Job itself |
 | `v1.10.7` | 2026-09-07 | `lab-gitops-deploy` | `argo-await-sync` trusts the hook, not the operation's initiator |
 | `v1.10.6` | 2026-09-05 | `lab-gitops-deploy` | `argo-await-sync` rejects torn reads and Running hooks it cannot prove |
