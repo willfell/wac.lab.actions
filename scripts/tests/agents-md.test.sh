@@ -172,14 +172,15 @@ fails() {
   check "${1:-check exits 1}" 1 "$status"
 }
 
-# render_refuses LABEL: render exits 2 and leaves AGENTS.md as it was.
+# render_refuses: render exits 2, says it refused, and leaves AGENTS.md as it
+# was. Takes no arguments.
 render_refuses() {
   local status=0
   snapshot
   gate render || status=$?
   check "render exits 2" 2 "$status"
   contains "render says it refused" "refusing to write AGENTS.md"
-  unchanged "render wrote nothing" "${1:-$repo/AGENTS.md}"
+  unchanged "render wrote nothing" "$repo/AGENTS.md"
 }
 
 # --------------------------------------------------------------------------
