@@ -257,91 +257,85 @@ finance, flight-checker, and wac each carried and drifted independently.
 
 Output: `bump_sha`, the `main`-branch commit carrying the image pin.
 
-### Why the sync wait asserts the operation, not the end state
+### What the sync wait asserts, and what it does not
 
-An Argo `Application` with `syncPolicy.automated.selfHeal` can start its own
-sync between the pin landing on `main` and this action's patch taking effect.
-That automated sync reconciles only the drifted `Deployment` and runs **no
-hooks**, so a `PreSync` migration Job never executes -- yet it still leaves the
-Application at the pinned revision, `Synced`, and `Healthy`. A wait built on
-those three flags passes, the rollout succeeds, and a `/api/health` probe that
-only does `select 1` confirms the new image is serving. The result is a fully
-green deploy against an unmigrated schema. This happened three times in
-production before the wait was written to catch it.
+The sync step runs `scripts/argo-await-sync.sh`. It asks one question: is the
+Application `Synced` at the pinned revision? Each poll reads
+`.status.sync.status`, `.status.sync.revision` and `.operation.sync.revision`
+in a single `kubectl get`, retrying a failed read up to three times. If the
+Application is already `Synced` at the pin, the step is done. Otherwise, when
+the operation slot is free, it requests a sync of the pin. That request is a
+JSON Patch `add` on `/operation`, stamped `initiatedBy.username: ci`, and it
+replaces the whole object instead of merging into one an automated sync has
+just claimed. When the slot is occupied, it waits. It gives up after
+`wait_timeout` seconds.
 
-So the wait does not ask "is the app synced and healthy at my revision". It
-asks "did the operation *I* requested run to completion", by polling
-`.status.operationState` until it shows a `Succeeded` operation whose
-`initiatedBy.username` is `ci` and whose `sync.revision` is the pin. If the
-operation slot is free and the recorded operation is not ours -- an automated
-sync displaced the request -- it re-requests rather than waiting on an
-operation that will never be ours.
+The steps after it finish the deploy. They wait for the Application to reach
+the pin, `Synced` and `Healthy`, then for the Deployment rollout. When
+`health_url` is set, they also check that the health route is serving the
+source sha and, unless `health_expect_db_ok` is `"false"`, that it reports
+`db == ok`. The verify step treats any non-2xx response as a failure.
 
-Two details make that assertion trustworthy:
+The step does **not** try to prove that a migration hook ran. Up to `v1.10.8`
+it did, by reading the operation's state out of
+`.status.operationState`. That proof was abandoned because one week of
+production deploys showed the record misreporting what happened in three
+ways:
 
-**The read is atomic.** Every field the decision depends on comes out of one
-`kubectl get`. Reading them with separate calls lets a `Succeeded` phase left
-over from the *previous* operation pair with the revision of the one just
-requested -- a combination that never existed in any single state of the
-resource. That torn read is not a rare race: it reproduced on four consecutive
-deploys, each passing the wait ~5 seconds after the patch, before the migration
-Job could possibly have run.
+- A requested full sync was recorded as an automated, selective selfHeal
+  operation.
+- Hook phases stayed frozen at `Running` in the `syncResult` of an operation
+  that had already finished.
+- Completed hook Jobs were deleted before they could be inspected.
 
-**A stale success cannot satisfy it.** The wait records the operation identity
-before patching and requires the observed one to differ, so the previous
-deploy's `Succeeded` is never mistaken for this one's.
+The underlying hazard is unchanged. With `syncPolicy.automated.selfHeal`, Argo
+can start its own selective sync between the pin landing on `main` and this
+action's request. That sync reconciles only the drifted resources and runs
+**no hooks**, so a `PreSync` migration Job never executes. It still leaves the
+Application at the pinned revision, `Synced` and `Healthy`, which is exactly
+what this step waits for. A sync this action requested can also skip its
+hooks. On flights, on 2026-10-02, under Argo CD v3.5.2, an operation that had
+to wait for an earlier hook Job to be deleted resumed with its hooks skipped.
 
-**The request replaces the operation, it does not merge into one.** The sync is
-requested with a JSON Patch `add` on `/operation`, which replaces the whole
-object, and only when the slot looks free, so a sync that is genuinely
-mid-flight is not displaced.
+`require_hook` is still accepted so that existing callers keep working, but it
+is ignored. The script logs a notice when it is set. Callers can drop it.
 
-**The hook, not the initiator, is what makes the result trustworthy.** Argo's
-own auto-sync can stamp `automated: true` onto the very operation carrying this
-action's username, producing `initiatedBy: {automated: true, username: ci}`. No
-client-side patch prevents that -- the stamping happens on Argo's side, after
-the write. Fused operations usually do run hooks, so rejecting them outright
-only makes deploys unachievable on an app whose sync slot is contended. What
-the wait requires instead is that the completed operation carries the pinned
-revision, is not the one observed before patching, and -- when `require_hook`
-is set -- ran that hook to `Succeeded`. All three production incidents were
-syncs with no hook at all, which that catches regardless of who is recorded as
-having started them.
+### Where migration proof lives
 
-Set `require_hook: PreSync` on any app whose manifests carry a migration Job.
-It makes the deploy fail when an operation converges without running the hook,
-which is the difference between a schema that migrated and one that did not.
+The proof has moved into the app. The app's health route compares the
+migration journal shipped in the image against the database. When the
+database is behind, the route returns a 503 with `db=behind`. The `travel#35`
+change is the pattern to follow. A schema left behind by a hookless sync then
+fails the deploy in two places. The verify step fails because of the non-2xx
+response and `db == ok`. The `Healthy` wait fails too, when the readiness
+probe points at that route. When the step times out, its failure message says
+to check that route.
 
-The test is that the hook appears in the completed operation's `syncResult`,
-not that it reached `Succeeded` there. The syncs this wait exists to reject
-carry no entry for the hook at all -- their `syncResult` is the drifted
-workloads and nothing else. An operation can also finish while the hook it
-created is still `Running`, and that is a sync that did include the migration,
-so only an outright hook failure is treated as fatal.
+When a migration has been skipped, recover with a full sync of the
+Application. A full sync runs the hooks, which a selective selfHeal sync never
+does.
+
+Give migration hooks
+`argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded`.
+`BeforeHookCreation` deletes the previous run's Job when the next sync creates
+its own. That avoids the case where an operation has to wait for an earlier
+hook Job to be deleted, which is the case that resumed with hooks skipped.
 
 ### Apps whose migrations are not hooks
 
-Leaving `require_hook` empty is the right setting for an app with no Argo hook,
-but it does not mean there is nothing to verify -- only that this action cannot
-be the thing that verifies it. The wait asserts that a hook Argo was supposed
-to run actually ran. Where the migration is not an Argo-visible resource, that
-assertion has no referent.
-
-An app that migrates in-process -- finance runs drizzle's `migrate()` inside
-`getDb()` on the first request -- has no Job for a hookless sync to skip: if the
-pod is serving, it has already migrated, because migrating is the precondition
-of serving. What can still go wrong there is a migration that fails or is never
-reached, and the check for that is the journal itself, not the sync operation:
+Some apps migrate in-process. Finance, for example, runs drizzle's `migrate()`
+inside `getDb()` on the first request. There is no Job for a hookless sync to
+skip: if the pod is serving, it has already migrated, because migrating is the
+precondition of serving. What can still go wrong is a migration that fails or
+is never reached. The schema-aware health route catches that the same way.
+For a manual check, compare the journal itself:
 
 ```sh
 kubectl -n <ns> exec deploy/<db> -- psql -U postgres -d <database> \
   -tAc "select count(*) from <schema>.__drizzle_migrations"
 ```
 
-compared against the number of migration files the deployed commit carries.
-Travel and flight-checker take the hook-shaped check because their migrations
-are `PreSync` Jobs; finance takes the journal-shaped one. Picking the wrong
-shape for an app reads as a passing check while proving nothing.
+against the number of migration files the deployed commit carries.
 
 ### The registry split
 

@@ -54,10 +54,19 @@ Reading the table:
 | `v1.7.1` | | `nextjs-site-check`, `nextjs-site-deploy` | — |
 | `v1.7.0` | | `lab-tofu-apply`, `lab-tofu-plan`, `lab-tofu-validate`, `nextjs-site-deploy` | — |
 | `v1.6.0` | | `nextjs-site-check`, `nextjs-site-deploy` | — |
+| `v1.5.0` | 2026-09-01 | `lab-gitops-deploy`, `lab-kubeconform` | new composites: the build-to-served GitOps deploy and the kubeconform manifest check |
+| `v1.4.0` | 2026-09-01 | `actionlint`, `lab-build`, `lab-deploy`, `lab-tools` | new `lab-tools` installer and `actionlint` reusable workflow; `lab-build` and `lab-deploy` install crane and kubectl through `scripts/install-tools.sh` |
+| `v1.3.0` | 2026-08-31 | `lab-tofu-apply`, `lab-tofu-plan` | new composites extracting the OpenTofu plan and apply pipeline |
+| `v1.2.0` | 2026-08-12 | `lab-deploy` | the caller can pin the Application's chart version |
+| `v1.1.0` | 2026-08-11 | `lab-build`, `lab-deploy` | first tag: `lab-build` versions, builds, pushes, promotes and releases; `lab-deploy` points an Argo Application at a new image |
 
-Entries at and below `v1.8.0` were reconstructed from tag diffs on 2026-09-06;
+Entries `v1.6.0` to `v1.8.0` were reconstructed from tag diffs on 2026-09-06;
 the components are derived from the diffs and are reliable, the prose is not
 recorded and is left blank rather than guessed.
+
+Entries `v1.1.0` to `v1.5.0` were added on 2026-10-02 from tag diffs, with
+the prose taken from the commit subjects. `v1.1.1` is not listed: it only
+removed comments from `lab-build` and `lab-deploy`, so no behaviour changed.
 
 ## Adding an entry
 
