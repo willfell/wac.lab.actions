@@ -10,15 +10,27 @@ Reading the table:
 - **Components** names the actions and reusable workflows whose behaviour
   changed. A consumer pinning only components *not* listed can bump safely
   without re-testing.
-- `scripts/` belongs to **`lab-gitops-deploy`** — it is the only component that
-  runs anything from there (`lab-gitops-deploy/action.yml` shells out to
-  `scripts/argo-await-sync.sh`). A tag that touches only `scripts/` still
-  changes `lab-gitops-deploy`, which is easy to miss from a file list alone and
-  is why the column says components rather than paths.
+- `scripts/` is shared, and each script belongs to the components that run it.
+  A tag that touches only `scripts/` still changes those components, which is
+  easy to miss from a file list alone and is why the column says components
+  rather than paths:
+
+  | Path | Components |
+  |---|---|
+  | `scripts/install-tools.sh` | `lab-build`, `lab-deploy`, `lab-gitops-deploy`, `lab-kubeconform`, `lab-tools` |
+  | `scripts/argo-await-sync.sh` | `lab-gitops-deploy` |
+  | `scripts/check-docs-nav.sh` | `techdocs` |
+  | `scripts/agents-md.py`, `agents-md/` | `agents-md` |
+  | `scripts/tests/` | none; CI only |
+
+- A tag that changes `agents-md/fleet-rules.md` fails every `agents-md`
+  consumer's gate at its bump until that repo re-renders its AGENTS.md tail.
+  That is intended, and the row says so.
 - README-only and CI-only changes are not releases and are not listed.
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.13.0` | 2026-10-02 | `agents-md` | new reusable workflow gating each repo's AGENTS.md: no tracked CLAUDE.md, the section contract, a tail rendered from `catalog-info.yaml` and the fleet rules, and resolvable commands |
 | `v1.12.0` | 2026-09-13 | `techdocs` | new reusable workflow running the pinned strict MkDocs build and the fleet nav-category check |
 | `v1.11.0` | 2026-09-12 | `lab-gitops-deploy` | new optional `extra_images` input pins additional images inside the commit-back retry loop |
 | `v1.10.8` | 2026-09-07 | `lab-gitops-deploy` | `argo-await-sync` proves a frozen hook by the Job itself |

@@ -1,0 +1,29 @@
+name: agents-md
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ github.job_workflow_sha }}
+          path: .agents-md-gate
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: AGENTS.md holds the fleet contract and matches the repo
+        run: uv run .agents-md-gate/scripts/agents-md.py check

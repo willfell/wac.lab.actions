@@ -1,0 +1,8 @@
+{
+  "name": "fixture-basic-app",
+  "private": true,
+  "scripts": {
+    "build": "mkdir -p dist/bin && cp server.js dist/bin/doctor.js",
+    "test": "node --test"
+  }
+}

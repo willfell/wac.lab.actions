@@ -1,0 +1,8 @@
+{
+  "name": "fixture-basic",
+  "private": true,
+  "scripts": {
+    "build": "echo build",
+    "lint": "echo lint"
+  }
+}
