@@ -305,15 +305,59 @@ is ignored. The script logs a notice when it is set. Callers can drop it.
 The proof has moved into the app. The app's health route compares the
 migration journal shipped in the image against the database. When the
 database is behind, the route returns a 503 with `db=behind`. The `travel#35`
-change is the pattern to follow. A schema left behind by a hookless sync then
-fails the deploy in two places. The verify step fails because of the non-2xx
-response and `db == ok`. The `Healthy` wait fails too, when the readiness
-probe points at that route. When the step times out, its failure message says
-to check that route.
+change is the pattern to follow.
 
-When a migration has been skipped, recover with a full sync of the
-Application. A full sync runs the hooks, which a selective selfHeal sync never
-does.
+What CI shows for a skipped migration depends on where the readiness probe
+points.
+
+**Readiness on the schema-aware route (the recommended setup).** The new pod
+never goes Ready, so the Deployment stays `Progressing`. The step "Wait for
+Argo to reach that revision, synced and healthy" times out on
+`health.status=Healthy` after `wait_timeout`. The rollout and verify steps
+after it do not run, so `db=behind` never appears in the CI log. The CI
+symptom is only that Healthy-wait timeout. To find the cause, look in these
+places:
+
+- `kubectl -n <ns> describe pod <new pod>` shows the pod `NotReady`, with
+  readiness probe failures returning 503.
+- The app's own log has the line where it reports the database behind its
+  journal.
+- A request to the health route on the new pod's IP returns 503 `db=behind`.
+
+Do not expect the verify step to report it, even if you run it by hand.
+`health_url` is normally a Service. With `maxUnavailable: 0`, that Service
+routes only to the old Ready pod, so the request reaches the old sha with
+`db == ok` and fails on the sha mismatch instead.
+
+**Readiness not on that route.** The new pod goes Ready and the rollout
+finishes. The verify step then reaches the new build, and its `db == ok`
+assertion is what catches the behind schema: the route answers 503 and the
+step fails on the non-2xx response. This is the case `health_expect_db_ok`
+exists for.
+
+### Recovering from a skipped migration
+
+Recover with a full sync of the Application, meaning a sync operation with no
+`resources` list. A full sync runs the hooks; a selective sync, which is all
+selfHeal ever does, never runs them. The request is the same JSON Patch the
+script sends, issued when `.operation` is empty:
+
+```sh
+kubectl -n argocd patch application <app> --type json -p \
+  '[{"op":"add","path":"/operation","value":{"initiatedBy":{"username":"<you>"},"sync":{"revision":"<pinned sha>"}}}]'
+```
+
+Then check the Application's events and make sure the operation was not
+partial. A selective sync is reported as `Partial sync operation to <rev>
+succeeded`, while a full one says `Sync operation to <rev> succeeded`:
+
+```sh
+kubectl -n argocd get events --field-selector involvedObject.name=<app> \
+  --sort-by=.lastTimestamp
+```
+
+Also confirm that the migration Job ran and that the health route reports
+`db == ok`.
 
 Give migration hooks
 `argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded`.
