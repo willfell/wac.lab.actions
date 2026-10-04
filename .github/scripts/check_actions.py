@@ -95,6 +95,26 @@ def _check_reusable_workflow(path: Path, doc: dict) -> list[str]:
         problems.append(f"{path}: reusable workflow has no `jobs`")
     problems.extend(_check_no_floating_refs(path))
     problems.extend(_check_runner_is_a_caller_choice(path, doc))
+    problems.extend(_check_gate_identity(path, doc))
+    return problems
+
+
+def _check_gate_identity(path: Path, doc: dict) -> list[str]:
+    if path.name not in ("agents-md.yml", "techdocs.yml"):
+        return []
+    steps = (doc.get("jobs", {}).get("gate") or {}).get("steps", [])
+    shared = [(index, step) for index, step in enumerate(steps)
+              if step.get("with", {}).get("repository") == "willfell/wac.lab.actions"]
+    if len(shared) != 1:
+        return [f"{path}: gate must check out exactly one shared source"]
+    index, step = shared[0]
+    problems = []
+    if step["with"].get("ref") != "${{ job.workflow_sha }}":
+        problems.append(f"{path}: shared gate source must use the defining job.workflow_sha")
+    if not any(previous.get("env", {}).get("SHARED_WORKFLOW_SHA") == "${{ job.workflow_sha }}"
+               and previous.get("run") == '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+               for previous in steps[:index]):
+        problems.append(f"{path}: missing SHA validation before shared checkout could select main")
     return problems
 
 

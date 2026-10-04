@@ -32,7 +32,9 @@ jobs:
           shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
 
       - name: Validate the composite actions
-        run: python .github/scripts/check_actions.py
+        run: |
+          python .github/scripts/check_actions.py
+          python .github/scripts/test_workflow_identity.py
 
       - name: Run the script tests
         run: bash scripts/tests/argo-await-sync.test.sh

@@ -664,7 +664,7 @@ list.
 `scripts/check-docs-nav.sh` is vendored here rather than fetched from
 `wac.plugins`, which is private: reaching into it at run time would need a token
 in all thirteen consumers. The `gate` job checks this repo out a second time at
-`github.job_workflow_sha`, so the script it runs is the one that shipped in the
+`job.workflow_sha`, so the script it runs is the one that shipped in the
 tag the caller pinned -- not whatever is on `main`. That works without a token
 only because this repo is public.
 
@@ -673,8 +673,11 @@ file and `gate` is skipped, so the workflow can be added to a repo's `ci.yml`
 before its docs exist.
 
 `.github/actionlint.yaml` carries a narrow ignore for
-`github.job_workflow_sha`: it is a real context property that actionlint 1.7's
-schema does not yet know. The same file has to enumerate this repo's
+`job.workflow_sha`: it is the documented defining-workflow context property that older actionlint
+schemas do not yet know. Both gates validate its full commit SHA before checkout,
+so a missing identity fails instead of selecting the default branch. GitHub
+Enterprise Server does not expose this context and is not supported by these
+gates. The same file has to enumerate this repo's
 self-hosted labels, because actionlint only checks labels once a config file
 exists.
 
@@ -699,7 +702,7 @@ jobs:
 | --- | --- | --- |
 | `runner` | `runs-on` label the job is sent to, in the caller's repo | `ubuntu-latest` |
 
-The job checks this repo out a second time at `github.job_workflow_sha`, into
+The job checks this repo out a second time at `job.workflow_sha`, into
 `.agents-md-gate`, exactly as `techdocs` does, and runs
 `uv run .agents-md-gate/scripts/agents-md.py check`. The script declares its
 own Python and PyYAML pin inline (PEP 723), so `uv run` builds its environment

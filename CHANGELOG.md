@@ -30,6 +30,7 @@ Reading the table:
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.15.1` | 2026-10-03 | `agents-md`, `techdocs` | fix defining-workflow source checkout to documented `job.workflow_sha` and reject an absent commit before checkout; the previous undefined context silently selected main. Fleet rules remain byte-identical to v1.15.0 |
 | `v1.15.0` | 2026-10-03 | `agents-md` | native knowledge-search and cited-context guidance alongside catalog consumer checks; removes the obsolete catalog-only endpoint claim. Every consumer must re-render its AGENTS.md tail at the bump or its gate fails; unavailable tools require direct authoritative-source inspection |
 | `v1.14.0` | 2026-10-03 | `agents-md` | fleet rules direct agents to the local docs MCP for owners and incoming dependencies before shared-resource, API or cross-repo changes; every consumer must re-render its AGENTS.md tail when bumping or its gate fails |
 | `v1.13.0` | 2026-10-02 | `agents-md` | new reusable workflow gating each repo's AGENTS.md: no tracked CLAUDE.md, the section contract, a tail rendered from `catalog-info.yaml` and the fleet rules, and resolvable commands |

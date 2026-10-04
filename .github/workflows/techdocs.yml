@@ -33,10 +33,14 @@ jobs:
     runs-on: ${{ inputs.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
       - uses: actions/checkout@v4
         with:
           repository: willfell/wac.lab.actions
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ job.workflow_sha }}
           path: .techdocs-gate
           persist-credentials: false
       - uses: actions/setup-python@v5
