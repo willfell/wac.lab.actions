@@ -30,6 +30,7 @@ Reading the table:
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.15.0` | 2026-10-03 | `agents-md` | native knowledge-search and cited-context guidance alongside catalog consumer checks; removes the obsolete catalog-only endpoint claim. Every consumer must re-render its AGENTS.md tail at the bump or its gate fails; unavailable tools require direct authoritative-source inspection |
 | `v1.14.0` | 2026-10-03 | `agents-md` | fleet rules direct agents to the local docs MCP for owners and incoming dependencies before shared-resource, API or cross-repo changes; every consumer must re-render its AGENTS.md tail when bumping or its gate fails |
 | `v1.13.0` | 2026-10-02 | `agents-md` | new reusable workflow gating each repo's AGENTS.md: no tracked CLAUDE.md, the section contract, a tail rendered from `catalog-info.yaml` and the fleet rules, and resolvable commands |
 | `v1.12.2` | 2026-09-19 | `nextjs-site-deploy` | the bucket check runs from the workspace root, so it no longer dies before checkout on a fresh runner; installs the aws CLI the S3 sync and CloudFront invalidation need when the image lacks it |
