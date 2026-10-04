@@ -4,7 +4,7 @@ self-hosted-runner:
 paths:
   .github/workflows/techdocs.yml:
     ignore:
-      - 'property "job_workflow_sha" is not defined'
+      - 'property "workflow_sha" is not defined'
   .github/workflows/agents-md.yml:
     ignore:
-      - 'property "job_workflow_sha" is not defined'
+      - 'property "workflow_sha" is not defined'

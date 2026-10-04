@@ -70,7 +70,7 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
 - `.github/scripts/check_actions.py`: structural validation of every
   `action.yml` and reusable workflow.
 - `.github/actionlint.yaml`: this repo's self-hosted labels, and the narrow
-  `job_workflow_sha` ignore the two gate workflows need.
+  `job.workflow_sha` ignore the two gate workflows need.
 - `README.md`: the full reference, per component: inputs, outputs, and the
   incident history behind each design choice. Read a component's section before
   changing it.
@@ -101,7 +101,7 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    input has a description; a required input has no default; bash bodies pass
    `shellcheck --severity=warning`. `check_actions.py` enforces all of it.
 6. Credentials arrive as inputs and nothing secret lives here. The `techdocs`
-   and `agents-md` gates check this repo out at `github.job_workflow_sha`, so a
+   and `agents-md` gates check this repo out at `job.workflow_sha`, so a
    consumer runs the script from the tag it pinned; that needs no token only
    because the repo is public.
 7. A gate that discovers its own inputs fails when it discovers none, rather
