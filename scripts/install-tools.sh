@@ -47,9 +47,17 @@ for tool in "${TOOLS[@]}"; do
       # affects later steps. On a runner image that already ships helm the
       # check passed against that copy; on one that does not, the installer
       # writes the binary and then declares it missing.
-      DESIRED_VERSION="${HELM_VERSION:-}" HELM_INSTALL_DIR="$BIN_DIR" USE_SUDO=false \
-        PATH="$BIN_DIR:$PATH" \
-        bash <(curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3)
+      (
+        installer="$(mktemp)"
+        trap 'rm -f "$installer"' EXIT
+        if ! curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 -o "$installer"; then
+          curl -fsSL -H 'Accept: application/vnd.github.raw+json' \
+            'https://api.github.com/repos/helm/helm/contents/scripts/get-helm-3?ref=main' -o "$installer"
+        fi
+        head -n 1 "$installer" | grep -qx '#!/usr/bin/env bash'
+        DESIRED_VERSION="${HELM_VERSION:-}" HELM_INSTALL_DIR="$BIN_DIR" USE_SUDO=false \
+          PATH="$BIN_DIR:$PATH" bash "$installer"
+      )
       ;;
     *)
       echo "unknown tool: ${tool}" >&2

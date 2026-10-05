@@ -35,9 +35,12 @@ jobs:
         run: |
           python .github/scripts/check_actions.py
           python .github/scripts/test_workflow_identity.py
+          python scripts/tests/schema-api-proxy.test.py
 
       - name: Run the script tests
-        run: bash scripts/tests/argo-await-sync.test.sh
+        run: |
+          bash scripts/tests/argo-await-sync.test.sh
+          bash scripts/tests/helm-install.test.sh
 
       - uses: astral-sh/setup-uv@v5
 
@@ -81,3 +84,10 @@ jobs:
           crane version
           kubeconform -v
           helm version
+      - name: Validate real core and CRD schemas through the composite
+        uses: ./lab-kubeconform
+        with:
+          kustomize_dir: scripts/tests/fixtures/schema-recovery
+          flags: -strict -summary -schema-location default -schema-location https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json
+      - name: Schema transport recovery retains strict validation
+        run: bash scripts/tests/validate-kustomize.test.sh

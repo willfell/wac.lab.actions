@@ -12,10 +12,18 @@ The local catalog MCP guidance was released in `v1.14.0`; conditional native
 knowledge-search guidance followed in `v1.15.0`. The `v1.15.1` patch pins the
 shared AGENTS and TechDocs checkout to the defining workflow commit and fails
 closed when that commit is unavailable. The table records merged default-branch
-pins; an open bump PR does not change a row.
+pins; an open bump PR does not change a row. Baton rows were added from its
+actual default-branch workflow on 2026-10-05 UTC.
+
+Baton also checks out `v1.15.1` to run `scripts/install-tools.sh` directly for
+its release job; that checkout pin must move with a shared installer bump.
 
 | Component | Repo | File | Pin |
 |---|---|---|---|
+| `actionlint` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
+| `agents-md` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
+| `techdocs` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
+| `lab-kubeconform` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
 | `actionlint` | ero-copilot-iac | `.github/workflows/lint.yml` | `v1.7.1` |
 | `actionlint` | fellhoelter-consulting | `.github/workflows/pr.yml` | `v1.12.2` |
 | `nextjs-site-check` | fellhoelter-consulting | `.github/workflows/pr.yml` | `v1.12.2` |
