@@ -84,5 +84,10 @@ jobs:
           crane version
           kubeconform -v
           helm version
+      - name: Validate real core and CRD schemas through the composite
+        uses: ./lab-kubeconform
+        with:
+          kustomize_dir: scripts/tests/fixtures/schema-recovery
+          flags: -strict -summary -schema-location default -schema-location https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json
       - name: Schema transport recovery retains strict validation
         run: bash scripts/tests/validate-kustomize.test.sh
