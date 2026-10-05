@@ -30,6 +30,7 @@ Reading the table:
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.16.0` | 2026-10-05 | `lab-kubeconform`, `lab-build`, `lab-deploy`, `lab-gitops-deploy`, `lab-tools` | recover Kubernetes and explicitly configured Datree CRD schemas through the same upstream GitHub contents API when raw transport fails, retaining strict validation and genuine missing-schema policy; optional `github_token` defaults to the existing job token for API rate limits. Python 3.12 is provisioned internally. Shared Helm installation uses transport recovery and fails closed on an absent installer. No new credential grants or fleet-rule changes |
 | `v1.15.1` | 2026-10-03 | `agents-md`, `techdocs` | fix defining-workflow source checkout to documented `job.workflow_sha` and reject an absent commit before checkout; the previous undefined context silently selected main. Fleet rules remain byte-identical to v1.15.0 |
 | `v1.15.0` | 2026-10-03 | `agents-md` | native knowledge-search and cited-context guidance alongside catalog consumer checks; removes the obsolete catalog-only endpoint claim. Every consumer must re-render its AGENTS.md tail at the bump or its gate fails; unavailable tools require direct authoritative-source inspection |
 | `v1.14.0` | 2026-10-03 | `agents-md` | fleet rules direct agents to the local docs MCP for owners and incoming dependencies before shared-resource, API or cross-repo changes; every consumer must re-render its AGENTS.md tail when bumping or its gate fails |

@@ -13,9 +13,15 @@ inputs:
   kubeconform_version:
     description: kubeconform release to install
     default: v0.7.0
+  github_token:
+    description: GitHub token for upstream public schema API rate limits
+    default: ${{ github.token }}
 runs:
   using: composite
   steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
     - name: Install kustomize and kubeconform
       shell: bash
       env:
@@ -28,7 +34,6 @@ runs:
       env:
         KUSTOMIZE_DIR: ${{ inputs.kustomize_dir }}
         FLAGS: ${{ inputs.flags }}
+        SCHEMA_GITHUB_TOKEN: ${{ inputs.github_token }}
       run: |
-        set -euo pipefail
-        read -ra flag_args <<<"$FLAGS"
-        kustomize build "$KUSTOMIZE_DIR" | kubeconform "${flag_args[@]}" -
+        bash "${{ github.action_path }}/../scripts/validate-kustomize.sh"

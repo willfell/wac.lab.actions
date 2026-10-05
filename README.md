@@ -473,6 +473,32 @@ coded release-asset URLs for that one architecture.
 | `flags` | Flags passed to kubeconform | `-strict -summary` |
 | `kustomize_version` | kustomize release to install | `v5.7.1` |
 | `kubeconform_version` | kubeconform release to install | `v0.7.0` |
+| `github_token` | Token for the upstream public schema API rate limit | `${{ github.token }}` |
+
+The overlay is rendered once and the same bytes are validated on every attempt.
+If kubeconform cannot retrieve its default Kubernetes schemas from
+`raw.githubusercontent.com`, the action retries through a temporary adapter
+bound only to loopback. The adapter retrieves the same repository, ref and schema
+path through GitHub's public contents API over verified TLS. An upstream 404
+remains a 404, preserving caller `-ignore-missing-schemas` policy for custom
+resources; other API errors and non-schema responses remain errors.
+There are at most two validation attempts. Strictness, output format, cache
+flags and custom schema locations are preserved; only the default upstream
+location and the explicitly configured `datreeio/CRDs-catalog/main` location are
+redirected, in their original search order. Other custom schema hosts are
+unchanged. Python 3.12 is provisioned by the action, uses only its
+standard library, and requires no caller setup. The existing job token is passed
+through the optional `github_token` input to avoid exhausting the shared anonymous
+API rate limit. No new credential grant is required; an empty input opts into
+anonymous requests. Credentials go only to the fixed GitHub API host, and
+redirects are rejected. The adapter is stopped
+and its temporary files removed on exit. Invalid manifests and unresolved schema
+errors still fail the gate.
+
+The shared Helm installer has the same transport fallback for the upstream
+`helm/helm` `main` script. It requires a successful download and a shell-script
+header before execution; a failed process substitution can no longer silently
+run an empty installer.
 
 ## Reusable workflows
 

@@ -35,6 +35,7 @@ uv run --with pyyaml python .github/scripts/check_actions.py  # the same, withou
 shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
 bash scripts/tests/argo-await-sync.test.sh  # lab-gitops-deploy's Argo wait, against a fake kubectl
 bash scripts/tests/agents-md.test.sh  # the AGENTS.md gate, against fixture repos; needs uv and git
+bash scripts/tests/validate-kustomize.test.sh  # requires kubeconform; schema recovery and strict rejection scenarios
 uv run scripts/agents-md.py check  # this file against the fleet contract
 uv run scripts/agents-md.py render  # rewrite this file's tail after a catalog or fleet-rules edit
 bash scripts/check-docs-nav.sh mkdocs.yml
@@ -61,7 +62,8 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
   `install-tools.sh` is `lab-build`, `lab-deploy`, `lab-gitops-deploy`,
   `lab-kubeconform` and `lab-tools`; `argo-await-sync.sh` is
   `lab-gitops-deploy`; `check-docs-nav.sh` is `techdocs`; `agents-md.py` is
-  `agents-md`.
+  `agents-md`; `validate-kustomize.sh` and `schema-api-proxy.py` are
+  `lab-kubeconform`.
 - `agents-md/fleet-rules.md`: the fleet-wide rules every fleet AGENTS.md tail
   carries verbatim.
 - `scripts/tests/`: scenario tests, run by `ci.yml` and shipped to no consumer.
