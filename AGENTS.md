@@ -1,11 +1,11 @@
 # wac.lab.actions
 
-The fleet's shared CI library, catalog Component `lab-actions`: eight composite
+The fleet's shared CI library, catalog Component `lab-actions`: nine composite
 GitHub Actions and five reusable workflows that the other repos' workflows call
 at exact tags. It has no runtime. It builds no image, deploys nothing, and runs
 no service; every effect it has happens inside someone else's CI. It is public
-on purpose: every credential arrives as an input, and a public repo is what lets
-the gates check it out at run time without a token.
+on purpose: callers supply credentials as inputs or through GitHub's native job
+authentication environment, and the gates can check it out without a token.
 
 ## The one thing to understand
 
@@ -51,8 +51,8 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
 
 ## Layout
 
-- `lab-*/action.yml`: the eight composite actions, one directory each:
-  `lab-build`, `lab-deploy`, `lab-gitops-deploy`, `lab-kubeconform`,
+- `lab-*/action.yml`: the nine composite actions, one directory each:
+  `lab-build`, `lab-deploy`, `lab-gitops-deploy`, `lab-release`, `lab-kubeconform`,
   `lab-tofu-plan`, `lab-tofu-apply`, `lab-tofu-validate`, `lab-tools`.
 - `.github/workflows/`: the reusable workflows `actionlint.yml`,
   `nextjs-site-check.yml`, `nextjs-site-deploy.yml`, `techdocs.yml` and
@@ -102,7 +102,8 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    every `run:` step has a `shell:`; no step has both `run` and `uses`; every
    input has a description; a required input has no default; bash bodies pass
    `shellcheck --severity=warning`. `check_actions.py` enforces all of it.
-6. Credentials arrive as inputs and nothing secret lives here. The `techdocs`
+6. Credentials arrive as inputs or, for scoped releases, through GitHub's
+   native OIDC job environment. Nothing secret lives here. The `techdocs`
    and `agents-md` gates check this repo out at `job.workflow_sha`, so a
    consumer runs the script from the tag it pinned; that needs no token only
    because the repo is public.
@@ -138,6 +139,14 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
   The tests that need one create it in a temp dir.
 - `scripts/tests/fixtures/` are test inputs. Changing one changes what the
   tests prove, so change it only alongside the test that relies on it.
+
+`lab-release` and the opt-in `authorization: oidc` route in `lab-gitops-deploy`
+use `scripts/ci-release.py` against Lab's fixed TLS service. Direct release jobs
+need `id-token: write` and the public runner trust mount. The service derives
+Kubernetes targets from repository identity. The action never falls back to a
+Kubernetes token or unverified TLS. Existing GitOps callers retain their default
+route; OIDC callers retain served-source and database health checks. The client
+scenario gate is `python scripts/tests/ci-release.test.py`.
 
 ## Dependencies
 

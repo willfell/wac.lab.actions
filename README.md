@@ -15,6 +15,7 @@ consuming repository.
 | `lab-tofu-apply` | Guard and apply the reviewed plan file on merge |
 | `lab-tofu-validate` | Check formatting and validate every OpenTofu root under a directory, no credentials needed |
 | `lab-tools` | Install the fleet's k8s and registry tooling, arch-aware, onto `PATH` |
+| `lab-release` | Verify fixed migration or deployment receipts with GitHub OIDC and TLS |
 | `lab-gitops-deploy` | Build, push, pin via a kustomize commit-back, sync Argo, verify the served build |
 | `lab-kubeconform` | Validate a kustomize overlay by piping its build through kubeconform |
 
@@ -236,6 +237,7 @@ finance, flight-checker, and wac each carried and drifted independently.
 
 | Input | Meaning | Default |
 | --- | --- | --- |
+| `authorization` | `kubernetes` for legacy repository runners, `oidc` for the scoped service | `kubernetes` |
 | `image` | Image name, also the default deployment name | required |
 | `extra_images` | Space-separated additional image names pinned to the same sha inside the same deploy commit; empty disables | `""` |
 | `argo_app` | Argo CD Application to sync and wait on | required |
@@ -843,3 +845,46 @@ The consequence is deliberate: bumping a repo's pin to a tag that changed
 `agents-md/fleet-rules.md` fails its gate until the bump PR re-renders, so the
 new rules ride the bump and cannot go stale silently. A `CHANGELOG.md` row for
 such a tag says so.
+
+## lab-release
+
+Planned for v1.17.0. This component requires Lab's activated scoped deployment
+service and the runner's public `/etc/ci-deploy/ca.crt` mount. It never uses a
+Kubernetes token. The direct release job must grant `id-token: write`; the
+service authorizes the repository ID, current owner, main branch, source SHA
+and trusted workflow. It supports only the first-wave repositories listed in
+[Lab's service contract](https://github.com/willfell/wac.lab/blob/main/docs/guides/ci-deploy-gateway.md).
+Do not route an existing release here before its live proof and activation gates.
+
+| Input | Meaning | Default |
+| --- | --- | --- |
+| `operation` | `status` for Baton, `sync` for Finance/Wealth, `migrate` for Lab | required |
+| `pin_sha` | Exact pin commit for status/sync | empty |
+| `expected_image` | Exact image reference, including digest where the caller pins one | empty |
+| `image_tag`, `image_digest` | Warehouse image identity for migrate | empty |
+| `min_replicas` | Required ready replica floor; Baton must pass `2` | `1` |
+| `wait_timeout` | Overall evidence deadline, up to 3600 seconds | `2100` |
+
+Output `receipt` is a local JSON file; the caller may upload it with its existing
+release evidence. TLS trust is mandatory, redirects are rejected, and each poll
+obtains a fresh OIDC token. Denial fails immediately. Busy/dependency responses
+retry within the deadline. A migration succeeds only with matching source,
+image, run ID/attempt and successful warehouse then ecosystem receipts. Call
+this before publishing the Lab image pin. A status/sync succeeds only when Argo
+is Synced and Healthy at the exact pin and the fixed Deployment has observed
+its generation, updated/ready/available replicas and the expected image. Baton
+still checks its served source SHA separately and must preserve its immutable
+digest and two-replica release contract.
+
+`lab-gitops-deploy` adds optional `authorization: oidc`. That route replaces its
+Kubernetes discovery/sync/rollout steps with the same client, keeps the source
+SHA image tag and deploy-key pin, and retains the served-source/database health
+check. Missing onboarding fails in the service instead of silently succeeding.
+Existing callers default to `kubernetes`. OIDC does not forward caller-selected
+Application or namespace names: the service derives the fixed target from the
+verified repository. Package scopes and image identities do not change.
+
+This release does not bump consumers automatically. Each authorized consumer
+change must pin all components from this repo to the same released exact tag.
+No fleet rules change, but the v1.16.0 transport improvements are included in a
+bump from v1.15.1. `CONSUMERS.md` remains a record of current main-branch pins.
