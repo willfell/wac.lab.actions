@@ -1,6 +1,9 @@
 name: lab-gitops-deploy
 description: Build an image, push it to the in-cluster registry, pin it via a kustomize commit back to main over the deploy key, force an Argo sync, and verify the served build is the source sha
 inputs:
+  authorization:
+    description: kubernetes for legacy repository runners, oidc for the scoped deployment service
+    default: kubernetes
   image:
     description: Image name, also the default deployment name (e.g. finance-app)
     required: true
@@ -68,6 +71,19 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Validate deployment authorization
+      shell: bash
+      env:
+        AUTHORIZATION: ${{ inputs.authorization }}
+      run: |
+        case "$AUTHORIZATION" in
+          kubernetes|oidc) ;;
+          *) echo "authorization must be kubernetes or oidc" >&2; exit 1 ;;
+        esac
+    - uses: actions/setup-python@v5
+      if: inputs.authorization == 'oidc'
+      with:
+        python-version: "3.12"
     - name: Install kubectl, kustomize, and crane
       shell: bash
       env:
@@ -164,6 +180,7 @@ runs:
         echo "bump_sha=$pinned" >> "$GITHUB_OUTPUT"
     - name: Check whether the application is onboarded to Argo
       id: onboarded
+      if: inputs.authorization == 'kubernetes'
       shell: bash
       env:
         ARGO_APP: ${{ inputs.argo_app }}
@@ -176,7 +193,7 @@ runs:
           echo "onboarded=false" >> "$GITHUB_OUTPUT"
         fi
     - name: Request a sync of the pinned revision and wait until Synced at it
-      if: steps.onboarded.outputs.onboarded == 'true'
+      if: inputs.authorization == 'kubernetes' && steps.onboarded.outputs.onboarded == 'true'
       shell: bash
       env:
         ARGO_APP: ${{ inputs.argo_app }}
@@ -186,7 +203,7 @@ runs:
       run: |
         "${{ github.action_path }}/../scripts/argo-await-sync.sh"
     - name: Wait for Argo to reach that revision, synced and healthy
-      if: steps.onboarded.outputs.onboarded == 'true'
+      if: inputs.authorization == 'kubernetes' && steps.onboarded.outputs.onboarded == 'true'
       shell: bash
       env:
         ARGO_APP: ${{ inputs.argo_app }}
@@ -201,7 +218,7 @@ runs:
         kubectl -n argocd wait "application/$ARGO_APP" --timeout="${WAIT_TIMEOUT}s" \
           --for=jsonpath='{.status.health.status}'=Healthy
     - name: Wait for the rollout
-      if: steps.onboarded.outputs.onboarded == 'true'
+      if: inputs.authorization == 'kubernetes' && steps.onboarded.outputs.onboarded == 'true'
       shell: bash
       env:
         NAMESPACE: ${{ inputs.namespace }}
@@ -210,13 +227,28 @@ runs:
       run: |
         set -euo pipefail
         kubectl -n "$NAMESPACE" rollout status "deploy/${DEPLOYMENT_NAME:-$IMAGE}" --timeout=5m
+    - name: Verify through the scoped deployment service
+      if: inputs.authorization == 'oidc'
+      shell: bash
+      env:
+        BUMP_SHA: ${{ steps.pin.outputs.bump_sha }}
+        PULL_REGISTRY: ${{ inputs.pull_registry }}
+        IMAGE: ${{ inputs.image }}
+        WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
+      run: |
+        set -euo pipefail
+        python "${{ github.action_path }}/../scripts/ci-release.py" \
+          --operation sync --pin-sha "$BUMP_SHA" \
+          --expected-image "$PULL_REGISTRY/$IMAGE:$GITHUB_SHA" \
+          --wait-timeout "$WAIT_TIMEOUT" \
+          --receipt "$RUNNER_TEMP/gitops-release-receipt.json"
     - name: Set up node for the verify step
-      if: steps.onboarded.outputs.onboarded == 'true' && inputs.health_url != ''
+      if: (inputs.authorization == 'oidc' || steps.onboarded.outputs.onboarded == 'true') && inputs.health_url != ''
       uses: actions/setup-node@v4
       with:
         node-version: "22"
     - name: Verify the running build is the one just built
-      if: steps.onboarded.outputs.onboarded == 'true' && inputs.health_url != ''
+      if: (inputs.authorization == 'oidc' || steps.onboarded.outputs.onboarded == 'true') && inputs.health_url != ''
       shell: bash
       env:
         HEALTH_URL: ${{ inputs.health_url }}

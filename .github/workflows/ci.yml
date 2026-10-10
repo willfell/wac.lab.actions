@@ -36,6 +36,7 @@ jobs:
           python .github/scripts/check_actions.py
           python .github/scripts/test_workflow_identity.py
           python scripts/tests/schema-api-proxy.test.py
+          python scripts/tests/ci-release.test.py
 
       - name: Run the script tests
         run: |
