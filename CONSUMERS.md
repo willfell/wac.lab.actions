@@ -4,8 +4,10 @@ Every repo pinning this library, by component and file. Bumping a tag means
 walking this table and opening one PR per repo whose pinned components changed;
 `CHANGELOG.md` says which those are.
 
-**Reconciled against the live default branch of every listed repo on 2026-10-04 UTC.**
-Every `.github/workflows/` file was read directly from its default branch;
+**Reconciled against fetched default branches of the migration repositories on 2026-10-10 UTC.**
+Rows outside the migration scope retain their previous audit evidence. Both
+willfell and wacwini shared-action callers were searched; scoped rows were read
+from fetched default branches. Every scoped `.github/workflows/` file was read;
 code-search results and planned PR pins were not used as evidence.
 
 The local catalog MCP guidance was released in `v1.14.0`; conditional native
@@ -21,75 +23,75 @@ its release job; that checkout pin must move with a shared installer bump.
 | Component | Repo | File | Pin |
 |---|---|---|---|
 | `actionlint` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-kubeconform` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
 | `actionlint` | ero-copilot-iac | `.github/workflows/lint.yml` | `v1.7.1` |
-| `actionlint` | fellhoelter-consulting | `.github/workflows/pr.yml` | `v1.12.2` |
-| `nextjs-site-check` | fellhoelter-consulting | `.github/workflows/pr.yml` | `v1.12.2` |
-| `nextjs-site-deploy` | fellhoelter-consulting | `.github/workflows/deploy.yml` | `v1.12.2` |
-| `actionlint` | homebrew-sauce | `.github/workflows/ci.yml` | `v1.12.0` |
-| `nextjs-site-deploy` | jack-creek-patch | `.github/workflows/deploy.yml` | `v1.12.2` |
-| `actionlint` | mac-config | `.github/workflows/ci.yml` | `v1.12.0` |
 | `actionlint` | sauce | `.github/workflows/ci.yml` | `v1.10.5` |
-| `actionlint` | wac | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-gitops-deploy` | wac | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-kubeconform` | wac | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.app.claw | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.app.claw | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac.app.claw | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.app.finance | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.app.finance | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-gitops-deploy` | wac.app.finance | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-kubeconform` | wac.app.finance | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac.app.finance | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.app.flights | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.app.flights | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-gitops-deploy` | wac.app.flights | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-kubeconform` | wac.app.flights | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac.app.flights | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.app.handbook | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.app.handbook | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-gitops-deploy` | wac.app.handbook | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-kubeconform` | wac.app.handbook | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac.app.handbook | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.app.travel | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.app.travel | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-gitops-deploy` | wac.app.travel | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-kubeconform` | wac.app.travel | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac.app.travel | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.app.wealth | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.app.wealth | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-gitops-deploy` | wac.app.wealth | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac.app.wealth | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.docs | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.docs | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-tools` | wac.docs | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac.docs | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.lab | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.lab | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-tofu-apply` | wac.lab | `.github/workflows/tofu-apply.yml` | `v1.15.1` |
-| `lab-tofu-plan` | wac.lab | `.github/workflows/tofu-drift.yml` | `v1.15.1` |
-| `lab-tofu-plan` | wac.lab | `.github/workflows/tofu-plan.yml` | `v1.15.1` |
-| `lab-tools` | wac.lab | `.github/workflows/warehouse-image.yml` | `v1.15.1` |
-| `techdocs` | wac.lab | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.lab.iac | `.github/workflows/tofu-plan.yml` | `v1.15.1` |
-| `agents-md` | wac.lab.iac | `.github/workflows/ci.yml` | `v1.15.1` |
-| `lab-tofu-apply` | wac.lab.iac | `.github/workflows/tofu-apply.yml` | `v1.15.1` |
-| `lab-tofu-plan` | wac.lab.iac | `.github/workflows/tofu-plan.yml` | `v1.15.1` |
-| `lab-tofu-validate` | wac.lab.iac | `.github/workflows/tofu-plan.yml` | `v1.15.1` |
-| `techdocs` | wac.lab.iac | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.lab.remote | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.lab.remote | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac.lab.remote | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | wac.plugins | `.github/workflows/ci.yml` | `v1.15.1` |
-| `agents-md` | wac.plugins | `.github/workflows/ci.yml` | `v1.15.1` |
-| `techdocs` | wac.plugins | `.github/workflows/ci.yml` | `v1.15.1` |
-| `actionlint` | will-fell | `.github/workflows/pr.yml` | `v1.12.2` |
-| `nextjs-site-check` | will-fell | `.github/workflows/pr.yml` | `v1.12.2` |
-| `nextjs-site-deploy` | will-fell | `.github/workflows/deploy.yml` | `v1.12.2` |
+| `actionlint` | wacwini/wac.lab | `.github/workflows/ci.yml` | `v1.17.0` |
+| `actionlint` | willfell/fellhoelter-consulting | `.github/workflows/pr.yml` | `v1.12.2` |
+| `actionlint` | willfell/homebrew-sauce | `.github/workflows/ci.yml` | `v1.12.0` |
+| `actionlint` | willfell/mac-config | `.github/workflows/ci.yml` | `v1.12.0` |
+| `actionlint` | willfell/wac | `.github/workflows/ci.yml` | `v1.16.0` |
+| `actionlint` | willfell/wac.app.claw | `.github/workflows/ci.yml` | `v1.15.1` |
+| `actionlint` | willfell/wac.app.finance | `.github/workflows/ci.yml` | `v1.16.0` |
+| `actionlint` | willfell/wac.app.flights | `.github/workflows/ci.yml` | `v1.16.0` |
+| `actionlint` | willfell/wac.app.handbook | `.github/workflows/ci.yml` | `v1.16.0` |
+| `actionlint` | willfell/wac.app.travel | `.github/workflows/ci.yml` | `v1.16.0` |
+| `actionlint` | willfell/wac.app.wealth | `.github/workflows/ci.yml` | `v1.15.1` |
+| `actionlint` | willfell/wac.docs | `.github/workflows/ci.yml` | `v1.15.1` |
+| `actionlint` | willfell/wac.lab.iac | `.github/workflows/tofu-plan.yml` | `v1.15.1` |
+| `actionlint` | willfell/wac.lab.remote | `.github/workflows/ci.yml` | `v1.15.1` |
+| `actionlint` | willfell/wac.plugins | `.github/workflows/ci.yml` | `v1.15.1` |
+| `actionlint` | willfell/will-fell | `.github/workflows/pr.yml` | `v1.12.2` |
+| `agents-md` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
+| `agents-md` | wacwini/wac.lab | `.github/workflows/ci.yml` | `v1.17.0` |
+| `agents-md` | willfell/wac | `.github/workflows/ci.yml` | `v1.16.0` |
+| `agents-md` | willfell/wac.app.claw | `.github/workflows/ci.yml` | `v1.15.1` |
+| `agents-md` | willfell/wac.app.finance | `.github/workflows/ci.yml` | `v1.16.0` |
+| `agents-md` | willfell/wac.app.flights | `.github/workflows/ci.yml` | `v1.16.0` |
+| `agents-md` | willfell/wac.app.handbook | `.github/workflows/ci.yml` | `v1.16.0` |
+| `agents-md` | willfell/wac.app.travel | `.github/workflows/ci.yml` | `v1.16.0` |
+| `agents-md` | willfell/wac.app.wealth | `.github/workflows/ci.yml` | `v1.15.1` |
+| `agents-md` | willfell/wac.docs | `.github/workflows/ci.yml` | `v1.15.1` |
+| `agents-md` | willfell/wac.lab.iac | `.github/workflows/ci.yml` | `v1.15.1` |
+| `agents-md` | willfell/wac.lab.remote | `.github/workflows/ci.yml` | `v1.15.1` |
+| `agents-md` | willfell/wac.plugins | `.github/workflows/ci.yml` | `v1.15.1` |
+| `lab-gitops-deploy` | willfell/wac | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-gitops-deploy` | willfell/wac.app.finance | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-gitops-deploy` | willfell/wac.app.flights | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-gitops-deploy` | willfell/wac.app.handbook | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-gitops-deploy` | willfell/wac.app.travel | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-gitops-deploy` | willfell/wac.app.wealth | `.github/workflows/ci.yml` | `v1.15.1` |
+| `lab-kubeconform` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
+| `lab-kubeconform` | willfell/wac | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-kubeconform` | willfell/wac.app.finance | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-kubeconform` | willfell/wac.app.flights | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-kubeconform` | willfell/wac.app.handbook | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-kubeconform` | willfell/wac.app.travel | `.github/workflows/ci.yml` | `v1.16.0` |
+| `lab-release` | wacwini/wac.lab | `.github/workflows/warehouse-image.yml` | `v1.17.0` |
+| `lab-tofu-apply` | wacwini/wac.lab | `.github/workflows/tofu-apply.yml` | `v1.17.0` |
+| `lab-tofu-apply` | willfell/wac.lab.iac | `.github/workflows/tofu-apply.yml` | `v1.15.1` |
+| `lab-tofu-plan` | wacwini/wac.lab | `.github/workflows/tofu-drift.yml` | `v1.17.0` |
+| `lab-tofu-plan` | wacwini/wac.lab | `.github/workflows/tofu-plan.yml` | `v1.17.0` |
+| `lab-tofu-plan` | willfell/wac.lab.iac | `.github/workflows/tofu-plan.yml` | `v1.15.1` |
+| `lab-tofu-validate` | willfell/wac.lab.iac | `.github/workflows/tofu-plan.yml` | `v1.15.1` |
+| `lab-tools` | willfell/wac.docs | `.github/workflows/ci.yml` | `v1.15.1` |
+| `nextjs-site-check` | willfell/fellhoelter-consulting | `.github/workflows/pr.yml` | `v1.12.2` |
+| `nextjs-site-check` | willfell/will-fell | `.github/workflows/pr.yml` | `v1.12.2` |
+| `nextjs-site-deploy` | willfell/fellhoelter-consulting | `.github/workflows/deploy.yml` | `v1.12.2` |
+| `nextjs-site-deploy` | willfell/jack-creek-patch | `.github/workflows/deploy.yml` | `v1.12.2` |
+| `nextjs-site-deploy` | willfell/will-fell | `.github/workflows/deploy.yml` | `v1.12.2` |
+| `techdocs` | baton | `.github/workflows/ci.yml` | `v1.15.1` |
+| `techdocs` | wacwini/wac.lab | `.github/workflows/ci.yml` | `v1.17.0` |
+| `techdocs` | willfell/wac | `.github/workflows/ci.yml` | `v1.16.0` |
+| `techdocs` | willfell/wac.app.claw | `.github/workflows/ci.yml` | `v1.15.1` |
+| `techdocs` | willfell/wac.app.finance | `.github/workflows/ci.yml` | `v1.16.0` |
+| `techdocs` | willfell/wac.app.flights | `.github/workflows/ci.yml` | `v1.16.0` |
+| `techdocs` | willfell/wac.app.handbook | `.github/workflows/ci.yml` | `v1.16.0` |
+| `techdocs` | willfell/wac.app.travel | `.github/workflows/ci.yml` | `v1.16.0` |
+| `techdocs` | willfell/wac.app.wealth | `.github/workflows/ci.yml` | `v1.15.1` |
+| `techdocs` | willfell/wac.docs | `.github/workflows/ci.yml` | `v1.15.1` |
+| `techdocs` | willfell/wac.lab.iac | `.github/workflows/ci.yml` | `v1.15.1` |
+| `techdocs` | willfell/wac.lab.remote | `.github/workflows/ci.yml` | `v1.15.1` |
+| `techdocs` | willfell/wac.plugins | `.github/workflows/ci.yml` | `v1.15.1` |
 
 ## Consumers that are not maintained here
 

@@ -100,9 +100,9 @@ def _check_reusable_workflow(path: Path, doc: dict) -> list[str]:
 
 
 def _check_gate_identity(path: Path, doc: dict) -> list[str]:
-    if path.name not in ("agents-md.yml", "techdocs.yml"):
+    if path.name not in ("agents-md.yml", "techdocs.yml", "actionlint.yml"):
         return []
-    steps = (doc.get("jobs", {}).get("gate") or {}).get("steps", [])
+    steps = (doc.get("jobs", {}).get("actionlint" if path.name == "actionlint.yml" else "gate") or {}).get("steps", [])
     shared = [(index, step) for index, step in enumerate(steps)
               if step.get("with", {}).get("repository") == "willfell/wac.lab.actions"]
     if len(shared) != 1:

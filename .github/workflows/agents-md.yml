@@ -13,6 +13,7 @@ permissions:
 jobs:
   gate:
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Require the defining workflow commit

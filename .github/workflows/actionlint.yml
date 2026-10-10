@@ -6,6 +6,18 @@ on:
       runner:
         type: string
         default: ubuntu-latest
+      runner_policy:
+        description: Runner policy mode, legacy or fleet
+        type: string
+        default: legacy
+      transitional_labels:
+        description: Repository pool labels admitted before organization transfer
+        type: string
+        default: ''
+      allowed_host_labels:
+        description: Explicit host runner labels, separated by spaces or commas
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -13,6 +25,7 @@ permissions:
 jobs:
   actionlint:
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,91 +35,38 @@ jobs:
         run: |
           set -eu
           install=""
+          /usr/bin/python3 -c "import yaml" >/dev/null 2>&1 || install=yes
           command -v pipx >/dev/null 2>&1 || install=yes
           command -v shellcheck >/dev/null 2>&1 || install=yes
           if [ -n "$install" ]; then
             if command -v apt-get >/dev/null 2>&1; then
               export DEBIAN_FRONTEND=noninteractive
               sudo apt-get update -qq
-              sudo apt-get install -y -qq --no-install-recommends pipx shellcheck
+              sudo apt-get install -y -qq --no-install-recommends pipx shellcheck python3-yaml
             else
               echo "::warning::pipx/shellcheck absent and no apt-get here; actionlint will attempt its own install"
             fi
           fi
       - uses: raven-actions/actionlint@v2
-      - name: No GitHub-hosted runners
-        if: (success() || failure()) && inputs.runner != 'ubuntu-latest'
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .runner-policy-gate
+          persist-credentials: false
+      - name: Validate runner routing
+        if: success() || failure()
+        env:
+          RUNNER_POLICY: ${{ inputs.runner_policy }}
+          POLICY_RUNNER: ${{ inputs.runner }}
+          TRANSITIONAL_LABELS: ${{ inputs.transitional_labels }}
+          ALLOWED_HOST_LABELS: ${{ inputs.allowed_host_labels }}
         run: |
-          python3 - <<'POLICY'
-          import glob, re, sys
-
-          HOSTED = re.compile(r"^(ubuntu|macos|windows)-", re.I)
-          RUNS_ON = re.compile(r"runs-on:\s*(.*)$")
-          ARRAY = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_-]*):\s*\[(.+)\]\s*$")
-          EXPR = re.compile(r"\$\{\{(.+?)\}\}")
-
-          def split_array(text):
-              return [v.strip().strip("'\"") for v in text.split(",") if v.strip()]
-
-          def resolve(value, matrix):
-              value = value.split("#")[0].strip()
-              if not value:
-                  return []
-              if value.startswith("["):
-                  # inline sequence; ignore anything after the closing bracket,
-                  # which is flow-mapping punctuation rather than a label
-                  end = value.find("]")
-                  return split_array(value[1:end if end != -1 else len(value)])
-              if not value.startswith("$"):
-                  # a plain scalar picks up flow-mapping punctuation when the
-                  # job is written inline, e.g. `jobs: {a: {runs-on: x}}`
-                  value = value.rstrip("}").rstrip(",").strip()
-              expr = EXPR.search(value)
-              if expr:
-                  # Only matrix references resolve to labels we can see here.
-                  # inputs/vars/secrets are supplied by the caller at run time
-                  # and carry no literal, which is what lets a break-glass
-                  # `inputs.runner || 'pool'` pass.
-                  found = []
-                  for ref in re.findall(r"matrix\.([A-Za-z0-9_-]+)", expr.group(1)):
-                      found.extend(matrix.get(ref, []))
-                  return found
-              return [value.strip("'\"")]
-
-          def scan(path):
-              lines = open(path, encoding="utf-8").read().splitlines()
-              matrix = {}
-              for line in lines:
-                  hit = ARRAY.match(line)
-                  if hit:
-                      matrix.setdefault(hit.group(1), []).extend(split_array(hit.group(2)))
-              out = []
-              for i, line in enumerate(lines):
-                  for hit in RUNS_ON.finditer(line):
-                      raw = hit.group(1)
-                      labels = resolve(raw, matrix)
-                      if not labels and not raw.strip():
-                          # block sequence on the following lines
-                          for nxt in lines[i + 1:]:
-                              if not nxt.strip().startswith("-"):
-                                  break
-                              labels.append(nxt.strip()[1:].strip().strip("'\""))
-                      out.extend((i + 1, l) for l in labels if HOSTED.match(l))
-              return out
-
-          findings = []
-          for path in sorted(glob.glob(".github/workflows/*.yml")
-                             + glob.glob(".github/workflows/*.yaml")):
-              findings.extend((path, line, label) for line, label in scan(path))
-
-          for path, line, label in findings:
-              print(f"::error file={path},line={line}::runner policy: {label!r} is a "
-                    "GitHub-hosted runner. This repo runs its lint on a self-hosted "
-                    "pool, so every job here must run on one too. Use this repo's "
-                    "pool label, or stop passing `runner` to the actionlint call if "
-                    "this repo is deliberately GitHub-hosted.")
-          if findings:
-              print(f"{len(findings)} GitHub-hosted runner label(s)", file=sys.stderr)
-              sys.exit(1)
-          print("runner policy: no GitHub-hosted labels")
-          POLICY
+          /usr/bin/python3 .runner-policy-gate/scripts/runner-policy.py \
+            --policy "$RUNNER_POLICY" --runner "$POLICY_RUNNER" \
+            --transitional-labels "$TRANSITIONAL_LABELS" \
+            --allowed-host-labels "$ALLOWED_HOST_LABELS"

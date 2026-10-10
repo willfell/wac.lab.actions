@@ -13,6 +13,7 @@ permissions:
 jobs:
   detect:
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
     outputs:
       mkdocs: ${{ steps.probe.outputs.mkdocs }}
     steps:
@@ -31,6 +32,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.mkdocs == 'true'
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Require the defining workflow commit
