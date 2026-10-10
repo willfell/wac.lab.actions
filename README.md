@@ -554,19 +554,30 @@ jobs:
 | --- | --- | --- |
 | `runner` | `runs-on` label the job is sent to, in the caller's repo | `ubuntu-latest` |
 
-Passing a `runner` other than `ubuntu-latest` also **enables the runner
-policy**: a step that scans the caller's own `.github/workflows/` and fails on
-any `runs-on` resolving to a GitHub-hosted label (`ubuntu-*`, `macos-*`,
-`windows-*`), including through a `matrix` whose values are visible in the file.
+`runner_policy: legacy` remains the default: a non-`ubuntu-latest` runner
+arms the original direct-label scanner, preserving existing callers.
 
-Running your lint on a self-hosted pool is the sovereignty claim, so the claim
-is what arms the check -- a repo that deliberately stays GitHub-hosted passes no
-`runner`, gets the default, and is never scanned. That is deliberate: several
-repos outside the homelab fleet call this workflow and would fail the scan.
+`runner_policy: fleet` validates direct `runs-on`, matrices and reusable
+`with.runner` choices independently of where lint runs. It admits
+`ubuntu-24.04-arm`, the five organization `ci-*` capability labels, and explicit
+`allowed_host_labels`. `transitional_labels` admits repository pools only while
+the caller is outside `wacwini`. Unknown dynamic expressions fail closed.
+The hosted kill switch must use `${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}`.
+Owner conditions are checked on both branches before transfer. After transfer,
+the inactive personal fallback must still be declared in `transitional_labels`,
+but only the organization branch can execute; a direct personal label fails.
 
-Expressions carry no literal label, so a break-glass
-`runs-on: ${{ inputs.runner || 'lab' }}` passes. Self-hosted qualifier labels
-like `[self-hosted, macOS, ARM64]` also pass -- `macOS` is not `macos-*`.
+Helpers bill at most two minutes per private-repository job. Tests, builds,
+Docker and deployment jobs stay on our runners. Public-repository jobs are free.
+Every helper has a ten-minute timeout; timeouts bound failures, not eligibility.
+The library's public smoke matrix alone may request `ubuntu-latest`, explicitly
+through `allowed_host_labels`; another repository cannot use that exception.
+
+| Input | Meaning | Default |
+| --- | --- | --- |
+| `runner_policy` | `legacy` or explicit fleet routing validation | `legacy` |
+| `transitional_labels` | Temporary repository labels, spaces or commas | empty |
+| `allowed_host_labels` | Declared host labels, spaces or commas | empty |
 
 ### nextjs-site-deploy
 

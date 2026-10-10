@@ -1,10 +1,10 @@
-self-hosted-runner:
-  labels:
-    - lab-actions
 paths:
   .github/workflows/techdocs.yml:
     ignore:
       - 'property "workflow_sha" is not defined'
   .github/workflows/agents-md.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined'
+  .github/workflows/actionlint.yml:
     ignore:
       - 'property "workflow_sha" is not defined'

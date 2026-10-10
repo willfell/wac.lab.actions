@@ -34,6 +34,7 @@ python3 .github/scripts/check_actions.py  # needs PyYAML and shellcheck on PATH
 uv run --with pyyaml python .github/scripts/check_actions.py  # the same, without installing PyYAML
 shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
 bash scripts/tests/argo-await-sync.test.sh  # lab-gitops-deploy's Argo wait, against a fake kubectl
+python3 scripts/tests/runner-policy.test.py  # fleet routing and legacy compatibility
 bash scripts/tests/agents-md.test.sh  # the AGENTS.md gate, against fixture repos; needs uv and git
 bash scripts/tests/validate-kustomize.test.sh  # requires kubeconform; schema recovery and strict rejection scenarios
 uv run scripts/agents-md.py check  # this file against the fleet contract
@@ -97,7 +98,10 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    `ubuntu-latest`, and every one of its jobs has `runs-on: ${{ inputs.runner }}`.
    Its jobs run on the caller's runners, so a hardcoded label lands in every
    consumer, and a new default silently moves every existing caller.
-   `check_actions.py` enforces both.
+   `check_actions.py` enforces both. Fleet callers opt into `runner_policy: fleet`;
+   helpers use the configurable ARM hosted label and expensive work uses our
+   capability pools. Legacy caller behavior remains unchanged. This public
+   repository also smoke-tests ubuntu-latest as its explicit policy exception.
 5. Composite actions carry `name`, `description` and `runs.using: composite`;
    every `run:` step has a `shell:`; no step has both `run` and `uses`; every
    input has a description; a required input has no default; bash bodies pass

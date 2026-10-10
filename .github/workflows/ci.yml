@@ -15,7 +15,8 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: lab-actions
+    runs-on: ${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +38,7 @@ jobs:
           python .github/scripts/test_workflow_identity.py
           python scripts/tests/schema-api-proxy.test.py
           python scripts/tests/ci-release.test.py
+          python scripts/tests/runner-policy.test.py
 
       - name: Run the script tests
         run: |
@@ -51,26 +53,32 @@ jobs:
   lint:
     uses: ./.github/workflows/actionlint.yml
     with:
-      runner: lab-actions
+      runner_policy: fleet
+      allowed_host_labels: ubuntu-latest
+      runner: ${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}
     permissions:
       contents: read
 
   techdocs:
     uses: ./.github/workflows/techdocs.yml
     with:
-      runner: lab-actions
+      runner: ${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}
     permissions:
       contents: read
 
   agents-md:
     uses: ./.github/workflows/agents-md.yml
     with:
-      runner: lab-actions
+      runner: ${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}
     permissions:
       contents: read
 
   smoke:
-    runs-on: lab-actions
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: ./lab-tools
