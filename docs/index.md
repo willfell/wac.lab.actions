@@ -34,7 +34,7 @@ Consume at an **exact patch-level tag** — never at `main`, and never at a
 floating major:
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-build@v1.10.5
+- uses: willfell/wac.lab.actions/lab-build@v1.18.0
 ```
 
 `@main` lets an unrelated push here change how a consuming repo builds and
