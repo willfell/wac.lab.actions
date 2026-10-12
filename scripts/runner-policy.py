@@ -9,9 +9,9 @@ import sys
 import yaml
 
 HOSTED = re.compile(r"^(ubuntu|macos|windows)-", re.I)
-FLEET = {'ubuntu-24.04-arm', 'ci-light', 'ci-standard', 'ci-large', 'ci-build', 'ci-build-large'}
-KILL_SWITCH = re.compile(r"^\$\{\{\s*vars\.CI_HOSTED_LABEL\s*\|\|\s*'ubuntu-24\.04-arm'\s*\}\}$")
-OWNER_SWITCH = re.compile(r"^\$\{\{\s*github\.repository_owner\s*==\s*'wacwini'\s*&&\s*'([^']+)'\s*\|\|\s*'([^']+)'\s*\}\}$")
+HOSTED_ARM = 'ubuntu-24.04-arm'
+SIZE = re.compile(r'^vars\.CI_RUNNER_(?:SMALL|STANDARD)$')
+INPUT_OR_SIZE = re.compile(r'^inputs\.runner\s*\|\|\s*(vars\.CI_RUNNER_(?:SMALL|STANDARD))$')
 
 
 def legacy_scan(path):
@@ -57,6 +57,7 @@ def legacy_scan(path):
 
 
 def labels_for(value, matrix, reusable=False):
+    """Every label or size a runner value can resolve to; sizes are returned as `vars.*`."""
     if isinstance(value, list):
         return [label for item in value for label in labels_for(item, matrix, reusable)]
     if isinstance(value, dict):
@@ -65,14 +66,15 @@ def labels_for(value, matrix, reusable=False):
         raise ValueError('runner must resolve to a nonempty label')
     if '${{' not in value:
         return [value]
-    if 'vars.CI_HOSTED_LABEL' in value:
-        if not KILL_SWITCH.fullmatch(value):
-            raise ValueError("CI_HOSTED_LABEL requires vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm'")
-        return ['ubuntu-24.04-arm']
     expr = re.fullmatch(r'\$\{\{\s*(.*?)\s*\}\}', value)
     if not expr:
         raise ValueError('unsupported runner interpolation')
     body = expr[1]
+    if SIZE.fullmatch(body):
+        return [body]
+    size = INPUT_OR_SIZE.fullmatch(body)
+    if size:
+        return [size[1]]
     ref = re.fullmatch(r'matrix\.([A-Za-z0-9_-]+)', body)
     if ref:
         values = matrix.get(ref[1], [])
@@ -82,13 +84,7 @@ def labels_for(value, matrix, reusable=False):
         return labels_for(values, {}, reusable)
     if body == 'inputs.runner' and reusable:
         return []
-    fallback = re.fullmatch(r"inputs\.runner\s*\|\|\s*'([^']+)'", body)
-    if fallback:
-        return [fallback[1]]
-    owner = re.fullmatch(r"github\.repository_owner\s*==\s*'wacwini'\s*&&\s*'([^']+)'\s*\|\|\s*'([^']+)'", body)
-    if owner:
-        return [owner[1], owner[2]]
-    raise ValueError('unsupported dynamic runner expression')
+    raise ValueError('unsupported dynamic runner expression: name a size, vars.CI_RUNNER_SMALL or vars.CI_RUNNER_STANDARD')
 
 
 def fleet_scan(path, repository, transitional=(), hosts=()):
@@ -97,9 +93,8 @@ def fleet_scan(path, repository, transitional=(), hosts=()):
     invalid_hosts = [label for label in hosts if HOSTED.match(label) and label != 'ubuntu-latest']
     if invalid_hosts:
         raise ValueError('host exceptions cannot admit other GitHub-hosted labels')
-    allowed = FLEET | set(hosts)
-    if repository.split('/')[0] != 'wacwini':
-        allowed |= set(transitional)
+    organization = repository.split('/')[0] == 'wacwini'
+    allowed = set(hosts) | ({HOSTED_ARM} | set(transitional) if not organization else set())
     doc = yaml.safe_load(path.read_text()) or {}
     triggers = doc.get('on', doc.get(True, {})) or {}
     reusable = isinstance(triggers, dict) and 'workflow_call' in triggers
@@ -111,25 +106,20 @@ def fleet_scan(path, repository, transitional=(), hosts=()):
         values = []
         if 'runs-on' in job:
             values.append(('runs-on', job['runs-on']))
-        if 'uses' in job:
-            inputs = job.get('with') or {}
-            if 'runner' in inputs:
-                values.append(('with.runner', inputs['runner']))
-            elif job['uses'].startswith(('willfell/wac.lab.actions/.github/workflows/', './.github/workflows/')):
-                findings.append((name, 'with.runner', 'shared reusable workflow requires an explicit runner'))
+        if 'uses' in job and 'runner' in (job.get('with') or {}):
+            values.append(('with.runner', job['with']['runner']))
         for key, value in values:
             try:
                 labels = labels_for(value, matrix, reusable)
             except ValueError as exc:
                 findings.append((name, key, str(exc)))
                 continue
-            owner_switch = OWNER_SWITCH.fullmatch(value) if isinstance(value, str) else None
-            if owner_switch and repository.split('/')[0] == 'wacwini':
-                if owner_switch[2] not in transitional:
-                    findings.append((name, key, 'inactive owner fallback must be a declared transitional label'))
-                labels = [owner_switch[1]]
             for label in labels:
-                if label not in allowed or (HOSTED.match(label) and label not in {'ubuntu-24.04-arm', 'ubuntu-latest'}):
+                if label.startswith('vars.') or label in allowed:
+                    continue
+                if organization:
+                    findings.append((name, key, f'literal runner label {label!r}; organization jobs name a size variable'))
+                else:
                     findings.append((name, key, f'runner label {label!r} is not admitted'))
     return findings
 
