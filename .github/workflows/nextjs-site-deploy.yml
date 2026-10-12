@@ -4,8 +4,9 @@ on:
   workflow_call:
     inputs:
       runner:
+        description: Runner label; empty uses the caller's CI_RUNNER_SMALL variable
         type: string
-        default: ubuntu-latest
+        default: ''
       app_dir:
         type: string
         default: app
@@ -47,7 +48,7 @@ permissions:
 
 jobs:
   build-and-deploy:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     permissions:
       id-token: write
       contents: read

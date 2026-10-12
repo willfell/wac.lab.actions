@@ -4,15 +4,16 @@ on:
   workflow_call:
     inputs:
       runner:
+        description: Runner label; empty uses the caller's CI_RUNNER_SMALL variable
         type: string
-        default: ubuntu-latest
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
   detect:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 10
     outputs:
       mkdocs: ${{ steps.probe.outputs.mkdocs }}
@@ -31,7 +32,7 @@ jobs:
   gate:
     needs: detect
     if: needs.detect.outputs.mkdocs == 'true'
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

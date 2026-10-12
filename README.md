@@ -23,7 +23,7 @@ Consume at an **exact patch-level tag** — never at `main`, and never at a floa
 major:
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-build@v1.19.0
+- uses: willfell/wac.lab.actions/lab-build@v1.20.0
 ```
 
 `@main` lets an unrelated push here change how a consuming repo builds and deploys.
@@ -92,7 +92,7 @@ re-plans at apply time, so a drift or a racing change lands without anyone havin
 reviewed it.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-tofu-plan@v1.19.0
+- uses: willfell/wac.lab.actions/lab-tofu-plan@v1.20.0
   with:
     working_directory: infra/cloudflare
     role_arn: arn:aws:iam::634560051830:role/lab-cloudflare-plan
@@ -163,7 +163,7 @@ assuming any cloud role or reading any state. It installs OpenTofu itself, so a
 caller drops its own setup step.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-tofu-validate@v1.19.0
+- uses: willfell/wac.lab.actions/lab-tofu-validate@v1.20.0
   with:
     working_directory: infra
 ```
@@ -195,7 +195,7 @@ tool's release-asset arch naming, so the same call works unmodified on
 GitHub-hosted amd64 runners and this homelab's arm64 self-hosted runners.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-tools@v1.19.0
+- uses: willfell/wac.lab.actions/lab-tools@v1.20.0
   with:
     tools: kubectl,kustomize,crane,kubeconform
 ```
@@ -224,7 +224,7 @@ just built. This canonicalizes the ~150-line version of this job that
 finance, flight-checker, and wac each carried and drifted independently.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-gitops-deploy@v1.19.0
+- uses: willfell/wac.lab.actions/lab-gitops-deploy@v1.20.0
   with:
     image: finance-app
     argo_app: finance
@@ -464,7 +464,7 @@ had drifted onto different tool versions and, on the arm64 consumers, hard-
 coded release-asset URLs for that one architecture.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-kubeconform@v1.19.0
+- uses: willfell/wac.lab.actions/lab-kubeconform@v1.20.0
   with:
     kustomize_dir: deploy/k8s
 ```
@@ -507,29 +507,26 @@ run an empty installer.
 Reusable workflows ride the same repo-wide exact tags as the composites above --
 consume at an exact patch-level tag, never `@main` or a floating major.
 
-**Every one of them takes a `runner` input, and every one of them defaults it to
-`ubuntu-latest`.** A reusable workflow's jobs run on the *caller's* runners,
-billed to the caller and queued against the caller's pools -- but the label is
-written here, in this repo. So a hardcoded `runs-on` put a GitHub-hosted job into
-every consumer's pipeline, including repos that had otherwise moved onto
-self-hosted pools, and it was invisible from the caller's side. Pass `runner`
-with your own pool's label to keep the job on your infrastructure:
+**Every reusable workflow takes an optional `runner` input. When the caller
+passes none, the job runs on the caller's `CI_RUNNER_SMALL` variable; a caller
+passes `runner: ${{ vars.CI_RUNNER_STANDARD }}` for a build.** A reusable
+workflow's jobs run on the *caller's* runners, billed to the caller and queued
+against the caller's pools, so the label has to come from the caller. A caller
+that sets neither the input nor `CI_RUNNER_SMALL` fails at once instead of
+landing on a hosted runner.
 
 ```yaml
 jobs:
   lint:
-    uses: willfell/wac.lab.actions/.github/workflows/actionlint.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/actionlint.yml@v1.20.0
     with:
-      runner: lab
+      runner: ${{ vars.CI_RUNNER_STANDARD }}
 ```
 
-The default is deliberate and load-bearing: a caller that passes nothing behaves
-exactly as it did before the input existed, so bumping the tag is not a runner
-change. `runs-on` receives the value as a single label, so `runner` takes one
-label (`ubuntu-latest`, `lab`, `wac`) rather than a list -- a multi-label
-self-hosted set like `[self-hosted, macOS, ARM64]` cannot be expressed through
-it. `.github/scripts/check_actions.py` fails CI if any reusable workflow here
-hardcodes `runs-on`, omits the input, or changes its default.
+`runs-on` receives the value as a single label, so `runner` takes one label
+rather than a list. `.github/scripts/check_actions.py` fails CI if any reusable
+workflow here hardcodes `runs-on`, omits the input, or gives it a non-empty
+default.
 
 ### actionlint
 
@@ -545,27 +542,27 @@ GitHub-hosted caller pays nothing.
 ```yaml
 jobs:
   lint:
-    uses: willfell/wac.lab.actions/.github/workflows/actionlint.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/actionlint.yml@v1.20.0
     permissions:
       contents: read
 ```
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `runner` | `runs-on` label the job is sent to, in the caller's repo | `ubuntu-latest` |
+| `runner` | `runs-on` label the job is sent to, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
 
 `runner_policy: legacy` remains the default: a non-`ubuntu-latest` runner
 arms the original direct-label scanner, preserving existing callers.
 
 `runner_policy: fleet` validates direct `runs-on`, matrices and reusable
-`with.runner` choices independently of where lint runs. It admits
-`ubuntu-24.04-arm`, the five organization `ci-*` capability labels, and explicit
-`allowed_host_labels`. `transitional_labels` admits repository pools only while
-the caller is outside `wacwini`. Unknown dynamic expressions fail closed.
-The hosted kill switch must use `${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}`.
-Owner conditions are checked on both branches before transfer. After transfer,
-the inactive personal fallback must still be declared in `transitional_labels`,
-but only the organization branch can execute; a direct personal label fails.
+`with.runner` choices independently of where lint runs. Inside `wacwini`,
+`runs-on` and `with.runner` accept only `${{ vars.CI_RUNNER_SMALL }}`,
+`${{ vars.CI_RUNNER_STANDARD }}`, `${{ inputs.runner || vars.CI_RUNNER_<SIZE> }}`,
+bare `${{ inputs.runner }}` in a `workflow_call` workflow, matrices of those,
+and `allowed_host_labels`. Literal `vars.*` text and empty `runs-on` values
+(`[]`, or a dict without `labels`) fail. Outside the organization the literal
+`ubuntu-24.04-arm` and `transitional_labels` are also accepted. `CI_HOSTED_LABEL`
+and owner switches are gone.
 
 Helpers bill at most two minutes per private-repository job. Tests, builds,
 Docker and deployment jobs stay on our runners. Public-repository jobs are free.
@@ -592,7 +589,7 @@ drifted -- one step and one invalidation path apart.
 ```yaml
 jobs:
   deploy:
-    uses: willfell/wac.lab.actions/.github/workflows/nextjs-site-deploy.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/nextjs-site-deploy.yml@v1.20.0
     permissions:
       id-token: write
       contents: read
@@ -606,7 +603,7 @@ jobs:
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `runner` | `runs-on` label the job is sent to, in the caller's repo | `ubuntu-latest` |
+| `runner` | `runs-on` label the job is sent to, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
 | `app_dir` | Directory holding the Next.js app | `app` |
 | `node_version` | Node release installed before `yarn install` | `22` |
 | `role_arn` | OIDC role assumed for the AWS credentials used to deploy | required |
@@ -649,12 +646,12 @@ Next.js site still builds, without any of the deploy steps.
 ```yaml
 jobs:
   check:
-    uses: willfell/wac.lab.actions/.github/workflows/nextjs-site-check.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/nextjs-site-check.yml@v1.20.0
 ```
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `runner` | `runs-on` label the job is sent to, in the caller's repo | `ubuntu-latest` |
+| `runner` | `runs-on` label the job is sent to, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
 | `app_dir` | Directory holding the Next.js app | `app` |
 | `node_version` | Node release installed before `yarn install` | `22` |
 
@@ -671,14 +668,14 @@ same shape on docs.wacwini.com.
 ```yaml
 jobs:
   techdocs:
-    uses: willfell/wac.lab.actions/.github/workflows/techdocs.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/techdocs.yml@v1.20.0
     with:
       runner: lab
 ```
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `runner` | `runs-on` label the jobs are sent to, in the caller's repo | `ubuntu-latest` |
+| `runner` | `runs-on` label the jobs are sent to, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
 
 The gate is two steps, and both have to pass:
 
@@ -730,7 +727,7 @@ disagree: a stale context file is worse than none, because an agent trusts it.
 ```yaml
 jobs:
   agents-md:
-    uses: willfell/wac.lab.actions/.github/workflows/agents-md.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/agents-md.yml@v1.20.0
     with:
       runner: lab
     permissions:
@@ -739,7 +736,7 @@ jobs:
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `runner` | `runs-on` label the job is sent to, in the caller's repo | `ubuntu-latest` |
+| `runner` | `runs-on` label the job is sent to, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
 
 The job checks this repo out a second time at `job.workflow_sha`, into
 `.agents-md-gate`, exactly as `techdocs` does, and runs
