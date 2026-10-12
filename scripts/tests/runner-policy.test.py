@@ -91,6 +91,20 @@ class RunnerPolicyTests(unittest.TestCase):
             path.write_text('jobs: {a: {runs-on: ubuntu-latest}}')
             self.assertEqual(policy.legacy_scan(path), [(1, 'ubuntu-latest')])
 
+    def test_legacy_scan_stays_unarmed_for_an_empty_runner(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'ci.yml').write_text('jobs: {a: {runs-on: ubuntu-latest}}')
+            argv = ['runner-policy.py', '--policy', 'legacy', '--runner', '', '--directory', tmp]
+            out = io.StringIO()
+            with mock.patch('sys.argv', argv), contextlib.redirect_stdout(out):
+                code = policy.main()
+            self.assertEqual(code, 0)
+            self.assertIn('legacy scan is unarmed', out.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()

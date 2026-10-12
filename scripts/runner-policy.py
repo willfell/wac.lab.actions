@@ -146,7 +146,7 @@ def main():
     parser.add_argument('--allowed-host-labels', default='')
     parser.add_argument('--directory', type=Path, default=Path('.github/workflows'))
     args = parser.parse_args()
-    if args.policy == 'legacy' and args.runner == 'ubuntu-latest':
+    if args.policy == 'legacy' and (not args.runner or args.runner == 'ubuntu-latest'):
         print('runner policy: legacy scan is unarmed')
         return 0
     paths = sorted([*args.directory.glob('*.yml'), *args.directory.glob('*.yaml')])

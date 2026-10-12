@@ -4,6 +4,7 @@ on:
   workflow_call:
     inputs:
       runner:
+        description: Runner label; empty uses the caller's CI_RUNNER_SMALL variable
         type: string
         default: ''
 
