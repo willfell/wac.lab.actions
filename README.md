@@ -23,7 +23,7 @@ Consume at an **exact patch-level tag** — never at `main`, and never at a floa
 major:
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-build@v1.19.0
+- uses: willfell/wac.lab.actions/lab-build@v1.20.0
 ```
 
 `@main` lets an unrelated push here change how a consuming repo builds and deploys.
@@ -92,7 +92,7 @@ re-plans at apply time, so a drift or a racing change lands without anyone havin
 reviewed it.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-tofu-plan@v1.19.0
+- uses: willfell/wac.lab.actions/lab-tofu-plan@v1.20.0
   with:
     working_directory: infra/cloudflare
     role_arn: arn:aws:iam::634560051830:role/lab-cloudflare-plan
@@ -163,7 +163,7 @@ assuming any cloud role or reading any state. It installs OpenTofu itself, so a
 caller drops its own setup step.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-tofu-validate@v1.19.0
+- uses: willfell/wac.lab.actions/lab-tofu-validate@v1.20.0
   with:
     working_directory: infra
 ```
@@ -195,7 +195,7 @@ tool's release-asset arch naming, so the same call works unmodified on
 GitHub-hosted amd64 runners and this homelab's arm64 self-hosted runners.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-tools@v1.19.0
+- uses: willfell/wac.lab.actions/lab-tools@v1.20.0
   with:
     tools: kubectl,kustomize,crane,kubeconform
 ```
@@ -224,7 +224,7 @@ just built. This canonicalizes the ~150-line version of this job that
 finance, flight-checker, and wac each carried and drifted independently.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-gitops-deploy@v1.19.0
+- uses: willfell/wac.lab.actions/lab-gitops-deploy@v1.20.0
   with:
     image: finance-app
     argo_app: finance
@@ -464,7 +464,7 @@ had drifted onto different tool versions and, on the arm64 consumers, hard-
 coded release-asset URLs for that one architecture.
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-kubeconform@v1.19.0
+- uses: willfell/wac.lab.actions/lab-kubeconform@v1.20.0
   with:
     kustomize_dir: deploy/k8s
 ```
@@ -518,7 +518,7 @@ landing on a hosted runner.
 ```yaml
 jobs:
   lint:
-    uses: willfell/wac.lab.actions/.github/workflows/actionlint.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/actionlint.yml@v1.20.0
     with:
       runner: ${{ vars.CI_RUNNER_STANDARD }}
 ```
@@ -542,7 +542,7 @@ GitHub-hosted caller pays nothing.
 ```yaml
 jobs:
   lint:
-    uses: willfell/wac.lab.actions/.github/workflows/actionlint.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/actionlint.yml@v1.20.0
     permissions:
       contents: read
 ```
@@ -589,7 +589,7 @@ drifted -- one step and one invalidation path apart.
 ```yaml
 jobs:
   deploy:
-    uses: willfell/wac.lab.actions/.github/workflows/nextjs-site-deploy.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/nextjs-site-deploy.yml@v1.20.0
     permissions:
       id-token: write
       contents: read
@@ -646,7 +646,7 @@ Next.js site still builds, without any of the deploy steps.
 ```yaml
 jobs:
   check:
-    uses: willfell/wac.lab.actions/.github/workflows/nextjs-site-check.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/nextjs-site-check.yml@v1.20.0
 ```
 
 | Input | Meaning | Default |
@@ -668,7 +668,7 @@ same shape on docs.wacwini.com.
 ```yaml
 jobs:
   techdocs:
-    uses: willfell/wac.lab.actions/.github/workflows/techdocs.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/techdocs.yml@v1.20.0
     with:
       runner: lab
 ```
@@ -727,7 +727,7 @@ disagree: a stale context file is worse than none, because an agent trusts it.
 ```yaml
 jobs:
   agents-md:
-    uses: willfell/wac.lab.actions/.github/workflows/agents-md.yml@v1.19.0
+    uses: willfell/wac.lab.actions/.github/workflows/agents-md.yml@v1.20.0
     with:
       runner: lab
     permissions:
