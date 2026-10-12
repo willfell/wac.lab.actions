@@ -5,14 +5,14 @@ on:
     inputs:
       runner:
         type: string
-        default: ubuntu-latest
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
   gate:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

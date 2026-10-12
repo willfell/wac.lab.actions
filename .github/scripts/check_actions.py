@@ -31,8 +31,8 @@ FLOATING_REFS = ("@main", "@master")
 #: The input every reusable workflow here exposes so a caller can send the job
 #: to its own runners, and the default that keeps pre-input callers unchanged.
 RUNNER_INPUT = "runner"
-DEFAULT_RUNNER = "ubuntu-latest"
-RUNS_ON_EXPRESSION = "${{ inputs.runner }}"
+DEFAULT_RUNNER = ""
+RUNS_ON_EXPRESSION = "${{ inputs.runner || vars.CI_RUNNER_SMALL }}"
 
 
 def _action_files() -> list[Path]:
@@ -122,16 +122,10 @@ def _check_runner_is_a_caller_choice(path: Path, doc: dict) -> list[str]:
     """A reusable workflow must let the caller pick the runner.
 
     A reusable-workflow job runs on the CALLER's runners, billed to the caller
-    and queued against the caller's pools -- but the label is written here. So
-    one hardcoded `runs-on: ubuntu-latest` in this repo silently put a
-    GitHub-hosted job into every consumer's pipeline, including the repos that
-    had otherwise moved entirely onto self-hosted ARC pools. That is why this
-    is a check rather than a note: the mistake is invisible from the caller's
-    side, where the only visible symptom is a bill and a runner name nobody
-    reads.
-
-    The default keeps `ubuntu-latest`, so a caller that passes nothing is
-    byte-identical to the behaviour before the input existed.
+    and queued against the caller's pools. The caller's `CI_RUNNER_SMALL`
+    variable chooses the runner unless the caller passes `runner`. The input
+    defaults to an empty string, so a caller with neither fails at once
+    instead of silently landing on a hosted runner.
     """
     triggers = doc.get("on") or doc.get(True) or {}
     call = triggers.get("workflow_call") or {}

@@ -5,7 +5,7 @@ on:
     inputs:
       runner:
         type: string
-        default: ubuntu-latest
+        default: ''
       runner_policy:
         description: Runner policy mode, legacy or fleet
         type: string
@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   actionlint:
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: ${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -55,21 +55,21 @@ jobs:
     with:
       runner_policy: fleet
       allowed_host_labels: ubuntu-latest
-      runner: ${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}
+      runner: ubuntu-24.04-arm
     permissions:
       contents: read
 
   techdocs:
     uses: ./.github/workflows/techdocs.yml
     with:
-      runner: ${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}
+      runner: ubuntu-24.04-arm
     permissions:
       contents: read
 
   agents-md:
     uses: ./.github/workflows/agents-md.yml
     with:
-      runner: ${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}
+      runner: ubuntu-24.04-arm
     permissions:
       contents: read
 

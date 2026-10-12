@@ -30,6 +30,7 @@ Reading the table:
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.20.0` | <merge date> | `actionlint`, `techdocs`, `agents-md`, `nextjs-site-check`, `nextjs-site-deploy` | fleet policy accepts runner size variables and rejects literal labels inside `wacwini`; `runner` is optional on every reusable workflow and defaults to the caller's `CI_RUNNER_SMALL`; `CI_HOSTED_LABEL` and owner expressions are no longer accepted. Callers in `wacwini` must set the two organization variables (wac.lab.iac) before bumping. No fleet-rule changes |
 | `v1.19.0` | 2026-10-11 | `agents-md` | fleet rule 5 names the plugins repository at its new home, `wacwini/wac.plugins`, after its move to the wacwini organization; `willfell/wac.plugins` now only redirects. No workflow or script behaviour changes, but every consumer must re-render its AGENTS.md tail at the bump or its gate fails |
 | `v1.18.0` | 2026-10-10 | `actionlint`, `techdocs`, `agents-md` | Add opt-in fleet runner validation for direct jobs, reusable runner inputs, visible matrices and hosted kill switches; preserve legacy defaults, pin policy source to defining workflow SHA, and bound helper jobs to ten minutes. No fleet-rule changes |
 | `v1.17.0` | 2026-10-10 | `lab-release`, `lab-gitops-deploy` | Add TLS-verified GitHub OIDC release receipts and an optional scoped deployment route; direct release jobs opting in require `id-token: write`, Lab service activation and public runner trust. Preserve legacy defaults and served-source/database verification. No fleet-rule changes |

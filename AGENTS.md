@@ -94,14 +94,16 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    (a new required input is a minor too); major is reserved.
 3. The `CHANGELOG.md` row lands in the PR that makes the change and names
    components. README-only and CI-only changes are not releases and get no row.
-4. Every reusable workflow declares a `runner` input defaulting to
-   `ubuntu-latest`, and every one of its jobs has `runs-on: ${{ inputs.runner }}`.
-   Its jobs run on the caller's runners, so a hardcoded label lands in every
-   consumer, and a new default silently moves every existing caller.
-   `check_actions.py` enforces both. Fleet callers opt into `runner_policy: fleet`;
-   helpers use the configurable ARM hosted label and expensive work uses our
-   capability pools. Legacy caller behavior remains unchanged. This public
-   repository also smoke-tests ubuntu-latest as its explicit policy exception.
+4. Every reusable workflow declares a `runner` input of `type: string` with
+   `default: ''`, and every one of its jobs has
+   `runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}`. Its jobs run on the
+   caller's runners, so a hardcoded label lands in every consumer, and a
+   non-empty default silently moves every existing caller. `check_actions.py`
+   enforces both. Fleet callers opt into `runner_policy: fleet`, which inside
+   `wacwini` accepts only the `CI_RUNNER_SMALL` and `CI_RUNNER_STANDARD`
+   variables. This public repository's own CI uses the literal
+   `ubuntu-24.04-arm` and smoke-tests ubuntu-latest as its explicit policy
+   exception.
 5. Composite actions carry `name`, `description` and `runs.using: composite`;
    every `run:` step has a `shell:`; no step has both `run` and `uses`; every
    input has a description; a required input has no default; bash bodies pass
