@@ -11,6 +11,12 @@ import yaml
 HOSTED = re.compile(r"^(ubuntu|macos|windows)-", re.I)
 HOSTED_ARM = 'ubuntu-24.04-arm'
 SIZE = re.compile(r'^vars\.CI_RUNNER_(?:SMALL|STANDARD)$')
+
+
+class Size(str):
+    pass
+
+
 INPUT_OR_SIZE = re.compile(r'^inputs\.runner\s*\|\|\s*(vars\.CI_RUNNER_(?:SMALL|STANDARD))$')
 
 
@@ -59,9 +65,13 @@ def legacy_scan(path):
 def labels_for(value, matrix, reusable=False):
     """Every label or size a runner value can resolve to; sizes are returned as `vars.*`."""
     if isinstance(value, list):
+        if not value:
+            raise ValueError('runner must resolve to a nonempty label')
         return [label for item in value for label in labels_for(item, matrix, reusable)]
     if isinstance(value, dict):
-        return labels_for(value.get('labels', []), matrix, reusable)
+        if not value.get('labels'):
+            raise ValueError('runner must resolve to a nonempty label')
+        return labels_for(value['labels'], matrix, reusable)
     if not isinstance(value, str) or not value:
         raise ValueError('runner must resolve to a nonempty label')
     if '${{' not in value:
@@ -71,10 +81,10 @@ def labels_for(value, matrix, reusable=False):
         raise ValueError('unsupported runner interpolation')
     body = expr[1]
     if SIZE.fullmatch(body):
-        return [body]
+        return [Size(body)]
     size = INPUT_OR_SIZE.fullmatch(body)
     if size:
-        return [size[1]]
+        return [Size(size[1])]
     ref = re.fullmatch(r'matrix\.([A-Za-z0-9_-]+)', body)
     if ref:
         values = matrix.get(ref[1], [])
@@ -115,7 +125,7 @@ def fleet_scan(path, repository, transitional=(), hosts=()):
                 findings.append((name, key, str(exc)))
                 continue
             for label in labels:
-                if label.startswith('vars.') or label in allowed:
+                if isinstance(label, Size) or label in allowed:
                     continue
                 if organization:
                     findings.append((name, key, f'literal runner label {label!r}; organization jobs name a size variable'))

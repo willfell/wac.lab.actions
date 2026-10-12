@@ -30,6 +30,21 @@ class RunnerPolicyTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertTrue(self.scan('jobs:\n  a:\n    runs-on: ' + value, repository=self.ORG))
 
+    def test_bare_vars_text_is_a_literal_label(self):
+        for value in ['vars.CI_RUNNER_SMAL', 'vars.CI_RUNNER_SMALL', 'vars.CI_RUNNER_STANDARD', '[vars.CI_RUNNER_SMALL]']:
+            with self.subTest(value=value):
+                self.assertTrue(self.scan('jobs:\n  a:\n    runs-on: ' + value, repository=self.ORG))
+        for label in ['vars.CI_RUNNER_SMAL', 'vars.CI_RUNNER_SMALL']:
+            with self.subTest(matrix=label):
+                source = 'jobs:\n  a:\n    strategy:\n      matrix:\n        size: ["${{ vars.CI_RUNNER_SMALL }}", ' + label + ']\n    runs-on: ${{ matrix.size }}'
+                self.assertTrue(self.scan(source, repository=self.ORG))
+
+    def test_empty_runner_values_fail(self):
+        for value in ['{group: big}', '{labels: []}', '[]', '{}']:
+            for repository in [self.ORG, 'willfell/example']:
+                with self.subTest(value=value, repository=repository):
+                    self.assertTrue(self.scan('jobs:\n  a:\n    runs-on: ' + value, repository=repository))
+
     def test_host_labels_stay_literal_inside_the_organization(self):
         source = 'jobs:\n  a:\n    runs-on: rpo-mac-mini\n  b:\n    runs-on: [self-hosted, rpo-mac-mini]\n  c:\n    runs-on: ' + self.STANDARD
         self.assertEqual(self.scan(source, repository=self.ORG, hosts=('self-hosted', 'rpo-mac-mini')), [])
