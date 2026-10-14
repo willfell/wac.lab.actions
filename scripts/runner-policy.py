@@ -10,14 +10,14 @@ import yaml
 
 HOSTED = re.compile(r"^(ubuntu|macos|windows)-", re.I)
 HOSTED_ARM = 'ubuntu-24.04-arm'
-SIZE = re.compile(r'^vars\.CI_RUNNER_(?:SMALL|STANDARD)$')
+SIZE = re.compile(r'^vars\.CI_RUNNER_(?:SMALL|STANDARD|LARGE)$')
 
 
 class Size(str):
     pass
 
 
-INPUT_OR_SIZE = re.compile(r'^inputs\.runner\s*\|\|\s*(vars\.CI_RUNNER_(?:SMALL|STANDARD))$')
+INPUT_OR_SIZE = re.compile(r'^inputs\.runner\s*\|\|\s*(vars\.CI_RUNNER_(?:SMALL|STANDARD|LARGE))$')
 
 
 def legacy_scan(path):
@@ -94,7 +94,7 @@ def labels_for(value, matrix, reusable=False):
         return labels_for(values, {}, reusable)
     if body == 'inputs.runner' and reusable:
         return []
-    raise ValueError('unsupported dynamic runner expression: name a size, vars.CI_RUNNER_SMALL or vars.CI_RUNNER_STANDARD')
+    raise ValueError('unsupported dynamic runner expression: name a size, vars.CI_RUNNER_SMALL, vars.CI_RUNNER_STANDARD or vars.CI_RUNNER_LARGE')
 
 
 def fleet_scan(path, repository, transitional=(), hosts=()):

@@ -100,8 +100,8 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    caller's runners, so a hardcoded label lands in every consumer, and a
    non-empty default silently moves every existing caller. `check_actions.py`
    enforces both. Fleet callers opt into `runner_policy: fleet`, which inside
-   `wacwini` accepts only the `CI_RUNNER_SMALL` and `CI_RUNNER_STANDARD`
-   variables. This public repository's own CI uses the literal
+   `wacwini` accepts only the `CI_RUNNER_SMALL`, `CI_RUNNER_STANDARD` and
+   `CI_RUNNER_LARGE` variables. This public repository's own CI uses the literal
    `ubuntu-24.04-arm` and smoke-tests ubuntu-latest as its explicit policy
    exception.
 5. Composite actions carry `name`, `description` and `runs.using: composite`;
