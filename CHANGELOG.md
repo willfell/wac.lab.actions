@@ -30,6 +30,7 @@ Reading the table:
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.21.0` | 2026-10-14 | `actionlint` | fleet policy also accepts `CI_RUNNER_LARGE`, the heavy-test-suite size (organization default ci-standard, set in wac.lab.iac); no other change. No fleet-rule changes |
 | `v1.20.0` | 2026-10-12 | `actionlint`, `techdocs`, `agents-md`, `nextjs-site-check`, `nextjs-site-deploy` | fleet policy accepts runner size variables and rejects literal labels inside `wacwini`; `runner` is optional on every reusable workflow and defaults to the caller's `CI_RUNNER_SMALL`; `CI_HOSTED_LABEL` and owner expressions are no longer accepted. Callers in `wacwini` must set the two organization variables (wac.lab.iac) before bumping. No fleet-rule changes |
 | `v1.19.0` | 2026-10-11 | `agents-md` | fleet rule 5 names the plugins repository at its new home, `wacwini/wac.plugins`, after its move to the wacwini organization; `willfell/wac.plugins` now only redirects. No workflow or script behaviour changes, but every consumer must re-render its AGENTS.md tail at the bump or its gate fails |
 | `v1.18.0` | 2026-10-10 | `actionlint`, `techdocs`, `agents-md` | Add opt-in fleet runner validation for direct jobs, reusable runner inputs, visible matrices and hosted kill switches; preserve legacy defaults, pin policy source to defining workflow SHA, and bound helper jobs to ten minutes. No fleet-rule changes |

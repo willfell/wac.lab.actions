@@ -25,6 +25,19 @@ class RunnerPolicyTests(unittest.TestCase):
                 self.assertEqual(self.scan('jobs:\n  a:\n    runs-on: ' + value, repository=self.ORG), [])
                 self.assertEqual(self.scan('jobs:\n  a:\n    uses: willfell/wac.lab.actions/.github/workflows/techdocs.yml@v1.20.0\n    with:\n      runner: ' + value, repository=self.ORG), [])
 
+    def test_organization_accepts_the_large_size(self):
+        for value in ['${{ vars.CI_RUNNER_LARGE }}', '${{ inputs.runner || vars.CI_RUNNER_LARGE }}']:
+            with self.subTest(value=value):
+                self.assertEqual(self.scan('jobs:\n  a:\n    runs-on: ' + value, repository=self.ORG), [])
+                self.assertEqual(self.scan('jobs:\n  a:\n    uses: willfell/wac.lab.actions/.github/workflows/techdocs.yml@v1.20.0\n    with:\n      runner: ' + value, repository=self.ORG), [])
+        mixed = 'jobs:\n  a:\n    strategy:\n      matrix:\n        size: ["${{ vars.CI_RUNNER_LARGE }}", "${{ vars.CI_RUNNER_STANDARD }}"]\n    runs-on: ${{ matrix.size }}'
+        self.assertEqual(self.scan(mixed, repository=self.ORG), [])
+
+    def test_large_literal_and_misspelling_fail(self):
+        for value in ['vars.CI_RUNNER_LARGE', '${{ vars.CI_RUNNER_LARG }}', 'vars.CI_RUNNER_LARG']:
+            with self.subTest(value=value):
+                self.assertTrue(self.scan('jobs:\n  a:\n    runs-on: ' + value, repository=self.ORG))
+
     def test_organization_literals_and_old_expressions_fail(self):
         for value in ['ci-build', 'ci-standard', 'ubuntu-24.04-arm', 'ubuntu-latest', "${{ vars.CI_HOSTED_LABEL || 'ubuntu-24.04-arm' }}", "${{ github.repository_owner == 'wacwini' && 'ci-standard' || 'finance' }}", "${{ inputs.runner || 'ci-light' }}", "${{ vars.CI_RUNNER_SMALL || 'ci-light' }}", '${{ vars.CI_RUNNER_SMAL }}', '${{ secrets.RUNNER }}']:
             with self.subTest(value=value):
