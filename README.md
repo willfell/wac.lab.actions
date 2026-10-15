@@ -546,20 +546,27 @@ jobs:
 | `runners` | Compact JSON object mapping each job key to its label, e.g. `{"persistence":"ci-standard","base":"ci-standard","browser":"ubuntu-24.04-arm"}` |
 | `reason` | Short reason for the decision, e.g. `2 of 3 Lab slots free` or `cpu pressure 0.52 above 0.4` |
 
-**The decision.** The action asks Prometheus three instant queries, five
-seconds each: the runner pods in the pool, the VM's CPU pressure, and the p95
-of production's health-probe latency. If a query fails or returns no usable
+**The decision.** The action asks Prometheus three instant queries: the
+runner pods in the pool, the VM's CPU pressure, and the p95 of production's
+health-probe latency. The five-second timeout applies to each connect and
+socket read, not to DNS resolution, so give the route job
+`timeout-minutes: 2` as in the example. An idle pool reads as 0 pods; a
+missing `kube_pod_info` series reads as a failed query, not as a free Lab. If a query fails or returns no usable
 number, if CPU pressure is above `max-cpu-pressure`, or if probe p95 is above
 `max-probe-p95-ms`, every job goes to `overflow`. Otherwise free slots are
 `capacity` minus the pool's current pods, and the first that many job keys, in
 the order given, go to `lab`; the rest go to `overflow`. A route job that runs
 in the pool it measures does not count its own pod. When `lab` and `overflow`
-are the same label, nothing is measured and every job gets that label.
+are the same label, nothing is measured and every job gets that label. When
+`pool` is left empty and `lab` cannot name a Lab scale set (a size variable set
+to a hosted label such as `ubuntu-24.04-arm`), every job goes to `overflow`
+and the step succeeds.
 
 **Prometheus never fails the job.** A timeout, refused connection, HTTP error
 or malformed answer sends every job to `overflow`, and `reason` says which
 query failed. Only malformed inputs fail the step: an empty label, an empty or
-repeated job key, a key that is not an identifier, or a non-numeric limit.
+repeated job key, a key that is not an identifier, a non-numeric limit, or an
+explicitly passed `pool` holding anything but letters, digits and `-`.
 
 **It only works inside the Lab cluster.** Prometheus is a cluster-internal
 service, reachable from runner pods in `arc-runners` and from nowhere else. The
@@ -580,7 +587,13 @@ The `actionlint` fleet policy accepts
 `runs-on: ${{ fromJSON(needs.<route>.outputs.runners).<key> }}` (or `['<key>']`)
 only when `<route>` is in the job's `needs`, exports `outputs.runners` from a
 `willfell/wac.lab.actions/lab-route@<tag>` step, passes `lab` and `overflow` as
-size variables, and lists `<key>` in `jobs`.
+size variables, and lists `<key>` in `jobs`. The route job must hold that one
+step and no `container`, `services` or `env`, and the workflow `env` must not set
+`PATH`, `BASH_ENV`, `ENV`, `LD_*` or `PYTHON*`: each of those could change which
+interpreter or files the action runs. The action runs its script with
+`python3 -I`. The policy names the action by its `willfell/` path, so moving
+this repository to another owner needs a matching change in
+`scripts/runner-policy.py`, or every routed workflow fails lint.
 
 The decision logic and the Prometheus client are tested by
 `scripts/tests/lab-route.test.py` against a local stub server. This repo's CI

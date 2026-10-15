@@ -103,14 +103,17 @@ ROUTED = re.compile(
     r"(?:\.(" + KEY + r")|\[\s*'(" + KEY + r")'\s*\])\s*\}\}"
 )
 ROUTER_ACTION = re.compile(r'^willfell/wac\.lab\.actions/lab-route@[A-Za-z0-9._/-]+$')
+LOADER_ENV = re.compile(r'^(PATH|BASH_ENV|ENV|LD_.*|PYTHON.*)$', re.I)
 
 
-def routed_runner(value, name, job, jobs, repository, reusable):
+def routed_runner(value, name, job, jobs, repository, reusable, workflow_env=None):
     """Check `fromJSON(needs.<J>.outputs.runners).<key>`; None when value is not that form.
 
     The labels come from a lab-route step whose `lab` and `overflow` are sizes,
     so the job still runs on a size; anything else wired the same way is not
-    admitted.
+    admitted. The router job must be that one step with nothing around it: an
+    earlier step, a container or an environment can change which python3 or
+    which files the action runs, and with them the labels it prints.
     """
     hit = ROUTED.fullmatch(value) if isinstance(value, str) else None
     if not hit:
@@ -127,6 +130,13 @@ def routed_runner(value, name, job, jobs, repository, reusable):
     uses = (step or {}).get('uses', '')
     if not (ROUTER_ACTION.match(uses) or (uses == './lab-route' and repository == 'willfell/wac.lab.actions')):
         return f'router job {router_name!r} must export outputs.runners from a willfell/wac.lab.actions/lab-route step'
+    if len(router.get('steps') or []) != 1:
+        return f'router job {router_name!r} must hold only the lab-route step'
+    if any(field in router for field in ('container', 'services', 'env')) or 'env' in step:
+        return f'router job {router_name!r} must not set container, services or env'
+    loader = sorted(key for key in (workflow_env or {}) if LOADER_ENV.match(str(key)))
+    if loader:
+        return f'workflow env {loader[0]} would change how lab-route runs'
     inputs = step.get('with') or {}
     for field in ('lab', 'overflow'):
         try:
@@ -159,7 +169,7 @@ def fleet_scan(path, repository, transitional=(), hosts=()):
             matrix = {}
         values = []
         if 'runs-on' in job:
-            routed = routed_runner(job['runs-on'], name, job, jobs, repository, reusable)
+            routed = routed_runner(job['runs-on'], name, job, jobs, repository, reusable, doc.get('env') if isinstance(doc.get('env'), dict) else {})
             if routed:
                 findings.append((name, 'runs-on', routed))
             elif routed is None:

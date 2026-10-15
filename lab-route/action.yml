@@ -48,4 +48,4 @@ runs:
         MAX_CPU_PRESSURE: ${{ inputs.max-cpu-pressure }}
         MAX_PROBE_P95_MS: ${{ inputs.max-probe-p95-ms }}
       run: |
-        python3 "${{ github.action_path }}/../scripts/lab-route.py"
+        python3 -I "${{ github.action_path }}/../scripts/lab-route.py"

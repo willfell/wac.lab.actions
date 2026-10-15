@@ -91,6 +91,19 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(set(runners.values()), {LAB})
         self.assertIn('same label', reason)
 
+    def test_hosted_lab_label_equal_to_overflow_is_not_an_error(self):
+        runners, reason = route.decide(config(lab=HOSTED), None)
+        self.assertEqual(set(runners.values()), {HOSTED})
+        self.assertIn('same label', reason)
+
+    def test_lab_label_that_cannot_name_a_pool_overflows(self):
+        cfg = config(lab='ubuntu-24.04-arm', overflow='ci-standard')
+        self.assertTrue(cfg.pool_error)
+        runners, reason = route.decide(cfg, None)
+        self.assertEqual(set(runners.values()), {'ci-standard'})
+        self.assertIn("lab label 'ubuntu-24.04-arm' is not a Lab pool", reason)
+        self.assertFalse(route.own_pod_in_pool(cfg, 'ubuntu-24.04-arm-x-runner-y'))
+
     def test_capacity_zero_overflows(self):
         runners, _ = route.decide(config(capacity='0'), measured(pods=0))
         self.assertEqual(set(runners.values()), {HOSTED})
@@ -100,7 +113,8 @@ class ConfigTests(unittest.TestCase):
     def test_pool_defaults_to_the_lab_label(self):
         self.assertEqual(config().pool, LAB)
         self.assertEqual(config(pool='ci-large').pool, 'ci-large')
-        self.assertEqual(route.pod_query(config()), 'count(kube_pod_info{namespace="arc-runners",pod=~"ci-standard-.*-runner-.*"}) or vector(0)')
+        self.assertEqual(route.pod_query(config()), 'count(kube_pod_info{namespace="arc-runners",pod=~"ci-standard-.*-runner-.*"}) or (0 * count(kube_pod_info))')
+        self.assertNotIn('vector(', route.pod_query(config()))
 
     def test_malformed_input_is_rejected(self):
         cases = [
@@ -116,6 +130,7 @@ class ConfigTests(unittest.TestCase):
             {'max-cpu-pressure': 'nan'},
             {'max-probe-p95-ms': ''},
             {'pool': 'ci.standard'},
+            {'pool': 'ubuntu-24.04-arm', 'lab': 'ubuntu-24.04-arm', 'overflow': 'ubuntu-24.04-arm'},
             {'pool': 'ci"} or vector(9) #'},
             {'prometheus': 'file:///etc/passwd'},
         ]
@@ -205,6 +220,7 @@ class ActionTests(unittest.TestCase):
             {'kube_pod_info': (500, '{}')},
             {'kube_pod_info': (200, 'not json')},
             {'kube_pod_info': (200, '{"status":"error","error":"bad query"}')},
+            {'kube_pod_info': (200, '{"status":"success","data":{"resultType":"vector","result":[]}}')},
             {'kube_pod_info': vector('1'), 'node_pressure': (200, '{"status":"success","data":{"resultType":"vector","result":[]}}')},
             {'kube_pod_info': vector('1'), 'node_pressure': vector('NaN')},
         ]
@@ -217,6 +233,14 @@ class ActionTests(unittest.TestCase):
                 self.assertEqual(set(json.loads(outputs['runners']).values()), {HOSTED})
                 self.assertTrue(outputs['reason'].startswith('prometheus query failed'))
                 self.assertNotIn('\n', outputs['reason'])
+
+    def test_hosted_lab_label_succeeds_without_measuring(self):
+        for lab, overflow in [(HOSTED, HOSTED), (HOSTED, LAB)]:
+            with self.subTest(lab=lab, overflow=overflow):
+                code, outputs, summary, _ = self.run_action('http://127.0.0.1:9', LAB=lab, OVERFLOW=overflow)
+                self.assertEqual(code, 0)
+                self.assertEqual(set(json.loads(outputs['runners']).values()), {overflow})
+                self.assertIn('not measured', summary)
 
     def test_malformed_input_fails_the_step(self):
         code, outputs, _, out = self.run_action('http://127.0.0.1:9', JOBS='a a')

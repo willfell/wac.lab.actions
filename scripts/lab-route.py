@@ -34,6 +34,7 @@ class Config:
     prometheus: str
     max_cpu: float
     max_probe_ms: float
+    pool_error: str = ''
 
 
 @dataclass
@@ -69,9 +70,16 @@ def parse_config(values: dict[str, str]) -> Config:
         raise ValueError('jobs must not repeat a key')
     if not re.fullmatch(r'\d+', values['capacity'].strip()):
         raise ValueError(f"capacity must be a whole number, got {values['capacity']!r}")
-    pool = values['pool'].strip() or lab
-    if not POOL.match(pool):
+    pool = values['pool'].strip()
+    pool_error = ''
+    if pool and not POOL.match(pool):
         raise ValueError(f'pool {pool!r} must hold only letters, digits and -')
+    if not pool:
+        pool = lab
+        # A size variable may name a hosted label. That is a routing fact,
+        # not a caller mistake, so it overflows instead of failing the step.
+        if not POOL.match(lab):
+            pool_error = f'lab label {lab!r} is not a Lab pool'
     prometheus = values['prometheus'].strip().rstrip('/')
     if urllib.parse.urlparse(prometheus).scheme not in ('http', 'https'):
         raise ValueError(f'prometheus must be an http or https URL, got {prometheus!r}')
@@ -84,19 +92,23 @@ def parse_config(values: dict[str, str]) -> Config:
         prometheus=prometheus,
         max_cpu=_number('max-cpu-pressure', values['max-cpu-pressure']),
         max_probe_ms=_number('max-probe-p95-ms', values['max-probe-p95-ms']),
+        pool_error=pool_error,
     )
 
 
 def pod_query(config: Config) -> str:
-    # `count` of nothing is an empty vector, not 0, so an idle pool needs the
-    # explicit fallback to read as zero pods rather than as a failed query.
-    return f'count(kube_pod_info{{namespace="arc-runners",pod=~"{config.pool}-.*-runner-.*"}}) or vector(0)'
+    # `count` of nothing is an empty vector, not 0. The fallback reads an idle
+    # pool as 0 only while kube_pod_info exists at all, so a missing metric is
+    # still an empty answer and a failed query rather than a free Lab.
+    return f'count(kube_pod_info{{namespace="arc-runners",pod=~"{config.pool}-.*-runner-.*"}}) or (0 * count(kube_pod_info))'
 
 
 def own_pod_in_pool(config: Config, runner_name: str) -> bool:
     # ARC names the runner after its pod. The route job normally runs in a
     # smaller pool and never matches; this only matters if a caller puts it in
     # the pool it is measuring.
+    if config.pool_error:
+        return False
     return re.fullmatch(f'{config.pool}-.*-runner-.*', runner_name) is not None
 
 
@@ -106,6 +118,8 @@ def decide(config: Config, measured: Measurement | None, own_pod_in_pool: bool =
 
     if config.lab == config.overflow:
         return split(len(config.jobs)), 'lab and overflow are the same label'
+    if config.pool_error:
+        return split(0), config.pool_error
     if measured is None or measured.error:
         return split(0), f'prometheus query failed ({measured.error if measured else "not measured"})'
     if measured.cpu > config.max_cpu:
@@ -194,7 +208,7 @@ def main() -> int:
 
     measured = None
     try:
-        if config.lab != config.overflow:
+        if config.lab != config.overflow and not config.pool_error:
             measured = measure(config)
         runners, reason = decide(config, measured, own_pod_in_pool(config, env.get('RUNNER_NAME', '')))
         line = summary_line(config, measured, runners, reason)

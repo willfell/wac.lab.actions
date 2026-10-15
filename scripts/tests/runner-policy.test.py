@@ -142,6 +142,20 @@ class RunnerPolicyTests(unittest.TestCase):
             with self.subTest(output=output):
                 self.assertRejected(self.routed(output=output), 'from a willfell/wac.lab.actions/lab-route step')
 
+    def test_router_job_is_only_the_router_step(self):
+        prior = self.routed().replace('    steps:\n', '    steps:\n      - run: echo /tmp/fake >> "$GITHUB_PATH"\n')
+        self.assertRejected(prior, 'only the lab-route step')
+        after = self.routed().replace('  persistence:\n', '      - run: echo done\n  persistence:\n')
+        self.assertRejected(after, 'only the lab-route step')
+        for line in ['    container: example/evil-python:1\n', '    services:\n      db:\n        image: postgres:17\n', '    env:\n      PATH: /tmp/fake\n']:
+            with self.subTest(line=line):
+                self.assertRejected(self.routed().replace('    outputs:\n', line + '    outputs:\n'), 'container, services or env')
+        self.assertRejected(self.routed().replace('        with:\n', '        env:\n          PATH: /tmp/fake\n        with:\n'), 'container, services or env')
+        for key in ['PATH', 'BASH_ENV', 'PYTHONPATH', 'LD_PRELOAD']:
+            with self.subTest(key=key):
+                self.assertRejected(f'env:\n  {key}: /tmp/fake\n' + self.routed(), f'workflow env {key}')
+        self.assertEqual(self.scan('env:\n  NODE_VERSION: "24"\n' + self.routed(), repository=self.ORG), [])
+
     def test_router_key_must_be_one_of_its_jobs(self):
         self.assertRejected(self.routed(runs_on='${{ fromJSON(needs.route.outputs.runners).browser }}'), "router key 'browser'")
 
