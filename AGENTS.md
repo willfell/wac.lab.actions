@@ -1,6 +1,6 @@
 # wac.lab.actions
 
-The fleet's shared CI library, catalog Component `lab-actions`: nine composite
+The fleet's shared CI library, catalog Component `lab-actions`: ten composite
 GitHub Actions and five reusable workflows that the other repos' workflows call
 at exact tags. It has no runtime. It builds no image, deploys nothing, and runs
 no service; every effect it has happens inside someone else's CI. It is public
@@ -35,6 +35,7 @@ uv run --with pyyaml python .github/scripts/check_actions.py  # the same, withou
 shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
 bash scripts/tests/argo-await-sync.test.sh  # lab-gitops-deploy's Argo wait, against a fake kubectl
 python3 scripts/tests/runner-policy.test.py  # fleet routing and legacy compatibility
+python3 scripts/tests/lab-route.test.py  # lab-route decisions, against a stub Prometheus
 bash scripts/tests/agents-md.test.sh  # the AGENTS.md gate, against fixture repos; needs uv and git
 bash scripts/tests/validate-kustomize.test.sh  # requires kubeconform; schema recovery and strict rejection scenarios
 uv run scripts/agents-md.py check  # this file against the fleet contract
@@ -52,9 +53,9 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
 
 ## Layout
 
-- `lab-*/action.yml`: the nine composite actions, one directory each:
+- `lab-*/action.yml`: the ten composite actions, one directory each:
   `lab-build`, `lab-deploy`, `lab-gitops-deploy`, `lab-release`, `lab-kubeconform`,
-  `lab-tofu-plan`, `lab-tofu-apply`, `lab-tofu-validate`, `lab-tools`.
+  `lab-route`, `lab-tofu-plan`, `lab-tofu-apply`, `lab-tofu-validate`, `lab-tools`.
 - `.github/workflows/`: the reusable workflows `actionlint.yml`,
   `nextjs-site-check.yml`, `nextjs-site-deploy.yml`, `techdocs.yml` and
   `agents-md.yml`, plus `ci.yml`, this repo's own CI, which calls `actionlint`,
@@ -64,7 +65,8 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
   `lab-kubeconform` and `lab-tools`; `argo-await-sync.sh` is
   `lab-gitops-deploy`; `check-docs-nav.sh` is `techdocs`; `agents-md.py` is
   `agents-md`; `validate-kustomize.sh` and `schema-api-proxy.py` are
-  `lab-kubeconform`.
+  `lab-kubeconform`; `runner-policy.py` is `actionlint`; `lab-route.py` is
+  `lab-route`.
 - `agents-md/fleet-rules.md`: the fleet-wide rules every fleet AGENTS.md tail
   carries verbatim.
 - `scripts/tests/`: scenario tests, run by `ci.yml` and shipped to no consumer.

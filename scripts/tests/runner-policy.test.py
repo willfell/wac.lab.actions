@@ -96,6 +96,108 @@ class RunnerPolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.scan(source, hosts=('ubuntu-latest',))
 
+    ROUTER_STEP = '      - id: route\n        uses: {uses}\n        with:\n          lab: {lab}\n          overflow: {overflow}\n          jobs: persistence base\n'
+
+    def routed(self, runs_on='${{ fromJSON(needs.route.outputs.runners).persistence }}', needs='[route]', router='route', uses='willfell/wac.lab.actions/lab-route@v1.22.0', lab='${{ vars.CI_RUNNER_STANDARD }}', overflow='${{ vars.CI_RUNNER_LARGE }}', output='${{ steps.route.outputs.runners }}'):
+        return (
+            'jobs:\n'
+            f'  {router}:\n'
+            '    runs-on: ${{ vars.CI_RUNNER_SMALL }}\n'
+            '    outputs:\n'
+            f'      runners: {output}\n'
+            '    steps:\n'
+            + self.ROUTER_STEP.format(uses=uses, lab=lab, overflow=overflow)
+            + '  persistence:\n'
+            f'    needs: {needs}\n'
+            f'    runs-on: {runs_on}\n'
+        )
+
+    def assertRejected(self, source, reason):
+        findings = self.scan(source, repository=self.ORG)
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn(reason, findings[0][2])
+
+    def test_router_wiring_is_accepted(self):
+        for runs_on in ['${{ fromJSON(needs.route.outputs.runners).persistence }}', "${{ fromJSON(needs.route.outputs.runners)['base'] }}", '${{fromJson(needs.route.outputs.runners).base}}']:
+            with self.subTest(runs_on=runs_on):
+                self.assertEqual(self.scan(self.routed(runs_on=runs_on), repository=self.ORG), [])
+        self.assertEqual(self.scan(self.routed(needs='route'), repository=self.ORG), [])
+        self.assertEqual(self.scan(self.routed(lab='${{ inputs.runner || vars.CI_RUNNER_STANDARD }}'), repository=self.ORG), [])
+        self.assertEqual(self.scan(self.routed(uses='./lab-route'), repository='willfell/wac.lab.actions'), [])
+
+    def test_router_missing_from_needs_fails(self):
+        for needs in ['[]', '[other]', 'other']:
+            with self.subTest(needs=needs):
+                self.assertRejected(self.routed(needs=needs), 'must be in needs')
+        self.assertRejected(self.routed().replace('    needs: [route]\n', ''), 'must be in needs')
+
+    def test_router_with_literal_lab_or_overflow_fails(self):
+        for change in [{'lab': 'ci-standard'}, {'overflow': 'ubuntu-24.04-arm'}, {'overflow': "${{ inputs.runner || 'ubuntu-latest' }}"}, {'lab': '${{ matrix.size }}'}, {'lab': "''"}]:
+            with self.subTest(change=change):
+                self.assertRejected(self.routed(**change), 'must name a size variable')
+        self.assertRejected(self.routed().replace('          overflow: ${{ vars.CI_RUNNER_LARGE }}\n', ''), 'with.overflow must name a size variable')
+
+    def test_router_output_must_come_from_the_router_step(self):
+        for output in ['${{ steps.other.outputs.runners }}', '{"persistence": "ubuntu-latest"}', '${{ steps.route.outputs.reason }}']:
+            with self.subTest(output=output):
+                self.assertRejected(self.routed(output=output), 'from a willfell/wac.lab.actions/lab-route step')
+
+    def test_router_job_is_only_the_router_step(self):
+        prior = self.routed().replace('    steps:\n', '    steps:\n      - run: echo /tmp/fake >> "$GITHUB_PATH"\n')
+        self.assertRejected(prior, 'only the lab-route step')
+        after = self.routed().replace('  persistence:\n', '      - run: echo done\n  persistence:\n')
+        self.assertRejected(after, 'only the lab-route step')
+        for line in ['    container: example/evil-python:1\n', '    services:\n      db:\n        image: postgres:17\n', '    env:\n      PATH: /tmp/fake\n']:
+            with self.subTest(line=line):
+                self.assertRejected(self.routed().replace('    outputs:\n', line + '    outputs:\n'), 'container, services or env')
+        self.assertRejected(self.routed().replace('        with:\n', '        env:\n          PATH: /tmp/fake\n        with:\n'), 'container, services or env')
+        for key in ['PATH', 'BASH_ENV', 'PYTHONPATH', 'LD_PRELOAD']:
+            with self.subTest(key=key):
+                self.assertRejected(f'env:\n  {key}: /tmp/fake\n' + self.routed(), f'workflow env {key}')
+        self.assertEqual(self.scan('env:\n  NODE_VERSION: "24"\n' + self.routed(), repository=self.ORG), [])
+
+    def test_router_key_must_be_one_of_its_jobs(self):
+        self.assertRejected(self.routed(runs_on='${{ fromJSON(needs.route.outputs.runners).browser }}'), "router key 'browser'")
+
+    def test_other_needs_and_fromjson_forms_fail(self):
+        for runs_on in [
+            '${{ fromJSON(needs.route.outputs.labels).persistence }}',
+            '${{ fromJSON(needs.route.outputs.runners) }}',
+            '${{ needs.route.outputs.runners }}',
+            '${{ needs.route.outputs.persistence }}',
+            "${{ fromJSON('[\"ci-standard\"]') }}",
+            '${{ fromJSON(vars.RUNNERS).persistence }}',
+            '${{ fromJSON(needs.route.outputs.runners).persistence || vars.CI_RUNNER_SMALL }}',
+        ]:
+            with self.subTest(runs_on=runs_on):
+                self.assertRejected(self.routed(runs_on=runs_on), 'unsupported dynamic runner expression')
+
+    def test_fromjson_of_another_jobs_output_fails(self):
+        source = self.routed(runs_on='${{ fromJSON(needs.build.outputs.runners).persistence }}', needs='[route, build]') + '  build:\n    runs-on: ${{ vars.CI_RUNNER_SMALL }}\n    outputs:\n      runners: ${{ steps.pick.outputs.runners }}\n    steps:\n      - id: pick\n        run: echo runners={} >> "$GITHUB_OUTPUT"\n'
+        self.assertRejected(source, "router job 'build' must export outputs.runners from a willfell/wac.lab.actions/lab-route step")
+        self.assertRejected(self.routed(runs_on='${{ fromJSON(needs.ghost.outputs.runners).persistence }}', needs='[ghost]'), "router job 'ghost' is not a job")
+
+    def test_non_router_job_named_route_fails(self):
+        source = (
+            'jobs:\n'
+            '  route:\n'
+            '    runs-on: ${{ vars.CI_RUNNER_SMALL }}\n'
+            '    outputs:\n'
+            '      runners: ${{ steps.route.outputs.runners }}\n'
+            '    steps:\n'
+            '      - id: route\n'
+            '        run: echo \'runners={"persistence":"ubuntu-latest"}\' >> "$GITHUB_OUTPUT"\n'
+            '  persistence:\n'
+            '    needs: [route]\n'
+            '    runs-on: ${{ fromJSON(needs.route.outputs.runners).persistence }}\n'
+        )
+        self.assertRejected(source, 'from a willfell/wac.lab.actions/lab-route step')
+
+    def test_router_step_from_another_action_fails(self):
+        for uses in ['someone/wac.lab.actions/lab-route@v1.22.0', 'willfell/wac.lab.actions/lab-tools@v1.22.0', 'willfell/wac.lab.actions/lab-route', './lab-route', 'willfell/wac.lab.actions/lab-route-fork@v1.22.0']:
+            with self.subTest(uses=uses):
+                self.assertRejected(self.routed(uses=uses), 'from a willfell/wac.lab.actions/lab-route step')
+
     def test_legacy_retains_old_expression_and_with_runner_behavior(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'ci.yml'

@@ -1,0 +1,51 @@
+name: lab-route
+description: Send each listed job to the Lab runner pool while it has free slots and is healthy, and to the overflow label otherwise
+inputs:
+  lab:
+    description: Lab runner label, passed as a size variable such as vars.CI_RUNNER_STANDARD
+    required: true
+  overflow:
+    description: Fallback runner label, passed as a size variable such as vars.CI_RUNNER_LARGE
+    required: true
+  jobs:
+    description: Space-separated job keys, highest priority for Lab slots first
+    required: true
+  capacity:
+    description: Lab slots in the pool
+    default: "3"
+  pool:
+    description: Runner scale set whose pods are counted; empty uses the lab label
+    default: ""
+  prometheus:
+    description: Prometheus base URL reachable from Lab runner pods
+    default: http://prometheus-operated.observability.svc:9090
+  max-cpu-pressure:
+    description: Highest VM CPU pressure, in waiting seconds per second, that still routes to Lab
+    default: "0.4"
+  max-probe-p95-ms:
+    description: Highest p95 production health-probe latency, in milliseconds, that still routes to Lab
+    default: "30"
+outputs:
+  runners:
+    description: Compact JSON object mapping each job key to its runner label
+    value: ${{ steps.route.outputs.runners }}
+  reason:
+    description: Why the jobs went where they did
+    value: ${{ steps.route.outputs.reason }}
+runs:
+  using: composite
+  steps:
+    - name: Route jobs
+      id: route
+      shell: bash
+      env:
+        LAB: ${{ inputs.lab }}
+        OVERFLOW: ${{ inputs.overflow }}
+        JOBS: ${{ inputs.jobs }}
+        CAPACITY: ${{ inputs.capacity }}
+        POOL: ${{ inputs.pool }}
+        PROMETHEUS: ${{ inputs.prometheus }}
+        MAX_CPU_PRESSURE: ${{ inputs.max-cpu-pressure }}
+        MAX_PROBE_P95_MS: ${{ inputs.max-probe-p95-ms }}
+      run: |
+        python3 -I "${{ github.action_path }}/../scripts/lab-route.py"
