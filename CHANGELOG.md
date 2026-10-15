@@ -21,6 +21,8 @@ Reading the table:
   | `scripts/argo-await-sync.sh` | `lab-gitops-deploy` |
   | `scripts/check-docs-nav.sh` | `techdocs` |
   | `scripts/agents-md.py`, `agents-md/` | `agents-md` |
+  | `scripts/runner-policy.py` | `actionlint` |
+  | `scripts/lab-route.py` | `lab-route` |
   | `scripts/tests/` | none; CI only |
 
 - A tag that changes `agents-md/fleet-rules.md` fails every `agents-md`
@@ -30,6 +32,7 @@ Reading the table:
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.22.0` | 2026-10-15 | `lab-route`, `actionlint` | new `lab-route` composite sends a workflow's heavy jobs to a Lab pool while Prometheus shows free slots, CPU pressure and probe p95 under their limits, and to an overflow label otherwise; it must run on `CI_RUNNER_SMALL` inside Lab. The fleet policy accepts `runs-on: ${{ fromJSON(needs.<route>.outputs.runners).<key> }}` only when wired to a `lab-route` step with size-variable `lab` and `overflow`. No fleet-rule changes |
 | `v1.21.0` | 2026-10-14 | `actionlint` | fleet policy also accepts `CI_RUNNER_LARGE`, the heavy-test-suite size (organization default ci-standard, set in wac.lab.iac); no other change. No fleet-rule changes |
 | `v1.20.0` | 2026-10-12 | `actionlint`, `techdocs`, `agents-md`, `nextjs-site-check`, `nextjs-site-deploy` | fleet policy accepts runner size variables and rejects literal labels inside `wacwini`; `runner` is optional on every reusable workflow and defaults to the caller's `CI_RUNNER_SMALL`; `CI_HOSTED_LABEL` and owner expressions are no longer accepted. Callers in `wacwini` must set the two organization variables (wac.lab.iac) before bumping. No fleet-rule changes |
 | `v1.19.0` | 2026-10-11 | `agents-md` | fleet rule 5 names the plugins repository at its new home, `wacwini/wac.plugins`, after its move to the wacwini organization; `willfell/wac.plugins` now only redirects. No workflow or script behaviour changes, but every consumer must re-render its AGENTS.md tail at the bump or its gate fails |

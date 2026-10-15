@@ -22,6 +22,7 @@ consuming repository.
 | `lab-tofu-apply` | Guard and apply the reviewed plan file on merge |
 | `lab-tofu-validate` | Check formatting and validate every OpenTofu root under a directory, no credentials needed |
 | `lab-tools` | Install the fleet's k8s and registry tooling, arch-aware, onto `PATH` |
+| `lab-route` | Send heavy jobs to a Lab runner pool when it has room, and to an overflow label otherwise |
 
 Five reusable workflows ride the same tags: `actionlint.yml` (the fleet's
 shared lint and runner-policy gate), `nextjs-site-check.yml`,
@@ -34,7 +35,7 @@ Consume at an **exact patch-level tag** — never at `main`, and never at a
 floating major:
 
 ```yaml
-- uses: willfell/wac.lab.actions/lab-build@v1.21.0
+- uses: willfell/wac.lab.actions/lab-build@v1.22.0
 ```
 
 `@main` lets an unrelated push here change how a consuming repo builds and

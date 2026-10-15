@@ -39,6 +39,7 @@ jobs:
           python scripts/tests/schema-api-proxy.test.py
           python scripts/tests/ci-release.test.py
           python scripts/tests/runner-policy.test.py
+          python scripts/tests/lab-route.test.py
 
       - name: Run the script tests
         run: |

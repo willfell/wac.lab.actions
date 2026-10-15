@@ -97,6 +97,49 @@ def labels_for(value, matrix, reusable=False):
     raise ValueError('unsupported dynamic runner expression: name a size, vars.CI_RUNNER_SMALL, vars.CI_RUNNER_STANDARD or vars.CI_RUNNER_LARGE')
 
 
+KEY = r'[A-Za-z_][A-Za-z0-9_-]*'
+ROUTED = re.compile(
+    r'\$\{\{\s*(?i:fromjson)\(\s*needs\.(' + KEY + r')\.outputs\.runners\s*\)'
+    r"(?:\.(" + KEY + r")|\[\s*'(" + KEY + r")'\s*\])\s*\}\}"
+)
+ROUTER_ACTION = re.compile(r'^willfell/wac\.lab\.actions/lab-route@[A-Za-z0-9._/-]+$')
+
+
+def routed_runner(value, name, job, jobs, repository, reusable):
+    """Check `fromJSON(needs.<J>.outputs.runners).<key>`; None when value is not that form.
+
+    The labels come from a lab-route step whose `lab` and `overflow` are sizes,
+    so the job still runs on a size; anything else wired the same way is not
+    admitted.
+    """
+    hit = ROUTED.fullmatch(value) if isinstance(value, str) else None
+    if not hit:
+        return None
+    router_name, key = hit[1], hit[2] or hit[3]
+    needs = job.get('needs') or []
+    if router_name not in ([needs] if isinstance(needs, str) else needs):
+        return f'router job {router_name!r} must be in needs'
+    router = jobs.get(router_name)
+    if router_name == name or not isinstance(router, dict):
+        return f'router job {router_name!r} is not a job in this workflow'
+    output = re.fullmatch(r'\$\{\{\s*steps\.(' + KEY + r')\.outputs\.runners\s*\}\}', str((router.get('outputs') or {}).get('runners', '')))
+    step = next((s for s in router.get('steps') or [] if isinstance(s, dict) and output and s.get('id') == output[1]), None)
+    uses = (step or {}).get('uses', '')
+    if not (ROUTER_ACTION.match(uses) or (uses == './lab-route' and repository == 'willfell/wac.lab.actions')):
+        return f'router job {router_name!r} must export outputs.runners from a willfell/wac.lab.actions/lab-route step'
+    inputs = step.get('with') or {}
+    for field in ('lab', 'overflow'):
+        try:
+            labels = labels_for(inputs.get(field), {}, reusable)
+        except ValueError:
+            labels = []
+        if not labels or not all(isinstance(label, Size) for label in labels):
+            return f'lab-route with.{field} must name a size variable'
+    if key not in str(inputs.get('jobs', '')).split():
+        return f'router key {key!r} is not in the lab-route jobs input'
+    return ''
+
+
 def fleet_scan(path, repository, transitional=(), hosts=()):
     if 'ubuntu-latest' in hosts and repository != 'willfell/wac.lab.actions':
         raise ValueError('ubuntu-latest exception belongs only to willfell/wac.lab.actions')
@@ -109,13 +152,18 @@ def fleet_scan(path, repository, transitional=(), hosts=()):
     triggers = doc.get('on', doc.get(True, {})) or {}
     reusable = isinstance(triggers, dict) and 'workflow_call' in triggers
     findings = []
-    for name, job in (doc.get('jobs') or {}).items():
+    jobs = doc.get('jobs') or {}
+    for name, job in jobs.items():
         matrix = (job.get('strategy') or {}).get('matrix') or {}
         if not isinstance(matrix, dict):
             matrix = {}
         values = []
         if 'runs-on' in job:
-            values.append(('runs-on', job['runs-on']))
+            routed = routed_runner(job['runs-on'], name, job, jobs, repository, reusable)
+            if routed:
+                findings.append((name, 'runs-on', routed))
+            elif routed is None:
+                values.append(('runs-on', job['runs-on']))
         if 'uses' in job and 'runner' in (job.get('with') or {}):
             values.append(('with.runner', job['with']['runner']))
         for key, value in values:
