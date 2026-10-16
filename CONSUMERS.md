@@ -71,7 +71,7 @@ wacwini/baton `.github/workflows/ci.yml`, wacwini/wac.lab
 | `lab-kubeconform` | wacwini/wac.app.flights | `.github/workflows/ci.yml` | `v1.22.0` |
 | `lab-kubeconform` | wacwini/wac.app.handbook | `.github/workflows/ci.yml` | `v1.22.0` |
 | `lab-kubeconform` | wacwini/wac.app.travel | `.github/workflows/ci.yml` | `v1.22.0` |
-| `lab-release` | wacwini/baton | `.github/workflows/ci.yml` | `v1.22.0` |
+| `lab-release` | wacwini/baton | `.github/workflows/ci.yml` | `v1.23.0` |
 | `lab-release` | wacwini/wac.lab | `.github/workflows/warehouse-image.yml` | `v1.22.0` |
 | `lab-route` | wacwini/baton | `.github/workflows/ci.yml` | `v1.22.0` |
 | `lab-tofu-apply` | wacwini/wac.lab | `.github/workflows/tofu-apply.yml` | `v1.22.0` |
