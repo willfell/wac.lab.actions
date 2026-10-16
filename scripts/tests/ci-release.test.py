@@ -104,7 +104,12 @@ class ReleaseTests(unittest.TestCase):
         ):
             self.assertEqual(release.run(args), value)
             self.assertEqual(request.call_args.args[0], {"operation": "status"})
-        for operation, image in [("sync", tagged), ("status", "")]:
+        for operation, image in [
+            ("sync", tagged),
+            ("status", ""),
+            ("status", "localhost:30500/baton:main-" + "e" * 40),
+            ("status", "localhost:30500/baton:latest"),
+        ]:
             args = argparse.Namespace(
                 operation=operation, pin_sha="", expected_image=image, wait_timeout=30, min_replicas=2
             )
