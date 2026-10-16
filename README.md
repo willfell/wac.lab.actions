@@ -974,7 +974,7 @@ Do not route an existing release here before its live proof and activation gates
 | Input | Meaning | Default |
 | --- | --- | --- |
 | `operation` | `status` for Baton, `sync` for Finance/Wealth, `migrate` for Lab | required |
-| `pin_sha` | Exact pin commit for status/sync | empty |
+| `pin_sha` | Exact pin commit for status/sync; empty for Baton's status by image tag | empty |
 | `expected_image` | Exact image reference, including digest where the caller pins one | empty |
 | `image_tag`, `image_digest` | Warehouse image identity for migrate | empty |
 | `min_replicas` | Required ready replica floor; Baton must pass `2` | `1` |
@@ -987,7 +987,11 @@ retry within the deadline. A migration succeeds only with matching source,
 image, run ID/attempt and successful warehouse then ecosystem receipts. Call
 this before publishing the Lab image pin. A status/sync succeeds only when Argo
 is Synced and Healthy at the exact pin and the fixed Deployment has observed
-its generation, updated/ready/available replicas and the expected image. Baton
+its generation, updated/ready/available replicas and the expected image. With an
+empty `pin_sha`, status sends only the operation (Lab admits that for Baton
+alone), `expected_image` must end in `:main-<GITHUB_SHA>`, and it succeeds when
+Argo is Synced and Healthy at any revision and the Deployment runs that image
+with every replica ready. Baton
 still checks its served source SHA separately and must preserve its immutable
 digest and two-replica release contract.
 
