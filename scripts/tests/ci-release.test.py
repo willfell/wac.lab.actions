@@ -75,6 +75,47 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.ready(value, SOURCE, SOURCE, IMAGE, 2)
 
+    def test_status_without_a_pin_waits_for_the_tagged_image_at_any_revision(self):
+        tagged = "localhost:30500/baton:main-" + SOURCE
+        value = evidence()
+        value["pin_sha"] = ""
+        value["sync"]["revision"] = "d" * 40
+        value["deployments"][0]["images"] = [tagged]
+        self.assertTrue(release.ready(value, "", SOURCE, tagged, 2))
+        self.assertFalse(
+            release.ready(value, "", SOURCE, "localhost:30500/baton:main-" + "e" * 40, 2)
+        )
+        for path, replacement in [
+            (("sync", "status"), "OutOfSync"),
+            (("health", "status"), "Progressing"),
+        ]:
+            wrong = copy.deepcopy(value)
+            wrong[path[0]][path[1]] = replacement
+            self.assertFalse(release.ready(wrong, "", SOURCE, tagged, 2))
+        with self.assertRaises(release.ReleaseError):
+            release.ready(evidence(), "", SOURCE, tagged, 2)
+        args = argparse.Namespace(
+            operation="status", pin_sha="", expected_image=tagged, wait_timeout=30, min_replicas=2
+        )
+        with (
+            patch.dict(os.environ, {"GITHUB_SHA": SOURCE}),
+            patch.object(release.ssl, "create_default_context"),
+            patch.object(release, "request", return_value=(200, value)) as request,
+        ):
+            self.assertEqual(release.run(args), value)
+            self.assertEqual(request.call_args.args[0], {"operation": "status"})
+        for operation, image in [("sync", tagged), ("status", "")]:
+            args = argparse.Namespace(
+                operation=operation, pin_sha="", expected_image=image, wait_timeout=30, min_replicas=2
+            )
+            with (
+                patch.dict(os.environ, {"GITHUB_SHA": SOURCE}),
+                patch.object(release, "request") as request,
+            ):
+                with self.assertRaises(release.ReleaseError):
+                    release.run(args)
+                request.assert_not_called()
+
     def test_migrations_require_both_jobs_and_this_attempt(self):
         digest = "sha256:" + "c" * 64
         receipt = {

@@ -122,7 +122,7 @@ def ready(
     if value.get("pin_sha") != pin or value.get("source_sha") != source:
         raise ReleaseError("release response does not match this source and pin")
     if (
-        value.get("sync", {}).get("revision") != pin
+        (pin and value.get("sync", {}).get("revision") != pin)
         or value.get("sync", {}).get("status") != "Synced"
         or value.get("health", {}).get("status") != "Healthy"
     ):
@@ -180,9 +180,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "image_digest": args.image_digest,
         }
     else:
-        if not re.fullmatch("[0-9a-f]{40}", args.pin_sha) or not args.expected_image:
+        if not args.expected_image:
             raise ReleaseError("exact pin and expected image are required")
-        body = {"operation": args.operation, "pin_sha": args.pin_sha}
+        if args.pin_sha == "" and args.operation == "status":
+            # A release that deploys from an image tag (Baton, through Argo CD Image
+            # Updater) has no pin commit; the image names this build, at any revision.
+            body = {"operation": "status"}
+        elif re.fullmatch("[0-9a-f]{40}", args.pin_sha):
+            body = {"operation": args.operation, "pin_sha": args.pin_sha}
+        else:
+            raise ReleaseError("exact pin and expected image are required")
     try:
         trust = ssl.create_default_context(cafile=CA_FILE)
     except (OSError, ssl.SSLError):

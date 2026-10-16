@@ -5,7 +5,7 @@ inputs:
     description: status for Baton observation, sync for Finance or Wealth, migrate for Lab
     required: true
   pin_sha:
-    description: Exact main-branch pin commit for status or sync
+    description: Exact main-branch pin commit for status or sync; empty for a status check by image tag alone
     default: ""
   expected_image:
     description: Exact deployment image reference for status or sync
