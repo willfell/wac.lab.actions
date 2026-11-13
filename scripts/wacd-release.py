@@ -9,7 +9,8 @@ GitHub OIDC token for every request. That file belongs to other components and
 is loaded, never changed.
 
 The gateway contract (Plan 2, "Chart releases (wac-cd)") is isolated in
-RELEASE_BODY, STATUS_BODY and ready(). Any problem exits 1 with one stable
+RELEASE_BODY, STATUS_BODY and ready(). After the proof, github-release creates
+the GitHub Release for the tag with the job's GITHUB_TOKEN. Any problem exits 1 with one stable
 "wacd release: ..." stderr line, and no token is ever printed.
 """
 
@@ -17,6 +18,7 @@ import argparse
 import http.client
 import importlib.util
 import json
+import os
 import re
 import ssl
 import sys
@@ -41,6 +43,9 @@ DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 POLL_SECONDS = 5
 MAX_BODY = 1024 * 1024
 MAX_WAIT = 3600
+GITHUB_TIMEOUT = 30
+TAG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
+REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
 def RELEASE_BODY(version):
@@ -236,6 +241,68 @@ def served(url, sha, expect_db, timeout):
     raise ReleaseError(f"health check served sha {seen}, expected {sha}")
 
 
+def github_call(method, url, token, body=None):
+    """One GitHub REST call; returns the status code. Redirects are refused so
+    the token is never replayed to another host."""
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Authorization", f"Bearer {token}")
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("X-GitHub-Api-Version", "2022-11-28")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    opener = urllib.request.build_opener(ci.NoRedirect())
+    try:
+        with opener.open(request, timeout=GITHUB_TIMEOUT) as response:
+            response.read(MAX_BODY)
+            return response.status
+    except urllib.error.HTTPError as err:
+        err.close()
+        return err.code
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
+        raise ReleaseError(f"GitHub API {method} failed to connect") from None
+
+
+def github_release(tag, sha, environ):
+    """Create the GitHub Release for tag at sha, accepting one that already exists."""
+    if not TAG_PATTERN.fullmatch(tag):
+        raise ReleaseError("--tag is not a valid tag name")
+    if not SHA_PATTERN.fullmatch(sha):
+        raise ReleaseError("--sha must be 40 lowercase hex characters")
+    api = environ.get("GITHUB_API_URL", "").rstrip("/")
+    repository = environ.get("GITHUB_REPOSITORY", "")
+    token = environ.get("GITHUB_TOKEN", "")
+    parsed = urllib.parse.urlsplit(api)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ReleaseError("GITHUB_API_URL must be an http or https URL")
+    if not REPOSITORY_PATTERN.fullmatch(repository):
+        raise ReleaseError("GITHUB_REPOSITORY must be owner/name")
+    if not token:
+        raise ReleaseError("GITHUB_TOKEN is empty")
+    releases = f"{api}/repos/{repository}/releases"
+    body = {
+        "tag_name": tag,
+        "name": tag,
+        "target_commitish": sha,
+        "generate_release_notes": True,
+    }
+    code = github_call("POST", releases, token, body)
+    if code == 201:
+        return f"Created GitHub Release {tag}"
+    if code == 422:
+        # 422 is also what GitHub answers for a bad tag or commitish, so it
+        # only counts as "already released" when the release really exists.
+        found = github_call(
+            "GET", f"{releases}/tags/{urllib.parse.quote(tag, safe='')}", token
+        )
+        if found == 200:
+            return f"GitHub Release {tag} already exists"
+        raise ReleaseError(
+            f"GitHub refused the release (HTTP 422) and no release exists for {tag} (HTTP {found})"
+        )
+    raise ReleaseError(f"GitHub refused the release (HTTP {code})")
+
+
 def parse_images(text, version):
     try:
         images = json.loads(text)
@@ -283,10 +350,15 @@ def build_parser():
     health.add_argument("--sha", required=True)
     health.add_argument("--expect-db", required=True, choices=["true", "false"])
     health.add_argument("--wait-timeout", required=True)
+    gh = commands.add_parser("github-release")
+    gh.add_argument("--tag", required=True)
+    gh.add_argument("--sha", required=True)
     return parser
 
 
 def run(args):
+    if args.command == "github-release":
+        return github_release(args.tag, args.sha, os.environ)
     timeout = wait_bound(args.wait_timeout)
     if args.command == "health":
         if not SHA_PATTERN.fullmatch(args.sha):

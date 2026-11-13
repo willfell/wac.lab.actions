@@ -652,5 +652,31 @@ class CliPackageTests(unittest.TestCase):
             )
 
 
+
+class BuildArgsTests(unittest.TestCase):
+    def test_build_args_accepts_key_value_lines_and_skips_blank_ones(self):
+        self.assertEqual(chart.build_args(""), [])
+        self.assertEqual(
+            chart.build_args("NEXT_PUBLIC_BASE=/travel\n\n  \n_X1=a=b c\nEMPTY=\n"),
+            ["NEXT_PUBLIC_BASE=/travel", "_X1=a=b c", "EMPTY="],
+        )
+
+    def test_build_args_rejects_malformed_lines(self):
+        for line in ("NOEQUALS", "lower=1", "1ABC=x", "=x", " KEY=x", "KEY-NAME=x", "KEY =x", "K\u00c9Y=x"):
+            with self.subTest(line=line), self.assertRaises(chart.ChartError) as caught:
+                chart.build_args("GOOD=1\n" + line)
+            self.assertIn("line 2", str(caught.exception))
+
+    def test_build_args_cli(self):
+        ok = run_cli("build-args", "--text", "A=1\nB_2=two words\n")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(ok.stdout, "A=1\nB_2=two words\n")
+        empty = run_cli("build-args", "--text", "")
+        self.assertEqual((empty.returncode, empty.stdout), (0, ""))
+        bad = run_cli("build-args", "--text", "A=1\nbad=2")
+        self.assertEqual((bad.returncode, bad.stdout), (1, ""))
+        self.assertTrue(bad.stderr.startswith("wacd chart: "), bad.stderr)
+        self.assertEqual(len(bad.stderr.strip().splitlines()), 1)
+
 if __name__ == "__main__":
     unittest.main()

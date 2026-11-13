@@ -1,0 +1,463 @@
+name: wac-cd
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Runner label; empty uses the caller's CI_RUNNER_SMALL variable
+        type: string
+        default: ''
+      version_source:
+        description: commits computes the version from conventional commits; caller takes it from the version input
+        type: string
+        default: commits
+      version:
+        description: Caller-computed bare X.Y.Z when version_source is caller; empty means no release
+        type: string
+        default: ''
+      rollback_version:
+        description: Published version to release again; only on workflow_dispatch
+        type: string
+        default: ''
+      deploy:
+        description: false publishes the images, chart and tag without releasing them
+        type: boolean
+        default: true
+      build_args:
+        description: Newline-separated KEY=VALUE build args passed to every image build
+        type: string
+        default: ''
+      wait_timeout:
+        description: Seconds to wait for the gateway proof and for the health check
+        type: string
+        default: '2100'
+    secrets:
+      npm_token:
+        description: Token for private npm packages; empty uses the job's GitHub token
+        required: false
+    outputs:
+      mode:
+        description: release, publish, resume, rollback or none
+        value: ${{ jobs.plan.outputs.mode }}
+      version:
+        description: The released or published version, bare X.Y.Z
+        value: ${{ jobs.plan.outputs.version }}
+      tag:
+        description: The git tag for the version
+        value: ${{ jobs.plan.outputs.tag }}
+      images:
+        description: JSON map of built images with digests; empty on resume and rollback
+        value: ${{ jobs.build.outputs.images }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wac-cd-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.version.outputs.mode }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      expected_sha: ${{ steps.version.outputs.expected_sha }}
+      app: ${{ steps.profile.outputs.app }}
+      chart_version: ${{ steps.profile.outputs.chart_version }}
+      values_file: ${{ steps.profile.outputs.values_file }}
+      tag_prefix: ${{ steps.profile.outputs.tag_prefix }}
+      health_url: ${{ steps.profile.outputs.health_url }}
+      health_expect_db_ok: ${{ steps.profile.outputs.health_expect_db_ok }}
+      images: ${{ steps.profile.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read the wacd profile
+        id: profile
+        shell: bash
+        run: python3 .wacd/scripts/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+      - name: Check the trigger
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ROLLBACK_VERSION: ${{ inputs.rollback_version }}
+          DEPLOY: ${{ inputs.deploy }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::wac-cd: $1"
+            exit 1
+          }
+          [[ "$GITHUB_REF" == refs/heads/main ]] || fail "runs only on refs/heads/main, not $GITHUB_REF"
+          case "$EVENT_NAME" in
+            push)
+              [[ -z "$ROLLBACK_VERSION" ]] || fail "rollback_version is accepted only on workflow_dispatch"
+              ;;
+            workflow_dispatch)
+              [[ "$ROLLBACK_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "workflow_dispatch needs rollback_version as X.Y.Z"
+              ;;
+            *)
+              fail "event $EVENT_NAME is not push or workflow_dispatch"
+              ;;
+          esac
+          if [[ -n "$ROLLBACK_VERSION" && "$DEPLOY" != true ]]; then
+            fail "rollback_version cannot be combined with deploy: false"
+          fi
+      - name: Plan the version
+        id: version
+        shell: bash
+        env:
+          ROLLBACK_VERSION: ${{ inputs.rollback_version }}
+          VERSION_SOURCE: ${{ inputs.version_source }}
+          CALLER_VERSION: ${{ inputs.version }}
+          DEPLOY: ${{ inputs.deploy }}
+          APP: ${{ steps.profile.outputs.app }}
+          TAG_PREFIX: ${{ steps.profile.outputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+          registry=registry.network.svc.cluster.local:5000
+          revision_of() {
+            local line
+            line="$(python3 .wacd/scripts/wacd-chart.py chart-revision --registry "$registry" --app "$APP" --version "$1")"
+            revision="${line#revision=}"
+          }
+          if [[ -n "$ROLLBACK_VERSION" ]]; then
+            revision_of "$ROLLBACK_VERSION"
+            if ! git merge-base --is-ancestor "$revision" "$GITHUB_SHA"; then
+              echo "::error::wac-cd: deploy/$APP:$ROLLBACK_VERSION was built from $revision, which is not an ancestor of main"
+              exit 1
+            fi
+            {
+              echo "mode=rollback"
+              echo "version=$ROLLBACK_VERSION"
+              echo "tag=$TAG_PREFIX$ROLLBACK_VERSION"
+              echo "expected_sha=$revision"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          planned="$(python3 .wacd/scripts/wacd-version.py --prefix "$TAG_PREFIX" \
+            --version-source "$VERSION_SOURCE" --version "$CALLER_VERSION" --deploy "$DEPLOY")"
+          echo "$planned"
+          mode="$(sed -n 's/^mode=//p' <<< "$planned")"
+          version="$(sed -n 's/^version=//p' <<< "$planned")"
+          expected_sha="$GITHUB_SHA"
+          if [[ "$mode" == resume ]]; then
+            revision_of "$version"
+            expected_sha="$revision"
+            if [[ "$expected_sha" != "$GITHUB_SHA" ]]; then
+              echo "::error::wac-cd: deploy/$APP:$version was built from $expected_sha, not this push's $GITHUB_SHA"
+              exit 1
+            fi
+          fi
+          {
+            echo "$planned"
+            echo "expected_sha=$expected_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.mode == 'release' || needs.plan.outputs.mode == 'publish'
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      images: ${{ steps.images.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install crane
+        shell: bash
+        env:
+          CRANE_VERSION: v0.20.6
+        run: bash .wacd/scripts/install-tools.sh crane
+      - name: Build and push the images
+        id: images
+        shell: bash
+        env:
+          PROFILE_IMAGES: ${{ needs.plan.outputs.images }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          BUILD_ARGS: ${{ inputs.build_args }}
+          NODE_AUTH_TOKEN: ${{ secrets.npm_token || github.token }}
+        run: |
+          set -euo pipefail
+          registry=registry.network.svc.cluster.local:5000
+          validated="$(python3 .wacd/scripts/wacd-chart.py build-args --text="$BUILD_ARGS")"
+          extra=()
+          if [[ -n "$validated" ]]; then
+            while IFS= read -r line; do
+              extra+=(--build-arg "$line")
+            done <<< "$validated"
+          fi
+          python3 -c 'import json, os
+          for image in json.loads(os.environ["PROFILE_IMAGES"]):
+              print("\t".join([image["name"], image["dockerfile"], image["context"], image.get("sha_build_arg", "")]))' \
+            > "$RUNNER_TEMP/images.tsv"
+          : > "$RUNNER_TEMP/digests.tsv"
+          while IFS=$'\t' read -r name dockerfile context sha_arg <&3; do
+            ref="$registry/$name:$VERSION"
+            state="$(python3 .wacd/scripts/wacd-chart.py image-state --registry "$registry" \
+              --name "$name" --tag "$VERSION" --source-sha "$GITHUB_SHA")"
+            if [[ "$state" == state=absent ]]; then
+              args=(-f "$dockerfile" --label "org.opencontainers.image.revision=$GITHUB_SHA")
+              if [[ -n "$sha_arg" ]]; then
+                args+=(--build-arg "$sha_arg=$GITHUB_SHA")
+              fi
+              args+=("${extra[@]}")
+              args+=(--secret "id=node_auth_token,env=NODE_AUTH_TOKEN" -t "$name:$VERSION" "$context")
+              docker build "${args[@]}"
+              docker save "$name:$VERSION" -o "$RUNNER_TEMP/image.tar"
+              crane push --insecure "$RUNNER_TEMP/image.tar" "$ref"
+              rm -f "$RUNNER_TEMP/image.tar"
+              state="$(python3 .wacd/scripts/wacd-chart.py image-state --registry "$registry" \
+                --name "$name" --tag "$VERSION" --source-sha "$GITHUB_SHA")"
+              [[ "$state" == state=present ]]
+            elif [[ "$state" != state=present ]]; then
+              exit 1
+            else
+              echo "$ref already exists from $GITHUB_SHA; reusing it"
+            fi
+            digest="$(crane digest --insecure "$ref")"
+            echo "$ref @ $digest"
+            printf '%s\t%s\n' "$name" "$digest" >> "$RUNNER_TEMP/digests.tsv"
+          done 3< "$RUNNER_TEMP/images.tsv"
+          python3 -c 'import json, os, re, sys
+          version = os.environ["VERSION"]
+          images = {}
+          for line in open(sys.argv[1]):
+              name, digest = line.rstrip("\n").split("\t")
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                  sys.exit(f"wac-cd: {name} has no valid digest")
+              images[name] = {"repository": "localhost:30500/" + name, "tag": version, "digest": digest}
+          print("images=" + json.dumps(images, separators=(",", ":"), sort_keys=True))' \
+            "$RUNNER_TEMP/digests.tsv" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.mode == 'release' || needs.plan.outputs.mode == 'publish'
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install helm
+        shell: bash
+        env:
+          HELM_VERSION: v3.16.3
+        run: bash .wacd/scripts/install-tools.sh helm
+      - name: Pull the wac-app chart
+        id: pull
+        shell: bash
+        env:
+          CHART_VERSION: ${{ needs.plan.outputs.chart_version }}
+        run: |
+          set -euo pipefail
+          helm pull oci://registry.network.svc.cluster.local:5000/charts/wac-app \
+            --version "$CHART_VERSION" --plain-http -d "$RUNNER_TEMP"
+          tgz="$RUNNER_TEMP/wac-app-$CHART_VERSION.tgz"
+          test -f "$tgz"
+          echo "tgz=$tgz" >> "$GITHUB_OUTPUT"
+      - name: Publish the deploy chart and the tag
+        shell: bash
+        env:
+          APP: ${{ needs.plan.outputs.app }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          IMAGES: ${{ needs.build.outputs.images }}
+          WAC_APP_TGZ: ${{ steps.pull.outputs.tgz }}
+        run: |
+          set -euo pipefail
+          registry=registry.network.svc.cluster.local:5000
+          chart_state() {
+            python3 .wacd/scripts/wacd-chart.py chart-state --registry "$registry" \
+              --app "$APP" --version "$VERSION" --source-sha "$GITHUB_SHA"
+          }
+          state="$(chart_state)"
+          if [[ "$state" == state=absent ]]; then
+            line="$(python3 .wacd/scripts/wacd-chart.py package --profile .github/wacd.json \
+              --version "$VERSION" --source-sha "$GITHUB_SHA" --images "$IMAGES" \
+              --wac-app-tgz "$WAC_APP_TGZ" --out "$RUNNER_TEMP/deploy-chart")"
+            chart_dir="${line#chart_dir=}"
+            helm package "$chart_dir" -d "$RUNNER_TEMP/packaged"
+            tgz="$RUNNER_TEMP/packaged/$APP-$VERSION.tgz"
+            test -f "$tgz"
+            helm push "$tgz" "oci://$registry/deploy" --plain-http
+            state="$(chart_state)"
+            if [[ "$state" != state=present ]]; then
+              echo "::error::wac-cd: deploy/$APP:$VERSION is not readable after the push"
+              exit 1
+            fi
+          elif [[ "$state" == state=present ]]; then
+            echo "deploy/$APP:$VERSION is already published from $GITHUB_SHA"
+          else
+            exit 1
+          fi
+          remote="$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          if [[ -z "$remote" ]]; then
+            local_sha="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" || true)"
+            if [[ -z "$local_sha" ]]; then
+              git tag "$TAG" "$GITHUB_SHA"
+            elif [[ "$local_sha" != "$GITHUB_SHA" ]]; then
+              echo "::error::wac-cd: local tag $TAG is on $local_sha, not $GITHUB_SHA"
+              exit 1
+            fi
+            git push origin "refs/tags/$TAG"
+            echo "Pushed tag $TAG at $GITHUB_SHA"
+          else
+            peeled="$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}' <<< "$remote")"
+            direct="$(awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}' <<< "$remote")"
+            remote_sha="${peeled:-$direct}"
+            if [[ "$remote_sha" != "$GITHUB_SHA" ]]; then
+              echo "::error::wac-cd: tag $TAG already exists on $remote_sha, not $GITHUB_SHA"
+              exit 1
+            fi
+            echo "Tag $TAG already exists at $GITHUB_SHA"
+          fi
+
+  deploy:
+    needs: [plan, build, publish]
+    if: >-
+      !cancelled() && !failure() && (
+      needs.plan.outputs.mode == 'release' ||
+      needs.plan.outputs.mode == 'resume' ||
+      needs.plan.outputs.mode == 'rollback')
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read the published images
+        id: chart
+        shell: bash
+        env:
+          APP: ${{ needs.plan.outputs.app }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 .wacd/scripts/wacd-chart.py chart-images \
+            --registry registry.network.svc.cluster.local:5000 \
+            --app "$APP" --version "$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Release through the gateway
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          IMAGES: ${{ steps.chart.outputs.images }}
+          WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
+        run: |
+          python3 .wacd/scripts/wacd-release.py release --version "$VERSION" \
+            --images "$IMAGES" --wait-timeout "$WAIT_TIMEOUT" \
+            --receipt "$RUNNER_TEMP/wac-cd-release.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wac-cd-release-${{ needs.plan.outputs.version }}
+          path: ${{ runner.temp }}/wac-cd-release.json
+          if-no-files-found: error
+      - name: Prove the served build
+        shell: bash
+        env:
+          HEALTH_URL: ${{ needs.plan.outputs.health_url }}
+          EXPECTED_SHA: ${{ needs.plan.outputs.expected_sha }}
+          EXPECT_DB: ${{ needs.plan.outputs.health_expect_db_ok }}
+          WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
+        run: |
+          python3 .wacd/scripts/wacd-release.py health --url "$HEALTH_URL" \
+            --sha "$EXPECTED_SHA" --expect-db "$EXPECT_DB" --wait-timeout "$WAIT_TIMEOUT"
+
+  github-release:
+    needs: [plan, deploy]
+    if: >-
+      !cancelled() && !failure() &&
+      needs.deploy.result == 'success' && (
+      needs.plan.outputs.mode == 'release' ||
+      needs.plan.outputs.mode == 'resume')
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - name: Create the GitHub Release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.plan.outputs.expected_sha }}
+        run: python3 .wacd/scripts/wacd-release.py github-release --tag "$TAG" --sha "$EXPECTED_SHA"

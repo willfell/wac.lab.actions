@@ -6,8 +6,9 @@ It is pushed to registry repo deploy/<app> at tag <version>, and the release
 gateway reads it back from the Helm config blob (the Chart.yaml as JSON), so the
 revision and image annotations written here are the contract.
 
-Every CLI prints single-line key=value output for $GITHUB_OUTPUT. Any problem
-exits 1 with a one-line "wacd chart: ..." message.
+Every CLI prints single-line key=value output for $GITHUB_OUTPUT, except
+build-args, which prints the validated KEY=VALUE build args one per line. Any
+problem exits 1 with a one-line "wacd chart: ..." message.
 """
 
 import argparse
@@ -57,6 +58,7 @@ TOP_LEVEL_KEY = re.compile(
     r"""(?:"(?P<dq>[^"\\]*)"|'(?P<sq>[^']*)'|(?P<bare>[A-Za-z0-9_][A-Za-z0-9_. /-]*?))[ ]*:(\s|$)"""
 )
 TOP_LEVEL_ITEM = re.compile(r"-(\s|$)")
+BUILD_ARG_KEY = re.compile(r"[A-Z_][A-Z0-9_]*")
 
 
 class ChartError(Exception):
@@ -413,6 +415,27 @@ def parse_images_arg(text):
     return images
 
 
+def build_args(text):
+    """Validate wac-cd's newline-separated KEY=VALUE build args.
+
+    Blank lines are skipped; every other line must be KEY=VALUE with an
+    upper-case shell-style KEY. The value is passed through unchanged, so the
+    lines returned are exactly what reaches `docker build --build-arg`.
+    """
+    accepted = []
+    for number, line in enumerate(text.split("\n"), start=1):
+        if not line.strip():
+            continue
+        key, sep, _ = line.partition("=")
+        if not sep or not BUILD_ARG_KEY.fullmatch(key):
+            raise ChartError(
+                f"build_args line {number} must be KEY=VALUE with KEY matching "
+                f"^[A-Z_][A-Z0-9_]*$: {line[:80]!r}"
+            )
+        accepted.append(line)
+    return accepted
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="wacd-chart.py")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -438,6 +461,8 @@ def build_parser():
     image.add_argument("--source-sha", required=True)
     ci = sub.add_parser("ci-images")
     ci.add_argument("--profile", required=True)
+    args = sub.add_parser("build-args")
+    args.add_argument("--text", required=True)
     return parser
 
 
@@ -456,6 +481,8 @@ def run(args):
             ci=args.ci,
         )
         return f"chart_dir={chart_dir}"
+    if args.command == "build-args":
+        return "".join(line + "\n" for line in build_args(args.text))
     if args.command == "ci-images":
         compact = json.dumps(ci_images(load_profile(args.profile)), separators=(",", ":"))
         return f"images={compact}"
@@ -484,7 +511,7 @@ def main(argv):
     except ChartError as err:
         print("wacd chart: " + " ".join(str(err).split()), file=sys.stderr)
         return 1
-    print(line)
+    print(line, end="" if args.command == "build-args" else "\n")
     return 0
 
 

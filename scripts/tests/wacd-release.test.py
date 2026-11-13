@@ -689,5 +689,140 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(result.stderr.strip().splitlines()), 1)
 
 
+
+class ReleasesApi:
+    """A stub GitHub REST API for the releases endpoints."""
+
+    def __init__(self, post_status, get_status=404):
+        self.post_status = post_status
+        self.get_status = get_status
+        self.seen = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def reply(self, status, body):
+                raw = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                size = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(size))
+                outer.seen.append(("POST", self.path, self.headers["Authorization"], body))
+                self.reply(outer.post_status, {"tag_name": body.get("tag_name")})
+
+            def do_GET(self):
+                outer.seen.append(("GET", self.path, self.headers["Authorization"], None))
+                tag = self.path.rsplit("/", 1)[-1]
+                self.reply(outer.get_status, {"tag_name": tag})
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class GithubReleaseTests(unittest.TestCase):
+    TAG = "v0.1.0"
+    GH_TOKEN = "ghs_fake_release_token"
+
+    def publish(self, api, tag=TAG, sha=SOURCE, env=None):
+        environ = {
+            "GITHUB_API_URL": api.url if api else "http://127.0.0.1:9",
+            "GITHUB_REPOSITORY": "willfell/travel",
+            "GITHUB_TOKEN": self.GH_TOKEN,
+            "PATH": os.environ.get("PATH", ""),
+            "NO_PROXY": "127.0.0.1",
+            "no_proxy": "127.0.0.1",
+        }
+        environ.update(env or {})
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "github-release", "--tag", tag, "--sha", sha],
+            capture_output=True,
+            text=True,
+            env=environ,
+            timeout=60,
+        )
+        self.assertNotIn(self.GH_TOKEN, result.stdout + result.stderr)
+        return result
+
+    def serve(self, post_status, get_status=404):
+        api = ReleasesApi(post_status, get_status)
+        self.addCleanup(api.close)
+        return api
+
+    def test_github_release_created_or_already_there(self):
+        created = self.serve(201)
+        result = self.publish(created)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            created.seen,
+            [(
+                "POST",
+                "/repos/willfell/travel/releases",
+                f"Bearer {self.GH_TOKEN}",
+                {
+                    "tag_name": self.TAG,
+                    "name": self.TAG,
+                    "target_commitish": SOURCE,
+                    "generate_release_notes": True,
+                },
+            )],
+        )
+        self.assertIn(self.TAG, result.stdout)
+
+        existing = self.serve(422, 200)
+        result = self.publish(existing)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [(method, path, auth) for method, path, auth, _ in existing.seen],
+            [
+                ("POST", "/repos/willfell/travel/releases", f"Bearer {self.GH_TOKEN}"),
+                ("GET", f"/repos/willfell/travel/releases/tags/{self.TAG}", f"Bearer {self.GH_TOKEN}"),
+            ],
+        )
+
+        for label, post, get in (("422 without a release", 422, 404), ("forbidden", 403, 200)):
+            with self.subTest(case=label):
+                api = self.serve(post, get)
+                result = self.publish(api)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stderr.startswith("wacd release: "), result.stderr)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertEqual(result.stdout, "")
+                if post == 403:
+                    self.assertEqual(len(api.seen), 1)
+
+    def test_github_release_validates_before_calling(self):
+        api = self.serve(201)
+        for label, kwargs in (
+            ("short sha", {"sha": "abc"}),
+            ("blank tag", {"tag": ""}),
+            ("tag with a space", {"tag": "v0 .1.0"}),
+            ("no token", {"env": {"GITHUB_TOKEN": ""}}),
+            ("no repository", {"env": {"GITHUB_REPOSITORY": "travel"}}),
+            ("api not http", {"env": {"GITHUB_API_URL": "file:///etc/passwd"}}),
+        ):
+            with self.subTest(case=label):
+                result = self.publish(api, **kwargs)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertTrue(result.stderr.startswith("wacd release: "), result.stderr)
+        self.assertEqual(api.seen, [])
+
+    def test_github_release_unreachable_api_fails_cleanly(self):
+        result = self.publish(None)
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith("wacd release: "), result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+
 if __name__ == "__main__":
     unittest.main()
