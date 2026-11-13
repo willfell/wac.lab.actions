@@ -299,6 +299,53 @@ class RegistryReadTests(RegistryCase):
         with self.assertRaises(chart.ChartError):
             chart.manifest_state(self.address, "deploy/travel", "0.1.0", 5)
 
+    def test_chart_config_must_be_the_chart_asked_for(self):
+        self.registry.put_chart("travel", "0.1.0")
+        repo = "deploy/travel"
+        for name, version in (("other", "0.1.0"), ("travel", "0.2.0")):
+            body = json.dumps(
+                {"name": name, "version": version, "annotations": {"org.opencontainers.image.revision": SHA}}
+            ).encode()
+            self.registry.put_manifest(repo, "0.1.0", self.registry.put_blob(repo, body), HELM_CONFIG)
+            with self.assertRaises(chart.ChartError) as ctx:
+                chart.chart_revision(self.address, "travel", "0.1.0")
+            self.assertIn("not 'travel' '0.1.0'", str(ctx.exception))
+
+    def test_state_commands_reject_non_gateway_versions(self):
+        for version in ("01.2.3", "1.2.3-rc1", "latest"):
+            result = run_cli(
+                "chart-state", "--registry", self.address, "--app", "travel",
+                "--version", version, "--source-sha", SHA,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("version", result.stderr)
+        self.assertEqual(self.registry.requests, [])
+
+    def test_unexpected_statuses_are_errors_not_absence(self):
+        for status in (204, 401, 403, 500):
+            self.registry.routes["/v2/deploy/travel/manifests/0.1.0"] = (status, "text/plain", b"")
+            with self.assertRaises(chart.ChartError) as ctx:
+                chart.manifest_state(self.address, "deploy/travel", "0.1.0", 5)
+            self.assertIn(str(status), str(ctx.exception))
+
+    def test_malformed_http_is_a_chart_error(self):
+        import socket
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        self.addCleanup(server.close)
+
+        def garbage():
+            conn, _ = server.accept()
+            conn.recv(4096)
+            conn.sendall(b"not http at all\r\n\r\n")
+            conn.close()
+
+        threading.Thread(target=garbage, daemon=True).start()
+        with self.assertRaises(chart.ChartError):
+            chart.manifest_state(f"127.0.0.1:{server.getsockname()[1]}", "deploy/travel", "0.1.0", 5)
+
     def test_unsafe_arguments_never_reach_the_url(self):
         with self.assertRaises(chart.ChartError):
             chart.chart_config(self.address, "../x", "0.1.0")
@@ -405,23 +452,6 @@ class HelmTests(unittest.TestCase):
         rendered = self.helm("template", "travel", str(pkg / "travel-0.1.0.tgz"))
         self.assertIn('tag: "0.1.0"', rendered)
 
-    def test_text_values_reject_owned_keys_and_non_mappings(self):
-        tgz = self.fake_wac_app()
-        for key in ("app", "images", "global"):
-            values = self.repo(f"name: x\n{key}: y\n")
-            with self.assertRaises(chart.ChartError) as ctx:
-                chart.write_chart(self.base / "out", PROFILE, values, "0.1.0", SHA, IMAGES, tgz)
-            self.assertIn(key, str(ctx.exception))
-        values = self.repo('"app": y\n')
-        with self.assertRaises(chart.ChartError):
-            chart.write_chart(self.base / "out", PROFILE, values, "0.1.0", SHA, IMAGES, tgz)
-        values = self.repo("app-name: ok\nname: x\nimage: travel-app\n")
-        chart.write_chart(self.base / "out", PROFILE, values, "0.1.0", SHA, IMAGES, tgz)
-        values = self.repo("- a\n- b\n")
-        with self.assertRaises(chart.ChartError) as ctx:
-            chart.write_chart(self.base / "out", PROFILE, values, "0.1.0", SHA, IMAGES, tgz)
-        self.assertIn("mapping", str(ctx.exception))
-
     def test_ci_mode_allows_images_without_digests(self):
         values = self.repo("name: travel-app\nimage: travel-app\n")
         tgz = self.fake_wac_app()
@@ -438,6 +468,144 @@ class HelmTests(unittest.TestCase):
         self.helm("package", str(chart_dir), "--destination", str(pkg))
         rendered = self.helm("template", "travel", str(pkg / "travel-0.1.0.tgz"))
         self.assertIn('tag: "ci"', rendered)
+
+
+class TextValuesTests(unittest.TestCase):
+    """The block-YAML nesting and its owned-key scan, which need no Helm."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.tgz = self.base / "wac-app-1.0.0.tgz"
+        self.tgz.write_bytes(b"fake")
+
+    def package(self, text, raw=None):
+        values = self.base / "values.yaml"
+        if raw is None:
+            values.write_text(text, encoding="utf-8")
+        else:
+            values.write_bytes(raw)
+        chart_dir = chart.write_chart(
+            self.base / "out", PROFILE, values, "0.1.0", SHA, IMAGES, self.tgz
+        )
+        return (chart_dir / "values.yaml").read_text()
+
+    def assertRefused(self, text, needle):
+        with self.assertRaises(chart.ChartError) as ctx:
+            self.package(text)
+        self.assertIn(needle, str(ctx.exception))
+
+    def test_owned_keys_are_refused_in_every_spelling(self):
+        for key in ("app", "images", "global"):
+            self.assertRefused(f"name: x\n{key}: y\n", key)
+            self.assertRefused(f'name: x\n"{key}": y\n', key)
+            self.assertRefused(f"name: x\n'{key}': y\n", key)
+            self.assertRefused(f"name: x\n{key} : y\n", key)
+            self.assertRefused(f"name: x\n{key}:\n  a: 1\n", key)
+
+    def test_owned_key_bypass_shapes_are_refused(self):
+        shapes = {
+            "merge key": "name: x\n<<: {global: {a: 1}}\n",
+            "complex key": "name: x\n? global\n: {a: 1}\n",
+            "tagged key": "name: x\n!!str global: {a: 1}\n",
+            "anchored key": "name: x\n&g global: {a: 1}\n",
+            "alias key": "name: x\n*g : 1\n",
+            "escaped quoted key": 'name: x\n"\\u0067lobal": {a: 1}\n',
+            "flow mapping": "{global: {a: 1}}\n",
+            "flow line": "name: x\n{global: 1}\n",
+            "flow sequence": "name: x\n[global]\n",
+            "second document": "name: x\n---\nglobal: {a: 1}\n",
+            "document end": "name: x\n...\n",
+            "directive": "%YAML 1.2\nname: x\n",
+        }
+        for label, text in shapes.items():
+            with self.subTest(label):
+                with self.assertRaises(chart.ChartError):
+                    self.package(text)
+
+    def test_non_mappings_are_refused(self):
+        self.assertRefused("- a\n- b\n", "mapping")
+        self.assertRefused("[a, b]\n", "mapping")
+        self.assertRefused("  name: x\n", "column 0")
+
+    def test_plain_values_nest_under_wac_app(self):
+        got = self.package("name: travel-app\nimage: travel-app\n")
+        self.assertEqual(
+            got,
+            "wac-app:\n  name: travel-app\n  image: travel-app\n"
+            '  app: "travel"\n  images: ' + json.dumps(IMAGES, sort_keys=True) + "\n",
+        )
+
+    def test_block_scalars_sequences_anchors_and_comments_still_nest(self):
+        text = (
+            "# leading comment\n"
+            "name: travel-app\n"
+            "script: |\n"
+            "  line one\n"
+            "\n"
+            "    indented\n"
+            "env:\n"
+            "- name: A\n"
+            "  value: b\n"
+            "- name: C\n"
+            "base: &b\n"
+            "  x: 1\n"
+            "copy: *b\n"
+            "app-name: ok\n"
+            "global-ish: ok\n"
+        )
+        got = self.package(text)
+        self.assertEqual(
+            got.splitlines()[:16],
+            [
+                "wac-app:",
+                "  # leading comment",
+                "  name: travel-app",
+                "  script: |",
+                "    line one",
+                "",
+                "      indented",
+                "  env:",
+                "  - name: A",
+                "    value: b",
+                "  - name: C",
+                "  base: &b",
+                "    x: 1",
+                "  copy: *b",
+                "  app-name: ok",
+                "  global-ish: ok",
+            ],
+        )
+
+    def test_leading_document_marker_and_bom_are_accepted(self):
+        got = self.package("# c\n---\nname: x\n")
+        self.assertIn("wac-app:\n  # c\n  name: x\n", got)
+        self.assertNotIn("---", got)
+        got = self.package("", raw=b"\xef\xbb\xbfname: x\n")
+        self.assertTrue(got.startswith("wac-app:\n  name: x\n"))
+
+    def test_image_repository_must_be_the_pull_address(self):
+        values = self.base / "v.yaml"
+        values.write_text("name: x\n")
+        bad = {
+            "travel-app": {
+                "repository": "registry.network.svc.cluster.local:5000/travel-app",
+                "tag": "0.1.0",
+                "digest": DIGEST,
+            }
+        }
+        for ci in (False, True):
+            with self.assertRaises(chart.ChartError) as ctx:
+                chart.write_chart(self.base / "o", PROFILE, values, "0.1.0", SHA, bad, self.tgz, ci=ci)
+            self.assertIn("localhost:30500/travel-app", str(ctx.exception))
+
+    def test_package_version_must_match_the_gateway_pattern(self):
+        values = self.base / "v.yaml"
+        values.write_text("name: x\n")
+        for version in ("01.2.3", "1.2", "1.2.3-rc1", "v1.2.3"):
+            with self.assertRaises(chart.ChartError):
+                chart.write_chart(self.base / "o", PROFILE, values, version, SHA, IMAGES, self.tgz)
 
 
 class CliPackageTests(unittest.TestCase):

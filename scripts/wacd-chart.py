@@ -12,6 +12,7 @@ exits 1 with a one-line "wacd chart: ..." message.
 
 import argparse
 import hashlib
+import http.client
 import importlib.util
 import json
 import re
@@ -43,6 +44,8 @@ OWNED_KEYS = ("app", "images", "global")
 APP = re.compile(r"[a-z][a-z0-9-]{0,39}")
 IMAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?")
+NUM = r"(0|[1-9][0-9]*)"
+RELEASE_VERSION = re.compile(rf"{NUM}\.{NUM}\.{NUM}")
 SHA40 = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 REGISTRY = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?")
@@ -50,9 +53,10 @@ REF = re.compile(
     re.escape(PULL_REGISTRY + "/") + r"(?P<name>[a-z0-9][a-z0-9._-]{0,63}):"
     r"(?P<tag>[A-Za-z0-9_][A-Za-z0-9._-]{0,127})@(?P<digest>sha256:[0-9a-f]{64})"
 )
-OWNED_TOP_LEVEL = re.compile(
-    r"""^(?:"(?P<dq>[^"]*)"|'(?P<sq>[^']*)'|(?P<bare>[^\s#'"\-\[\]{},&*!|>%@`?:][^:#]*?))\s*:(\s|$)"""
+TOP_LEVEL_KEY = re.compile(
+    r"""(?:"(?P<dq>[^"\\]*)"|'(?P<sq>[^']*)'|(?P<bare>[A-Za-z0-9_][A-Za-z0-9_. /-]*?))[ ]*:(\s|$)"""
 )
+TOP_LEVEL_ITEM = re.compile(r"-(\s|$)")
 
 
 class ChartError(Exception):
@@ -137,31 +141,42 @@ def nest_values_text(text, app, images):
     """Nest a block-YAML values file under wac-app without a YAML parser.
 
     Every line moves two spaces right, then app and images are appended at the
-    new top level. Owned keys are refused by a column-0 scan.
+    new top level. Inside a block mapping every line at column 0 is a plain or
+    quoted key or a sequence item, so an allowlist over those lines is enough to
+    refuse the owned keys however YAML spells them (merge keys, complex keys,
+    tags, anchors and escapes all fall outside the allowlist).
     """
     lines = text.splitlines()
-    if lines and lines[0].rstrip() == "---":
-        lines = lines[1:]
-    first = None
-    for line in lines:
-        if line.strip() and not line.lstrip().startswith("#"):
-            first = line
-            break
-    if first is not None:
+    significant = [
+        i for i, line in enumerate(lines) if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if significant and lines[significant[0]].rstrip() == "---":
+        del lines[significant[0]]
+        significant = [
+            i for i, line in enumerate(lines) if line.strip() and not line.lstrip().startswith("#")
+        ]
+    if significant:
+        first = lines[significant[0]]
         if first[0] in " \t":
             raise ChartError("the values file must be a mapping starting at column 0")
-        if first.startswith(("- ", "[")) or first.rstrip() == "-":
-            raise ChartError("the values file must be a mapping")
         if first.startswith("{"):
             raise ChartError("the values file must be block YAML or a JSON object")
+        if TOP_LEVEL_ITEM.match(first) or first.startswith("["):
+            raise ChartError("the values file must be a mapping")
     for line in lines:
-        if line.rstrip() in ("---", "...") or line.startswith(("--- ", "%")):
-            raise ChartError("the values file must be a single YAML document")
-        found = OWNED_TOP_LEVEL.match(line)
-        if found:
-            key = found["dq"] or found["sq"] or found["bare"]
-            if key.strip() in OWNED_KEYS:
-                raise ChartError(f"the values file may not set {key.strip()!r}; wac-cd owns it")
+        if not line.strip() or line[0] in " \t#":
+            continue
+        if TOP_LEVEL_ITEM.match(line):
+            continue
+        found = TOP_LEVEL_KEY.match(line)
+        if not found:
+            raise ChartError(
+                f"unsupported top-level line in the values file: {line[:40]!r}; "
+                "use plain or quoted keys, sequence items and one document"
+            )
+        key = next(group for group in found.group("dq", "sq", "bare") if group is not None)
+        if key.strip() in OWNED_KEYS:
+            raise ChartError(f"the values file may not set {key.strip()!r}; wac-cd owns it")
     nested = ["wac-app:"] + [f"  {line}" if line.strip() else "" for line in lines]
     nested.append(f"  app: {json.dumps(app)}")
     nested.append(f"  images: {json.dumps(images, sort_keys=True)}")
@@ -180,13 +195,20 @@ def write_chart(out, profile, values_path, version, source_sha, images, wac_app_
     """Write out/<app>/{Chart.yaml,values.yaml,charts/wac-app-<chart_version>.tgz}."""
     app = check(profile["app"], APP, "app")
     chart_version = check(profile["chart_version"], VERSION, "chart_version")
-    check(version, VERSION, "version")
+    check(version, RELEASE_VERSION, "version")
     check(source_sha, SHA40, "source sha")
     wanted = {image["name"] for image in profile["images"]}
     if set(images) != wanted:
         raise ChartError(
             f"images {sorted(images)} do not match the profile images {sorted(wanted)}"
         )
+    for name, image in images.items():
+        if not isinstance(image, dict):
+            raise ChartError(f"image {name!r} must be an object")
+        if image.get("repository") != f"{PULL_REGISTRY}/{name}":
+            raise ChartError(
+                f"image {name!r} repository is {image.get('repository')!r}, not {PULL_REGISTRY}/{name}"
+            )
     if not ci:
         for name, image in images.items():
             if image.get("tag") != version:
@@ -196,7 +218,7 @@ def write_chart(out, profile, values_path, version, source_sha, images, wac_app_
     if not tgz.is_file():
         raise ChartError(f"wac-app package {tgz} does not exist")
     try:
-        text = Path(values_path).read_text(encoding="utf-8")
+        text = Path(values_path).read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as err:
         raise ChartError(f"cannot read the values file {values_path}: {err}") from err
     values = render_values(text, app, images)
@@ -218,18 +240,22 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def http_get(url, accept, timeout):
+    """GET url; returns (200, body) or (404, b""). Any other outcome is a ChartError."""
     request = urllib.request.Request(url, headers={"Accept": accept})
     try:
         with _OPENER.open(request, timeout=timeout) as response:
-            body = response.read(MAX_BODY + 1)
+            status = response.status
+            body = response.read(MAX_BODY + 1) if status == 200 else b""
     except urllib.error.HTTPError as err:
         err.close()
-        return err.code, b""
-    except (urllib.error.URLError, OSError, ValueError) as err:
+        status, body = err.code, b""
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as err:
         raise ChartError(f"cannot reach the registry at {url}: {getattr(err, 'reason', err)}") from err
+    if status not in (200, 404):
+        raise ChartError(f"the registry answered HTTP {status} for {url}")
     if len(body) > MAX_BODY:
         raise ChartError(f"the registry response for {url} exceeds {MAX_BODY} bytes")
-    return 200, body
+    return status, body
 
 
 def parse_json(body, what):
@@ -276,7 +302,7 @@ def config_digest(manifest, repo, ref):
 def chart_config(registry, app, version, timeout=TIMEOUT):
     """The Helm config blob (Chart.yaml as JSON) of deploy/<app>:<version>, or None."""
     check(app, APP, "app")
-    check(version, VERSION, "version")
+    check(version, RELEASE_VERSION, "version")
     repo = f"{DEPLOY_REPO}/{app}"
     manifest = manifest_state(registry, repo, version, timeout)
     if manifest is None:
@@ -286,7 +312,15 @@ def chart_config(registry, app, version, timeout=TIMEOUT):
         raise ChartError(
             f"{repo}:{version} config media type is {config.get('mediaType')!r}, not {HELM_CONFIG_TYPE}"
         )
-    return parse_json(blob(registry, repo, config["digest"], timeout), f"the chart config of {repo}:{version}")
+    parsed = parse_json(
+        blob(registry, repo, config["digest"], timeout), f"the chart config of {repo}:{version}"
+    )
+    if parsed.get("name") != app or parsed.get("version") != version:
+        raise ChartError(
+            f"{repo}:{version} holds chart {parsed.get('name')!r} {parsed.get('version')!r}, "
+            f"not {app!r} {version!r}"
+        )
+    return parsed
 
 
 def chart_annotations(config):
