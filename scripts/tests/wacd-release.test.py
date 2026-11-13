@@ -117,6 +117,9 @@ class Script:
         return self.responses[0]
 
 
+GARBAGE = object()
+
+
 class Health:
     def __init__(self, *responses):
         self.requests = 0
@@ -130,6 +133,9 @@ class Health:
                     status, body, location = outer.responses.pop(0)
                 else:
                     status, body, location = outer.responses[0]
+                if body is GARBAGE:
+                    self.wfile.write(b"this is not http\r\n\r\n")
+                    return
                 self.send_response(status)
                 if location:
                     self.send_header("Location", location)
@@ -260,23 +266,37 @@ class ReadyTests(unittest.TestCase):
         value["deployments"].append(sidecar)
         self.assertTrue(self.ready(value))
 
-    def test_ready_rejects_missing_deployments(self):
-        for deployments in ([], None):
+    def test_ready_is_false_while_deployments_are_missing(self):
+        for deployments in ([], None, "x"):
             with self.subTest(deployments=deployments):
                 value = evidence()
                 if deployments is None:
                     del value["deployments"]
                 else:
                     value["deployments"] = deployments
-                with self.assertRaises(ReleaseError):
-                    self.ready(value)
+                self.assertFalse(self.ready(value))
+
+    def test_ready_expects_the_release_version_as_the_image_tag(self):
+        stale = {
+            "travel-app": {
+                "repository": "localhost:30500/travel-app",
+                "tag": "0.0.9",
+                "digest": IMAGE_DIGEST,
+            }
+        }
+        value = evidence()
+        value["deployments"][0]["images"] = [
+            f"localhost:30500/travel-app:0.0.9@{IMAGE_DIGEST}"
+        ]
+        self.assertFalse(self.ready(value, stale))
+        self.assertTrue(self.ready(evidence(), stale))
 
     def test_ready_ignores_images_of_other_repositories(self):
         value = evidence()
         value["deployments"][0]["images"].append("localhost:30500/other:1")
         self.assertTrue(self.ready(value))
 
-    def test_ready_needs_each_release_repository_in_a_deployment_exactly(self):
+    def test_ready_rejects_a_stale_image_of_any_release_repository(self):
         images = dict(IMAGES)
         images["travel-worker"] = {
             "repository": "localhost:30500/travel-worker",
@@ -292,6 +312,15 @@ class ReadyTests(unittest.TestCase):
             f"localhost:30500/travel-worker:{VERSION}@sha256:{'f' * 64}"
         )
         self.assertTrue(self.ready(value, images))
+
+    def test_ready_allows_a_release_image_that_no_deployment_runs(self):
+        images = dict(IMAGES)
+        images["travel-worker"] = {
+            "repository": "localhost:30500/travel-worker",
+            "tag": VERSION,
+            "digest": "sha256:" + "f" * 64,
+        }
+        self.assertTrue(self.ready(evidence(), images))
 
 
 class DigestTests(unittest.TestCase):
@@ -442,6 +471,22 @@ class ServedTests(unittest.TestCase):
         self.assertEqual(health.requests, 3)
         self.assertEqual(clock.sleeps, [5, 5])
 
+    def test_health_retries_a_malformed_response(self):
+        health, _, ok = self.serve(
+            (200, GARBAGE, None),
+            (200, {"sha": SOURCE}, None),
+            expect_db=False,
+            timeout=60,
+        )
+        self.assertEqual(ok, {"sha": SOURCE})
+        self.assertEqual(health.requests, 2)
+
+    def test_health_truncates_a_long_served_sha(self):
+        _, _, error = self.serve((200, {"sha": "7" * 500, "db": "ok"}, None), timeout=1)
+        self.assertIsInstance(error, ReleaseError)
+        self.assertIn("7" * 80, str(error))
+        self.assertNotIn("7" * 81, str(error))
+
     def test_health_fails_closed(self):
         cases = {
             "not an object": (200, b'["sha"]', None),
@@ -506,6 +551,21 @@ class CliTests(unittest.TestCase):
             self.assertIn(receipt, out)
             self.assertEqual(json.loads(Path(receipt).read_text()), released())
 
+    def test_cli_receipt_keeps_the_released_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = str(Path(tmp) / "receipt.json")
+            script = Script((200, released(not_ready())), (200, evidence()))
+            stack, _ = fake_clock()
+            with stack, patch.object(wacd, "trust_context", lambda: None), patch.object(
+                wacd.ci, "request", script
+            ):
+                code, _, err = self.main(*self.release_argv(receipt))
+            self.assertEqual((code, err), (0, ""), err)
+            written = json.loads(Path(receipt).read_text())
+            self.assertEqual(written["released"]["chart_source_sha"], SOURCE)
+            self.assertEqual(written["released"], released()["released"])
+            self.assertEqual(written, {**evidence(), "released": released()["released"]})
+
     def test_cli_never_prints_the_token(self):
         def explode(body, trust, timeout):
             raise RuntimeError(f"Authorization: Bearer {TOKEN}")
@@ -545,6 +605,16 @@ class CliTests(unittest.TestCase):
                 "leading zero": self.release_argv(receipt, version="01.0.0"),
                 "timeout zero": self.release_argv(receipt, timeout="0"),
                 "timeout high": self.release_argv(receipt, timeout="3601"),
+                "image tag is not the version": self.release_argv(
+                    receipt,
+                    images={
+                        "a": {
+                            "repository": "localhost:30500/a",
+                            "tag": "0.0.9",
+                            "digest": IMAGE_DIGEST,
+                        }
+                    },
+                ),
                 "no images": self.release_argv(receipt, images={}),
                 "bad digest": self.release_argv(
                     receipt,
@@ -575,6 +645,16 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(code, 1)
         self.assertEqual(len(err.strip().splitlines()), 1)
+
+    def test_cli_health_rejects_a_malformed_sha(self):
+        for sha in ("abc", "A" * 40, "g" * 40, "a" * 41):
+            with self.subTest(sha=sha):
+                code, out, err = self.main(
+                    "health", "--url", "http://127.0.0.1:9/h", "--sha", sha,
+                    "--expect-db", "false", "--wait-timeout", "1",
+                )
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn("--sha", err)
 
     def test_cli_health(self):
         health = Health((200, {"sha": SOURCE, "db": "ok"}, None))

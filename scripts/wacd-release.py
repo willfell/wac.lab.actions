@@ -14,6 +14,7 @@ RELEASE_BODY, STATUS_BODY and ready(). Any problem exits 1 with one stable
 """
 
 import argparse
+import http.client
 import importlib.util
 import json
 import re
@@ -35,6 +36,7 @@ ReleaseError = ci.ReleaseError
 
 PULL_REGISTRY = "localhost:30500"
 VERSION_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 POLL_SECONDS = 5
 MAX_BODY = 1024 * 1024
@@ -80,9 +82,9 @@ def image_repository(ref):
     return f"{head}/{last}" if head else last
 
 
-def expected_refs(images):
+def expected_refs(version, images):
     return {
-        spec["repository"]: f"{spec['repository']}:{spec['tag']}@{spec['digest']}"
+        spec["repository"]: f"{spec['repository']}:{version}@{spec['digest']}"
         for spec in images.values()
     }
 
@@ -112,9 +114,6 @@ def rolled_out(deployment):
 
 
 def ready(value, version, chart_digest, images):
-    deployments = value.get("deployments")
-    if not isinstance(deployments, list) or not deployments:
-        raise ReleaseError("deployment evidence is missing")
     sync = value.get("sync")
     health = value.get("health")
     if (
@@ -127,7 +126,10 @@ def ready(value, version, chart_digest, images):
         or value.get("automated") is not True
     ):
         return False
-    wanted = expected_refs(images)
+    deployments = value.get("deployments")
+    if not isinstance(deployments, list) or not deployments:
+        return False
+    wanted = expected_refs(version, images)
     running = False
     for deployment in deployments:
         if not rolled_out(deployment):
@@ -148,6 +150,10 @@ def ready(value, version, chart_digest, images):
 
 
 def release(version, images, wait_timeout, request=None):
+    return proved(version, images, wait_timeout, request)[0]
+
+
+def proved(version, images, wait_timeout, request=None):
     if request is None:
         request = transport
         trust = trust_context()
@@ -162,12 +168,14 @@ def release(version, images, wait_timeout, request=None):
         time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
 
     digest = None
+    record = None
     while digest is None and time.monotonic() < deadline:
         code, value = send(RELEASE_BODY(version))
         if code == 200:
             digest = released_digest(value, version)
+            record = value["released"]
             if ready(value, version, digest, images):
-                return value
+                return value, record
         elif code == 503:
             wait()
         else:
@@ -176,7 +184,7 @@ def release(version, images, wait_timeout, request=None):
         code, value = send(STATUS_BODY())
         if code == 200:
             if ready(value, version, digest, images):
-                return value
+                return value, record
         elif code != 503:
             raise ReleaseError(f"release request rejected (HTTP {code})")
         wait()
@@ -195,7 +203,7 @@ def probe(url, timeout):
     except urllib.error.HTTPError as err:
         err.close()
         return None
-    except (OSError, urllib.error.URLError, ValueError):
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
         return None
     try:
         value = json.loads(raw)
@@ -214,11 +222,11 @@ def served(url, sha, expect_db, timeout):
         value = probe(url, max(1, min(10, deadline - time.monotonic())))
         if value is not None:
             got = value.get("sha")
-            seen = got if isinstance(got, str) else "(not a string)"
+            seen = got[:80] if isinstance(got, str) else "(not a string)"
             if got == sha and (not expect_db or value.get("db") == "ok"):
                 return value
             if got == sha:
-                seen = f"{sha} with db {value.get('db')!r}"
+                seen = f"{sha} with db {str(value.get('db'))[:80]!r}"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -228,7 +236,7 @@ def served(url, sha, expect_db, timeout):
     raise ReleaseError(f"health check served sha {seen}, expected {sha}")
 
 
-def parse_images(text):
+def parse_images(text, version):
     try:
         images = json.loads(text)
     except ValueError:
@@ -239,8 +247,7 @@ def parse_images(text):
         if (
             not isinstance(spec, dict)
             or spec.get("repository") != f"{PULL_REGISTRY}/{name}"
-            or not isinstance(spec.get("tag"), str)
-            or not spec["tag"]
+            or spec.get("tag") != version
             or not isinstance(spec.get("digest"), str)
             or not DIGEST_PATTERN.fullmatch(spec["digest"])
         ):
@@ -282,12 +289,15 @@ def build_parser():
 def run(args):
     timeout = wait_bound(args.wait_timeout)
     if args.command == "health":
+        if not SHA_PATTERN.fullmatch(args.sha):
+            raise ReleaseError("--sha must be 40 lowercase hex characters")
         value = served(args.url, args.sha, args.expect_db == "true", timeout)
         return f"Verified served build: {value['sha']}"
     if not VERSION_PATTERN.fullmatch(args.version):
         raise ReleaseError("--version must be X.Y.Z")
-    images = parse_images(args.images)
-    result = release(args.version, images, timeout)
+    images = parse_images(args.images, args.version)
+    result, record = proved(args.version, images, timeout)
+    result = {**result, "released": record}
     Path(args.receipt).write_text(json.dumps(result, indent=2) + "\n")
     return "Verified release receipt: " + args.receipt
 
