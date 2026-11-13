@@ -15,7 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-SEMVER = re.compile(r"(\d+)\.(\d+)\.(\d+)", re.ASCII)
+NUM = r"(0|[1-9][0-9]*)"
+SEMVER = re.compile(rf"{NUM}\.{NUM}\.{NUM}")
 BREAKING_HEADER = re.compile(r"\w+(\([^)]*\))?!:")
 FEAT_HEADER = re.compile(r"feat(\([^)]*\))?:")
 BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
@@ -31,7 +32,8 @@ def git(repo, *args):
             ["git", "-C", str(repo), *args],
             check=True,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.CalledProcessError as err:
         detail = " ".join((err.stderr or "").split())
@@ -42,7 +44,7 @@ def git(repo, *args):
 
 
 def parse_tag(tag, prefix):
-    match = re.fullmatch(re.escape(prefix) + r"(\d+)\.(\d+)\.(\d+)", tag, re.ASCII)
+    match = re.fullmatch(re.escape(prefix) + rf"{NUM}\.{NUM}\.{NUM}", tag)
     if not match:
         return None
     return tuple(int(part) for part in match.groups())
@@ -81,7 +83,8 @@ def commit_of(repo, tag):
             ["git", "-C", str(repo), "rev-parse", "-q", "--verify", ref],
             check=True,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
         ).stdout
     except subprocess.CalledProcessError:
         return None
@@ -98,6 +101,10 @@ def plan(repo, prefix, source, caller_version, deploy=True):
     if source not in ("commits", "caller"):
         raise VersionError(f"unknown version source {source!r}")
     repo = Path(repo)
+    if git(repo, "rev-parse", "--is-shallow-repository").strip() == "true":
+        raise VersionError(
+            "the checkout is shallow, so tags and history are incomplete; fetch with full depth"
+        )
     head = git(repo, "rev-parse", "HEAD").strip()
 
     at_head = [

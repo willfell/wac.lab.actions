@@ -15,7 +15,14 @@ SPEC.loader.exec_module(version)
 
 def git(repo, *args):
     result = subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        [
+            "git",
+            "-c", "user.name=t",
+            "-c", "user.email=t@t",
+            "-c", "commit.gpgsign=false",
+            "-c", "tag.gpgsign=false",
+            *args,
+        ],
         cwd=repo,
         check=True,
         capture_output=True,
@@ -64,6 +71,11 @@ class LatestTagTest(unittest.TestCase):
         self.assertEqual(version.latest_tag(self.TAGS, "v"), "1.10.0")
         self.assertEqual(version.latest_tag(self.TAGS, "app-v"), "1.0.0")
         self.assertEqual(version.latest_tag(self.TAGS, ""), "1.9.0")
+
+    def test_leading_zeros_are_ignored(self):
+        tags = ["v01.0.0", "v1.02.3", "v1.2.03", "v0.0.0", "v0.1.0"]
+        self.assertEqual(version.latest_tag(tags, "v"), "0.1.0")
+        self.assertIsNone(version.latest_tag(["v01.0.0"], "v"))
 
     def test_no_match_is_none(self):
         self.assertIsNone(version.latest_tag(self.TAGS, "zzz-v"))
@@ -167,7 +179,7 @@ class RepoTest(unittest.TestCase):
             self.plan(source="caller", caller=None),
             {"mode": "none", "version": "", "tag": ""},
         )
-        for bad in ("v2.0.0", "2.0", "2.0.0\n", "2.0.0-rc.1", " 2.0.0"):
+        for bad in ("v2.0.0", "2.0", "2.0.0\n", "2.0.0-rc.1", " 2.0.0", "01.2.3", "1.02.3", "1.2.03"):
             with self.assertRaises(version.VersionError, msg=repr(bad)):
                 self.plan(source="caller", caller=bad)
 
@@ -201,6 +213,40 @@ class RepoTest(unittest.TestCase):
             self.plan(source="caller", caller="", deploy=False),
             {"mode": "none", "version": "", "tag": ""},
         )
+
+    def test_annotated_tags_count(self):
+        self.commit("feat: old")
+        git(self.repo, "tag", "-a", "v1.4.0", "-m", "release")
+        self.commit("fix: x")
+        self.assertEqual(self.plan()["version"], "1.4.1")
+        git(self.repo, "tag", "-a", "v1.4.1", "-m", "release")
+        self.assertEqual(
+            self.plan(), {"mode": "resume", "version": "1.4.1", "tag": "v1.4.1"}
+        )
+
+    def test_leading_zero_head_tag_does_not_resume(self):
+        self.commit("feat: first")
+        self.tag("v01.0.0")
+        self.assertEqual(self.plan()["mode"], "release")
+
+    def test_shallow_clone_fails(self):
+        self.commit("feat: one")
+        self.tag("v1.0.0")
+        self.commit("fix: two")
+        with tempfile.TemporaryDirectory() as dest:
+            clone = Path(dest) / "clone"
+            git(Path(dest), "clone", "-q", "--depth", "1", f"file://{self.repo}", str(clone))
+            with self.assertRaises(version.VersionError) as ctx:
+                version.plan(clone, "v", "commits", None)
+            self.assertIn("shallow", str(ctx.exception))
+
+    def test_non_utf8_commit_message_is_read(self):
+        self.commit("feat: old")
+        self.tag("v1.0.0")
+        message = self.repo / "msg.txt"
+        message.write_bytes(b"feat: caf\xe9\n")
+        git(self.repo, "commit", "--allow-empty", "-q", "-F", str(message))
+        self.assertEqual(self.plan()["version"], "1.1.0")
 
     def test_not_a_repo_fails(self):
         with tempfile.TemporaryDirectory() as empty:
