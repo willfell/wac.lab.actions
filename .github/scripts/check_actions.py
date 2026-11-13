@@ -111,10 +111,9 @@ def _check_reusable_workflow(path: Path, doc: dict) -> list[str]:
 def _check_no_environment(path: Path, doc: dict) -> list[str]:
     """A reusable workflow job may not name an environment.
 
-    An environment is the caller's approval and secret boundary. A shared
-    workflow that names one would bind every caller to an environment it may
-    not have, or silently route its jobs through someone else's protection
-    rules.
+    A job that names an environment puts an `environment` claim in its OIDC
+    token, and the release gateway rejects tokens that carry one. The job
+    would also bind every caller to an environment it may not have.
     """
     return [
         f"{path}: job {name!r} declares `environment` -- environments belong to the "
@@ -139,7 +138,7 @@ def _check_shared_checkouts(path: Path, doc: dict) -> list[str]:
         steps = (job or {}).get("steps") or []
         for index, step in enumerate(steps):
             with_ = step.get("with") or {}
-            if with_.get("repository") != SHARED_REPOSITORY:
+            if str(with_.get("repository") or "").lower() != SHARED_REPOSITORY:
                 continue
             where = f"{path}: job {name!r} steps[{index}]"
             if with_.get("ref") != WORKFLOW_SHA_EXPRESSION:
@@ -204,6 +203,7 @@ def _check_runner_is_a_caller_choice(path: Path, doc: dict) -> list[str]:
         )
 
     for name, job in (doc.get("jobs") or {}).items():
+        job = job or {}
         if "uses" in job:
             # A nested call has no runner of its own: the callee picks one from
             # the `runner` input, so the only thing to hold is the pass-through.

@@ -1,5 +1,5 @@
-import copy
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -103,6 +103,33 @@ class ReusableWorkflowTests(unittest.TestCase):
         doc = workflow({"release": {"runs-on": module.RUNS_ON_EXPRESSION, "environment": {"name": "x"}, "steps": []}})
         problems = module._check_no_environment(Path("other.yml"), doc)
         self.assertTrue(any("environment" in p for p in problems))
+
+    def test_reusable_workflow_check_runs_the_shared_checkout_and_environment_rules(self):
+        cases = (
+            ("shared checkout at main", {"gate": {
+                "runs-on": module.RUNS_ON_EXPRESSION,
+                "steps": [guard_step(), shared_checkout(ref="main")],
+            }}, "shared checkout must use ref"),
+            ("job environment", {"release": {
+                "runs-on": module.RUNS_ON_EXPRESSION,
+                "environment": "production",
+                "steps": [],
+            }}, "declares `environment`"),
+        )
+        for label, jobs, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "wac-ci.yml"
+                doc = workflow(jobs)
+                path.write_text("name: wf\n")
+                problems = module._check_reusable_workflow(path, doc)
+                self.assertTrue(any(expected in p for p in problems), problems)
+
+    def test_shared_repository_match_ignores_case(self):
+        doc = workflow({"gate": {"steps": [guard_step(), shared_checkout(repository="WillFell/Wac.Lab.Actions", ref="main")]}})
+        self.assertTrue(module._check_shared_checkouts(Path("wac-ci.yml"), doc))
+
+    def test_null_nested_job_is_a_problem_not_a_crash(self):
+        self.assertTrue(runner_problems({"lint": None}))
 
     def test_repository_workflows_pass(self):
         self.assertEqual(module.main(), 0)
