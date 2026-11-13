@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Validate a repo's .github/wacd.json profile, the single input to wac-ci and wac-cd.
+
+The CLI prints key=value lines for $GITHUB_OUTPUT. Any problem exits 1 with a
+message that names the dotted field path of the first offence.
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+APP = re.compile(r"[a-z][a-z0-9-]{0,39}")
+SEMVER = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+TAG_PREFIX = re.compile(r"([a-z][a-z0-9-]*)?")
+HEALTH_URL = re.compile(
+    r"http://[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.svc\.cluster\.local(:[0-9]{1,5})?/\S*"
+)
+IMAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+BUILD_ARG = re.compile(r"[A-Z_][A-Z0-9_]*")
+VERSION = re.compile(r"[0-9]+(\.[0-9]+){0,2}")
+
+TOP_REQUIRED = (
+    "schema_version",
+    "app",
+    "chart_version",
+    "values_file",
+    "tag_prefix",
+    "health_url",
+    "images",
+    "ci",
+)
+TOP_OPTIONAL = ("health_expect_db_ok",)
+IMAGE_REQUIRED = ("name", "dockerfile", "context")
+IMAGE_OPTIONAL = ("sha_build_arg",)
+CI_REQUIRED = ("stack", "commands")
+CI_OPTIONAL = ("node_version", "go_version")
+
+
+class ProfileError(Exception):
+    """A profile problem; the message starts with the dotted field path."""
+
+
+def fail(path, message):
+    raise ProfileError(f"{path}: {message}")
+
+
+def check_keys(obj, path, required, optional):
+    """Reject unknown keys and report the first missing required one."""
+    prefix = f"{path}." if path else ""
+    for key in obj:
+        if key not in required and key not in optional:
+            fail(f"{prefix}{key}", "unknown field")
+    for key in required:
+        if key not in obj:
+            fail(f"{prefix}{key}", "required")
+
+
+def check_str(value, path):
+    if not isinstance(value, str):
+        fail(path, "must be a string")
+    return value
+
+
+def check_pattern(value, path, pattern, what):
+    if not pattern.fullmatch(check_str(value, path)):
+        fail(path, f"must be {what}")
+
+
+def check_relative(value, path):
+    """A repo-relative path that cannot climb out of the repo."""
+    check_str(value, path)
+    if not value or value.startswith("/") or "\\" in value:
+        fail(path, "must be a relative path inside the repo")
+    if ".." in value.split("/"):
+        fail(path, "must not contain a '..' segment")
+
+
+def check_images(images, path):
+    if not isinstance(images, list) or not images:
+        fail(path, "must be a non-empty list")
+    seen = set()
+    for i, image in enumerate(images):
+        here = f"{path}[{i}]"
+        if not isinstance(image, dict):
+            fail(here, "must be an object")
+        check_keys(image, here, IMAGE_REQUIRED, IMAGE_OPTIONAL)
+        check_pattern(image["name"], f"{here}.name", IMAGE_NAME, "a lowercase image name")
+        if image["name"] in seen:
+            fail(f"{here}.name", f"duplicate image name {image['name']!r}")
+        seen.add(image["name"])
+        check_relative(image["dockerfile"], f"{here}.dockerfile")
+        check_relative(image["context"], f"{here}.context")
+        if "sha_build_arg" in image:
+            check_pattern(
+                image["sha_build_arg"],
+                f"{here}.sha_build_arg",
+                BUILD_ARG,
+                "an upper-case build arg name",
+            )
+
+
+def check_ci(ci, path):
+    if not isinstance(ci, dict):
+        fail(path, "must be an object")
+    check_keys(ci, path, CI_REQUIRED, CI_OPTIONAL)
+    stack = ci["stack"]
+    if stack not in ("node", "go"):
+        fail(f"{path}.stack", "must be 'node' or 'go'")
+    own, other = (
+        ("node_version", "go_version") if stack == "node" else ("go_version", "node_version")
+    )
+    if own not in ci:
+        fail(f"{path}.{own}", f"required when stack is {stack!r}")
+    if other in ci:
+        fail(f"{path}.{other}", f"not allowed when stack is {stack!r}")
+    check_pattern(ci[own], f"{path}.{own}", VERSION, "a version such as 22 or 1.24")
+    commands = ci["commands"]
+    if not isinstance(commands, list) or not commands:
+        fail(f"{path}.commands", "must be a non-empty list")
+    for i, command in enumerate(commands):
+        here = f"{path}.commands[{i}]"
+        if not isinstance(command, str) or not command.strip():
+            fail(here, "must be a non-empty string")
+        if "\n" in command or "\r" in command:
+            fail(here, "must be a single line")
+
+
+def validate(data, repo_root):
+    if not isinstance(data, dict):
+        fail("profile", "must be a JSON object")
+    check_keys(data, "", TOP_REQUIRED, TOP_OPTIONAL)
+    version = data["schema_version"]
+    if isinstance(version, bool) or version != 1 or not isinstance(version, int):
+        fail("schema_version", "must be the integer 1")
+    check_pattern(data["app"], "app", APP, "a lowercase app name of at most 40 characters")
+    check_pattern(data["chart_version"], "chart_version", SEMVER, "X.Y.Z")
+    check_relative(data["values_file"], "values_file")
+    if not (repo_root / data["values_file"]).is_file():
+        fail("values_file", f"{data['values_file']} does not exist in the repo")
+    check_pattern(data["tag_prefix"], "tag_prefix", TAG_PREFIX, "empty or a lowercase prefix such as v")
+    check_pattern(
+        data["health_url"],
+        "health_url",
+        HEALTH_URL,
+        "an in-cluster http://<host>.svc.cluster.local URL",
+    )
+    if "health_expect_db_ok" in data and not isinstance(data["health_expect_db_ok"], bool):
+        fail("health_expect_db_ok", "must be a JSON boolean")
+    check_images(data["images"], "images")
+    check_ci(data["ci"], "ci")
+
+
+def load(path):
+    """Return the validated profile at path; the repo root is the parent of .github/."""
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text())
+    except OSError as err:
+        fail("profile", f"cannot read {path}: {err.strerror}")
+    except json.JSONDecodeError as err:
+        fail("profile", f"{path} is not valid JSON: {err}")
+    validate(data, path.parent.parent)
+    return data
+
+
+def outputs(data):
+    expect_db = data.get("health_expect_db_ok", True)
+    compact = {"separators": (",", ":")}
+    return [
+        f"app={data['app']}",
+        f"chart_version={data['chart_version']}",
+        f"values_file={data['values_file']}",
+        f"tag_prefix={data['tag_prefix']}",
+        f"health_url={data['health_url']}",
+        f"health_expect_db_ok={'true' if expect_db else 'false'}",
+        f"images={json.dumps(data['images'], **compact)}",
+        f"ci={json.dumps(data['ci'], **compact)}",
+    ]
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: wacd-profile.py <path to .github/wacd.json>", file=sys.stderr)
+        return 2
+    try:
+        data = load(argv[1])
+    except ProfileError as err:
+        print(f"wacd profile: {err}", file=sys.stderr)
+        return 1
+    print("\n".join(outputs(data)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
