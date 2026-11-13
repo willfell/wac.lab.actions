@@ -70,7 +70,7 @@ def check_pattern(value, path, pattern, what):
 def check_relative(value, path):
     """A repo-relative path that cannot climb out of the repo."""
     check_str(value, path)
-    if not value or value.startswith("/") or "\\" in value:
+    if not value or value.startswith("/") or any(c in value for c in "\\\n\r"):
         fail(path, "must be a relative path inside the repo")
     if ".." in value.split("/"):
         fail(path, "must not contain a '..' segment")
@@ -158,6 +158,8 @@ def load(path):
         data = json.loads(path.read_text())
     except OSError as err:
         fail("profile", f"cannot read {path}: {err.strerror}")
+    except UnicodeDecodeError:
+        fail("profile", f"{path} is not valid UTF-8")
     except json.JSONDecodeError as err:
         fail("profile", f"{path} is not valid JSON: {err}")
     validate(data, path.parent.parent)

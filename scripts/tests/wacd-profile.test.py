@@ -41,7 +41,9 @@ class ProfileTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name)
+        self.base = Path(self._tmp.name)
+        self.root = self.base / "repo"
+        self.root.mkdir()
         (self.root / ".github").mkdir()
         (self.root / "deploy").mkdir()
         (self.root / "deploy" / "values.yaml").write_text("replicas: 1\n")
@@ -91,9 +93,37 @@ class ProfileTest(unittest.TestCase):
         self.assertRejected(self.profile(schema_version=True), "schema_version")
 
     def test_values_file_must_exist_and_stay_inside(self):
-        self.assertRejected(self.profile(values_file="deploy/missing.yaml"), "values_file")
-        self.assertRejected(self.profile(values_file="../x.yaml"), "values_file")
-        self.assertRejected(self.profile(values_file="/etc/x"), "values_file")
+        self.assertRejected(self.profile(values_file="deploy/missing.yaml"), "does not exist")
+        (self.base / "x.yaml").write_text("escaped: true\n")
+        self.assertRejected(self.profile(values_file="../x.yaml"), "'..' segment")
+        outside = self.base / "abs.yaml"
+        outside.write_text("absolute: true\n")
+        self.assertRejected(self.profile(values_file=str(outside)), "relative path inside the repo")
+
+    def test_relative_paths_reject_line_breaks(self):
+        (self.root / "deploy" / "values.yaml\nextra=1").write_text("x: 1\n")
+        self.assertRejected(
+            self.profile(values_file="deploy/values.yaml\nextra=1"),
+            "relative path inside the repo",
+        )
+        data = self.profile()
+        data["images"][0]["dockerfile"] = "Dockerfile\r"
+        self.assertRejected(data, "images[0].dockerfile")
+
+    def test_profile_must_be_utf8_json(self):
+        self.path.write_bytes(b"\xff\xfe{")
+        with self.assertRaises(profile.ProfileError) as caught:
+            profile.load(self.path)
+        self.assertIn("UTF-8", str(caught.exception))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), str(self.path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith("wacd profile:"))
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_duplicate_image_names(self):
         data = self.profile()
