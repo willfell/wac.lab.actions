@@ -61,7 +61,7 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 10
     permissions:
-      contents: read
+      contents: write
     outputs:
       mode: ${{ steps.version.outputs.mode }}
       version: ${{ steps.version.outputs.version }}
@@ -79,7 +79,6 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-          persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
@@ -187,6 +186,21 @@ jobs:
             fi
             expected_sha="$GITHUB_SHA"
           fi
+          superseded=""
+          if [[ "$mode" == release || "$mode" == publish ]]; then
+            if ! claimed="$(python3 "$WACD_SCRIPTS"/wacd-tag.py claim-tag --tag "$tag" --sha "$GITHUB_SHA" \
+              --branch main 2> "$RUNNER_TEMP/claim-tag.err")"; then
+              echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/claim-tag.err")"
+              exit 1
+            fi
+            echo "$claimed"
+            if [[ "$(sed -n 's/^claim=//p' <<< "$claimed")" == superseded ]]; then
+              superseded="$(head -n 1 <<< "$claimed")"
+              mode=none
+              version=""
+              tag=""
+            fi
+          fi
           {
             echo "mode=$mode"
             echo "version=$version"
@@ -199,6 +213,10 @@ jobs:
             echo "| mode | version | tag | expected sha |"
             echo "| --- | --- | --- | --- |"
             echo "| $mode | ${version:--} | ${tag:--} | $expected_sha |"
+            if [[ -n "$superseded" ]]; then
+              echo
+              echo "Superseded: $superseded. Nothing was built or published; the newer run releases these commits cumulatively."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:

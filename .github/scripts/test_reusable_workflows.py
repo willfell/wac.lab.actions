@@ -253,6 +253,65 @@ class ReusableWorkflowTests(unittest.TestCase):
                 result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
+    def test_wac_cd_plan_claims_the_tag_before_build_and_steps_aside_when_superseded(self):
+        import os
+        import subprocess
+        import tempfile
+        import yaml
+
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-cd.yml").read_text())
+        plan = doc["jobs"]["plan"]
+        self.assertEqual(plan["permissions"], {"contents": "write"})
+        self.assertNotIn("persist-credentials", plan["steps"][0].get("with") or {})
+        step = next(s for s in plan["steps"] if s.get("name") == "Plan the version")
+        stubs = {
+            "wacd-version.py": "import os\nprint('mode=' + os.environ['STUB_MODE'])\nprint('version=0.2.0')\nprint('tag=v0.2.0')\n",
+            "wacd-chart.py": "print('state=present')\n",
+            "wacd-tag.py": (
+                "import os, sys\n"
+                "open(os.environ['STUB_LOG'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                "claim = os.environ['STUB_CLAIM']\n"
+                "if claim == 'fail':\n"
+                "    sys.exit(print('wacd tag: git push failed: refused', file=sys.stderr) or 1)\n"
+                "print('Tag v0.2.0 line')\n"
+                "print('claim=' + claim)\n"
+            ),
+        }
+        sha = "a" * 40
+        for mode, claim, code, expected_mode, claimed in (
+            ("release", "pushed", 0, "release", True),
+            ("publish", "exists", 0, "publish", True),
+            ("release", "superseded", 0, "none", True),
+            ("release", "fail", 1, None, True),
+            ("resume", "pushed", 0, "resume", False),
+        ):
+            with self.subTest(mode=mode, claim=claim), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for name, body in stubs.items():
+                    (root / name).write_text(body)
+                out, summary, log = root / "out", root / "summary", root / "log"
+                log.write_text("")
+                env = {**os.environ, "WACD_SCRIPTS": str(root), "RUNNER_TEMP": str(root),
+                       "GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_SHA": sha,
+                       "ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "",
+                       "DEPLOY": "true", "APP": "app", "TAG_PREFIX": "v",
+                       "STUB_MODE": mode, "STUB_CLAIM": claim, "STUB_LOG": str(log)}
+                result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                calls = log.read_text().splitlines()
+                self.assertEqual(calls, [f"claim-tag --tag v0.2.0 --sha {sha} --branch main"] if claimed else [])
+                if code:
+                    self.assertIn("::error::wac-cd: wacd tag: git push failed", result.stdout)
+                    continue
+                outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
+                self.assertEqual(outputs["mode"], expected_mode)
+                if claim == "superseded" and claimed:
+                    self.assertEqual((outputs["version"], outputs["tag"]), ("", ""))
+                    self.assertIn("newer run releases these commits cumulatively", summary.read_text())
+                else:
+                    self.assertEqual((outputs["version"], outputs["tag"]), ("0.2.0", "v0.2.0"))
+                    self.assertNotIn("Superseded", summary.read_text())
+
     def test_repository_workflows_pass(self):
         self.assertEqual(module.main(), 0)
 

@@ -1176,15 +1176,18 @@ exists on another commit fails the plan.
 | `resume` | HEAD already carries a `<tag_prefix>X.Y.Z` tag and its deploy chart is published from this SHA | deploy, github-release |
 | `rollback` | `workflow_dispatch` with `rollback_version` | deploy, github-release |
 | `none` | `version_source: caller` with no version, or a tagged HEAD whose chart is published, with `deploy: false` | nothing |
+| `none` | a `release` or `publish` run whose tag push was refused after `main` moved on: superseded | nothing |
 
 `deploy: false` is publish-only, used for cutover step 1: the old route still
 deploys while `wac-cd` publishes the first deploy chart so Lab can register the
 app at that version. `rollback_version` with `deploy: false` fails.
 
-**A tag means "published"; a GitHub Release means "ran".** `publish` pushes
-the deploy chart and then the git tag in the same step, so a version whose
-rollout fails is still tagged, and the next merge computes the next version
-rather than this one again. `github-release` runs after any successful
+**A tag means "claimed"; a GitHub Release means "ran".** In `release` and
+`publish` modes, `plan` pushes the git tag (`wacd-tag.py claim-tag`) as soon as
+the version is decided, before anything is built, and `publish` pushes the
+deploy chart and then accepts that same tag again, unchanged. So a version
+whose build, publish or rollout fails is still tagged, and the next merge
+computes the next version rather than this one again. `github-release` runs after any successful
 deploy, in every mode that deploys, and creates the Release for the tag if it
 is missing, with generated notes. It never edits one that exists, so a resume
 or rollback leaves the original Release as it was.
@@ -1261,20 +1264,46 @@ Image builds need BuildKit, because the npm token reaches the build as a
 `--secret` (`id=node_auth_token`), never as a build arg that would be baked
 into a layer.
 
-### When a run fails before the tag
+### Why the tag comes first
 
-If a run fails after images or the chart were pushed but before the tag was,
-re-run that same run. Both state checks accept an image or chart already
-published from this run's SHA and carry on to the tag. A different commit that
-computes the same version fails at the image or chart state check instead,
-naming both SHAs, because a version is never rebuilt from other source.
+GitHub refuses a `GITHUB_TOKEN` push of any ref at a commit whose
+`.github/workflows` tree differs from the default branch's, even when that
+commit is already on `main`, and that token can never be granted the
+`workflows` permission. A run queued behind the concurrency group while a
+workflow-changing merge (a pin bump of `cd.yml` or `ci.yml`, say) lands on
+`main` therefore cannot tag its own commit any more. Travel's first `wac-cd`
+release hit exactly that: it published `deploy/travel:0.2.0` and then failed
+to push `v0.2.0`. Claiming the tag in `plan`, before build, shrinks that
+window to the plan job alone and makes sure nothing is built or published for
+a version that cannot be tagged.
 
-Re-running the original run is the fix. The stuck version has no tag, and the
-next version is computed from the latest tag, so later commits keep computing
-it again. A different commit escapes only when its bump class is higher than
-the stuck version's: a `feat` past a stuck patch, or a breaking change past a
-stuck patch or minor. Nothing moves past a stuck major except re-running the
-original run.
+**Superseded runs.** When the tag push is refused, `plan` reads `main` on the
+remote. If `main` has moved past this run's SHA, a newer run is coming that
+will release these commits together with its own, so this run is superseded:
+it sets mode `none`, writes a summary line saying so, builds and publishes
+nothing, and ends green. If the refused SHA is still `main`'s tip, nothing will
+release it, and the plan fails as before. A tag that already exists on another
+commit fails the plan in either case. The cost: a queue of workflow-only merges
+can delay a release by one run, and their commits release with the next one.
+No version is ever lost or tagged twice.
+
+### When a run fails after the tag
+
+If build or publish fails after `plan` claimed the tag, re-run the same commit.
+Its HEAD is now tagged and the version's deploy chart is absent, so `plan`
+takes the `release` (or `publish`) path of [Resume](#wac-cd): it rebuilds and
+publishes that same version, the image and chart state checks accept anything
+already pushed from this SHA, and the claim accepts the tag already on it. A
+different commit that computes the same version fails at the image or chart
+state check instead, naming both SHAs, because a version is never rebuilt from
+other source.
+
+If the failed run is never re-run, the next commit's run versions above the
+tag, so the failed version is skipped: it has a tag and no deploy chart, and
+nothing was ever deployed at it. That gap in the version sequence is accepted;
+the skipped version can still be completed later by re-running its run, as
+long as no later version has deployed, since `deploy` refuses to go below the
+running version.
 
 ## lab-release
 
