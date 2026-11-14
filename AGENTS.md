@@ -1,7 +1,7 @@
 # wac.lab.actions
 
 The fleet's shared CI library, catalog Component `lab-actions`: ten composite
-GitHub Actions and five reusable workflows that the other repos' workflows call
+GitHub Actions and seven reusable workflows that the other repos' workflows call
 at exact tags. It has no runtime. It builds no image, deploys nothing, and runs
 no service; every effect it has happens inside someone else's CI. It is public
 on purpose: callers supply credentials as inputs or through GitHub's native job
@@ -36,6 +36,13 @@ shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
 bash scripts/tests/argo-await-sync.test.sh  # lab-gitops-deploy's Argo wait, against a fake kubectl
 python3 scripts/tests/runner-policy.test.py  # fleet routing and legacy compatibility
 python3 scripts/tests/lab-route.test.py  # lab-route decisions, against a stub Prometheus
+uv run --with pyyaml python .github/scripts/test_reusable_workflows.py  # check_actions rules for nested calls and shared checkouts
+python3 scripts/tests/wacd-profile.test.py  # the wacd.json profile validator
+python3 scripts/tests/wacd-version.test.py  # version planning, against temp git repos
+WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-chart.test.py  # deploy chart packaging and registry reads; needs helm
+python3 scripts/tests/wacd-release.test.py  # wac-cd's gateway client, against a stub gateway
+uv run --with pyyaml python scripts/tests/wacd-parity.test.py  # kustomize and Helm render parity
+python3 scripts/tests/wacd-tag.test.py  # wac-cd's tag push, against a local bare remote
 bash scripts/tests/agents-md.test.sh  # the AGENTS.md gate, against fixture repos; needs uv and git
 bash scripts/tests/validate-kustomize.test.sh  # requires kubeconform; schema recovery and strict rejection scenarios
 uv run scripts/agents-md.py check  # this file against the fleet contract
@@ -57,12 +64,17 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
   `lab-build`, `lab-deploy`, `lab-gitops-deploy`, `lab-release`, `lab-kubeconform`,
   `lab-route`, `lab-tofu-plan`, `lab-tofu-apply`, `lab-tofu-validate`, `lab-tools`.
 - `.github/workflows/`: the reusable workflows `actionlint.yml`,
-  `nextjs-site-check.yml`, `nextjs-site-deploy.yml`, `techdocs.yml` and
-  `agents-md.yml`, plus `ci.yml`, this repo's own CI, which calls `actionlint`,
-  `techdocs` and `agents-md` on this repo by local path.
+  `nextjs-site-check.yml`, `nextjs-site-deploy.yml`, `techdocs.yml`,
+  `agents-md.yml`, `wac-ci.yml` and `wac-cd.yml`, plus `ci.yml`, this repo's
+  own CI, which calls `actionlint`, `techdocs` and `agents-md` on this repo by
+  local path. `wac-ci` and `wac-cd` are the wacd pair, driven by a caller's
+  `.github/wacd.json` profile.
 - `scripts/`: what the components run from their pinned checkout. Owners:
   `install-tools.sh` is `lab-build`, `lab-deploy`, `lab-gitops-deploy`,
-  `lab-kubeconform` and `lab-tools`; `argo-await-sync.sh` is
+  `lab-kubeconform`, `lab-tools`, `wac-ci` and `wac-cd`;
+  `wacd-profile.py` and `wacd-chart.py` are `wac-ci` and `wac-cd`;
+  `wacd-parity.py` is `wac-ci`; `wacd-version.py`, `wacd-release.py` and
+  `wacd-tag.py` are `wac-cd`; `argo-await-sync.sh` is
   `lab-gitops-deploy`; `check-docs-nav.sh` is `techdocs`; `agents-md.py` is
   `agents-md`; `validate-kustomize.sh` and `schema-api-proxy.py` are
   `lab-kubeconform`; `runner-policy.py` is `actionlint`; `lab-route.py` is
@@ -73,9 +85,10 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
   `fixtures/agents-md/` holds fixture repos, with their prose stored as
   `AGENTS.prose.md` so it is never loaded as instructions.
 - `.github/scripts/check_actions.py`: structural validation of every
-  `action.yml` and reusable workflow.
-- `.github/actionlint.yaml`: this repo's self-hosted labels, and the narrow
-  `job.workflow_sha` ignore the two gate workflows need.
+  `action.yml` and reusable workflow. `test_reusable_workflows.py` and
+  `test_workflow_identity.py` beside it test that validation.
+- `.github/actionlint.yaml`: the narrow `job.workflow_sha` ignore each
+  workflow that checks this repo out at its own commit needs.
 - `README.md`: the full reference, per component: inputs, outputs, and the
   incident history behind each design choice. Read a component's section before
   changing it.
@@ -128,6 +141,11 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
 9. The OpenTofu actions keep `tofu_wrapper: false`; `lab-tofu-apply` applies the
    plan file the plan step wrote, never a fresh plan; guard logic stays in the
    consuming repo, passed in as `guard_command`.
+10. The gateway admits `wac-cd` only as the job workflow ref
+    `willfell/wac.lab.actions/.github/workflows/wac-cd.yml@refs/tags/vX.Y.Z`
+    called from a caller file named `.github/workflows/cd.yml`, so the gateway
+    call stays a job in `wac-cd.yml` itself and this repo cannot be renamed or
+    transferred without a gateway change first.
 
 ## Boundaries
 
@@ -175,7 +193,7 @@ Incoming edges (what depends on this repo) are not listed here. They live in the
 
 1. No comments in config, manifest or infrastructure files: YAML, HCL and Terraform, JSON, TOML, INI, `.env`, Helm templates, Dockerfiles. Reasoning goes, in order of preference, into a test, the commit message, the PR description, or a doc under `docs/`. Never strip a human's existing comments.
 2. No emoji or glyph icons in code, docs, commits or UI. Where a repo's Invariants name exemptions (wac's do), those govern that repo.
-3. A merge to `main` reconciled by Argo CD is the only deploy. Never change cluster state by hand, outside the bootstrap exceptions lab documents.
+3. A deploy is a merge to `main` reconciled by Argo CD, or a `wac-cd` release through the gateway; never a change to cluster state by hand, outside the bootstrap exceptions lab documents.
 4. No secret or token in a tracked file. Secrets are declared in lab's secrets registry and reach the cluster as Secrets.
 5. Fleet procedures live as skills in `wacwini/wac.plugins` under `plugins/wac/skills/<name>/SKILL.md`. Read the matching one before onboarding a repo, deploying, releasing the UI kit, or changing CI runners.
 6. Catalog entity names are load-bearing; see the `docs-onboard-repo` skill before touching `catalog-info.yaml`.
