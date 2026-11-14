@@ -45,17 +45,23 @@ jobs:
         id: profile
         shell: bash
         run: python3 .wacd/scripts/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+      - name: Read the node package layout
+        id: layout
+        if: fromJSON(steps.profile.outputs.ci).stack == 'node'
+        shell: bash
+        run: python3 .wacd/scripts/wacd-profile.py node-layout . >> "$GITHUB_OUTPUT"
       - if: fromJSON(steps.profile.outputs.ci).stack == 'node'
         uses: actions/setup-node@v4
         with:
           node-version: ${{ fromJSON(steps.profile.outputs.ci).node_version }}
-          cache: npm
+          cache: ${{ steps.layout.outputs.lockfiles != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ steps.layout.outputs.lockfiles }}
       - if: fromJSON(steps.profile.outputs.ci).stack == 'go'
         uses: actions/setup-go@v5
         with:
           go-version: ${{ fromJSON(steps.profile.outputs.ci).go_version }}
-      - name: Install node dependencies
-        if: fromJSON(steps.profile.outputs.ci).stack == 'node'
+      - name: Install root node dependencies
+        if: fromJSON(steps.profile.outputs.ci).stack == 'node' && steps.layout.outputs.root_package == 'true'
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.npm_token || github.token }}

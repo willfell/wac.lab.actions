@@ -9,7 +9,8 @@ differing dotted path. Unreadable or malformed input also exits 1, with one
 
 `normalize` and its helpers are ported verbatim from `wac.lab`
 `tests/wac_app/render.py` @ `8612f031` (branch `feat/wac-app-chart`), minus
-`render`, `_helm` and pytest. Those are the parity rules of the wacd plan
+`render`, `_helm` and pytest; that file is byte-identical at wac.lab main
+`a8214238`. Those are the parity rules of the wacd plan
 ("Parity, defined once"): namespaces, object labels, image tags and digests,
 container port names and probe/targetPort names are dropped or resolved; the
 Argo CD hook-delete-policy annotation compares as a set. Ingresses keep their

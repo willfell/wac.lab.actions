@@ -3,11 +3,18 @@
 
 The CLI prints key=value lines for $GITHUB_OUTPUT. Any problem exits 1 with a
 message that names the dotted field path of the first offence.
+
+`wacd-profile.py node-layout <repo>` instead reports how a node repo installs:
+`root_package=true|false` (whether wac-ci's implicit root `npm ci` applies)
+and a `lockfiles` multi-line block of every package-lock.json for the npm
+cache, empty when there are none.
 """
 
 import json
+import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 APP = re.compile(r"[a-z][a-z0-9-]{0,39}")
@@ -181,9 +188,59 @@ def outputs(data):
     ]
 
 
+def node_layout(repo):
+    """Return (root_package, lockfiles) for the repo checked out at `repo`.
+
+    Lockfiles are repo-relative POSIX paths, sorted. The walk skips
+    `node_modules` and any nested checkout (a directory holding `.git`, such
+    as wac-ci's shared `.wacd` checkout), so only the repo's own lockfiles
+    reach the cache key. Hidden directories are walked: finance keeps a
+    package under `.claude/`.
+    """
+    root = Path(repo)
+    if not root.is_dir():
+        fail("node-layout", f"{repo} is not a directory")
+    lockfiles = []
+    for current, dirs, files in os.walk(root):
+        here = Path(current)
+        dirs[:] = sorted(
+            name
+            for name in dirs
+            if name not in ("node_modules", ".git") and not (here / name / ".git").exists()
+        )
+        if "package-lock.json" in files:
+            relative = (here / "package-lock.json").relative_to(root).as_posix()
+            if "\n" in relative or "\r" in relative:
+                fail("node-layout", f"lockfile path {relative!r} contains a line break")
+            lockfiles.append(relative)
+    return (root / "package.json").is_file(), sorted(lockfiles)
+
+
+def node_layout_outputs(root_package, lockfiles):
+    # A random delimiter cannot collide with a path, which has no line breaks.
+    delimiter = f"WACD_LOCKFILES_{uuid.uuid4().hex}"
+    return [
+        f"root_package={'true' if root_package else 'false'}",
+        f"lockfiles<<{delimiter}",
+        *lockfiles,
+        delimiter,
+    ]
+
+
 def main(argv):
+    if len(argv) == 3 and argv[1] == "node-layout":
+        try:
+            lines = node_layout_outputs(*node_layout(argv[2]))
+        except ProfileError as err:
+            print(f"wacd profile: {err}", file=sys.stderr)
+            return 1
+        print("\n".join(lines))
+        return 0
     if len(argv) != 2:
-        print("usage: wacd-profile.py <path to .github/wacd.json>", file=sys.stderr)
+        print(
+            "usage: wacd-profile.py <path to .github/wacd.json> | node-layout <repo>",
+            file=sys.stderr,
+        )
         return 2
     try:
         data = load(argv[1])

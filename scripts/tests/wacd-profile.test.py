@@ -180,5 +180,95 @@ class ProfileTest(unittest.TestCase):
         self.assertTrue(result.stderr.startswith("wacd profile:"))
 
 
+def parse_github_output(text):
+    """Read key=value and key<<DELIM blocks the way the runner does."""
+    values = {}
+    lines = iter(text.splitlines())
+    for line in lines:
+        if "<<" in line and ("=" not in line or line.index("<<") < line.index("=")):
+            key, delimiter = line.split("<<", 1)
+            body = []
+            for inner in lines:
+                if inner == delimiter:
+                    break
+                body.append(inner)
+            else:
+                raise AssertionError(f"block {key} never closed")
+            values[key] = "\n".join(body)
+        else:
+            key, value = line.split("=", 1)
+            values[key] = value
+    return values
+
+
+class NodeLayoutTest(unittest.TestCase):
+    """wac-ci installs at the root only when there is a root package, and
+    caches npm over every lockfile, or not at all when there is none."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "repo"
+        self.repo.mkdir()
+
+    def touch(self, relative):
+        path = self.repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+
+    def layout(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "node-layout", str(self.repo)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return parse_github_output(result.stdout)
+
+    def test_prefixed_packages_without_a_root_package(self):
+        self.touch("app/package.json")
+        self.touch("app/package-lock.json")
+        self.touch("sync-agent/package.json")
+        self.touch("sync-agent/package-lock.json")
+        self.touch(".claude/skills/llc-month/ledger/package-lock.json")
+        self.touch("app/node_modules/dep/package-lock.json")
+        self.touch(".wacd/scripts/package-lock.json")
+        (self.repo / ".wacd" / ".git").mkdir()
+        out = self.layout()
+        self.assertEqual(out["root_package"], "false")
+        self.assertEqual(
+            out["lockfiles"].splitlines(),
+            [
+                ".claude/skills/llc-month/ledger/package-lock.json",
+                "app/package-lock.json",
+                "sync-agent/package-lock.json",
+            ],
+        )
+
+    def test_root_package_with_its_lockfile(self):
+        self.touch("package.json")
+        self.touch("package-lock.json")
+        out = self.layout()
+        self.assertEqual(out["root_package"], "true")
+        self.assertEqual(out["lockfiles"], "package-lock.json")
+
+    def test_no_lockfiles_at_all(self):
+        self.touch("package.json")
+        out = self.layout()
+        self.assertEqual(out["root_package"], "true")
+        self.assertEqual(out["lockfiles"], "")
+
+    def test_missing_repo_fails_cleanly(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "node-layout", str(self.repo / "absent")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith("wacd profile:"))
+
+
 if __name__ == "__main__":
     unittest.main()
