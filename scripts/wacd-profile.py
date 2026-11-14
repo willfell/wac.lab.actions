@@ -193,8 +193,8 @@ def node_layout(repo):
 
     Lockfiles are repo-relative POSIX paths, sorted. The walk skips
     `node_modules` and any nested checkout (a directory holding `.git`, such
-    as wac-ci's shared `.wacd` checkout), so only the repo's own lockfiles
-    reach the cache key. Hidden directories are walked: finance keeps a
+    as a submodule), so only the repo's own lockfiles reach the cache key.
+    wac-ci moves its shared checkout out of the workspace before this runs. Hidden directories are walked: finance keeps a
     package under `.claude/`.
     """
     root = Path(repo)

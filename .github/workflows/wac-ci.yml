@@ -28,6 +28,8 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
@@ -38,18 +40,24 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .wacd
           persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Read the wacd profile
         id: profile
         shell: bash
-        run: python3 .wacd/scripts/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+        run: python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
       - name: Read the node package layout
         id: layout
         if: fromJSON(steps.profile.outputs.ci).stack == 'node'
         shell: bash
-        run: python3 .wacd/scripts/wacd-profile.py node-layout . >> "$GITHUB_OUTPUT"
+        run: python3 "$WACD_SCRIPTS"/wacd-profile.py node-layout . >> "$GITHUB_OUTPUT"
       - if: fromJSON(steps.profile.outputs.ci).stack == 'node'
         uses: actions/setup-node@v4
         with:
@@ -87,6 +95,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
@@ -97,13 +107,19 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .wacd
           persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Read the wacd profile
         id: profile
         shell: bash
-        run: python3 .wacd/scripts/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+        run: python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
       - name: Install the render tools
         shell: bash
         env:
@@ -116,7 +132,7 @@ jobs:
           if [[ -n "$PARITY_KUSTOMIZE_DIR" ]]; then
             tools="$tools,kustomize"
           fi
-          bash .wacd/scripts/install-tools.sh "$tools"
+          bash "$WACD_SCRIPTS"/install-tools.sh "$tools"
       - name: Pull the wac-app chart
         id: pull
         shell: bash
@@ -134,8 +150,8 @@ jobs:
         env:
           WAC_APP_TGZ: ${{ steps.pull.outputs.tgz }}
         run: |
-          images_line="$(python3 .wacd/scripts/wacd-chart.py ci-images --profile .github/wacd.json)"
-          python3 .wacd/scripts/wacd-chart.py package --profile .github/wacd.json \
+          images_line="$(python3 "$WACD_SCRIPTS"/wacd-chart.py ci-images --profile .github/wacd.json)"
+          python3 "$WACD_SCRIPTS"/wacd-chart.py package --profile .github/wacd.json \
             --version 0.0.0 --source-sha "$GITHUB_SHA" --ci \
             --images "${images_line#images=}" \
             --wac-app-tgz "$WAC_APP_TGZ" --out "$RUNNER_TEMP/deploy-chart" >> "$GITHUB_OUTPUT"
@@ -149,7 +165,12 @@ jobs:
         env:
           APP: ${{ steps.profile.outputs.app }}
           CHART_DIR: ${{ steps.package.outputs.chart_dir }}
-        run: helm template "$APP" "$CHART_DIR" --namespace "$APP" > "$RUNNER_TEMP/render.yaml"
+        run: |
+          helm template "$APP" "$CHART_DIR" --namespace "$APP" > "$RUNNER_TEMP/render.yaml"
+          if ! grep -Eq '^kind: *[A-Za-z]' "$RUNNER_TEMP/render.yaml"; then
+            echo "::error::wac-ci: the deploy chart rendered no Kubernetes objects"
+            exit 1
+          fi
       - name: Validate the render against Kubernetes schemas
         shell: bash
         run: |
@@ -167,7 +188,7 @@ jobs:
       - name: Compare the kustomize and Helm renders
         if: inputs.parity_kustomize_dir != ''
         shell: bash
-        run: uv run --no-project --with pyyaml python .wacd/scripts/wacd-parity.py "$RUNNER_TEMP/kustomize.yaml" "$RUNNER_TEMP/render.yaml"
+        run: uv run --no-project --with pyyaml python "$WACD_SCRIPTS"/wacd-parity.py "$RUNNER_TEMP/kustomize.yaml" "$RUNNER_TEMP/render.yaml"
 
   lint:
     uses: ./.github/workflows/actionlint.yml

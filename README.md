@@ -972,7 +972,11 @@ workflows. It holds no `deploy/k8s`, no `Chart.yaml` and no templates.
 
 Both workflows reach their scripts by checking this repo out at
 `job.workflow_sha`, the commit the caller pinned, exactly as the `techdocs`
-and `agents-md` gates do. Both default `runner` to the caller's
+and `agents-md` gates do. `actions/checkout` only writes under the workspace,
+so every job checks it out to `.wacd` and its next step moves it to
+`$RUNNER_TEMP/wacd`, before anything else runs. Left in place it would be
+linted, tested and globbed by the app's `ci.commands`, and sent in a `.`
+docker build context, where `COPY . .` would bake it into the image. Both default `runner` to the caller's
 `CI_RUNNER_SMALL`. Both pull from the in-cluster registry, so they run on Lab
 runners only.
 
@@ -1131,7 +1135,12 @@ on a push that input is empty.
 
 The jobs are `plan`, `build`, `publish`, `deploy` and `github-release`,
 serialized per repository by a concurrency group that never cancels a run in
-progress. A cancelled release is worse than a queued one.
+progress. A cancelled release is worse than a queued one. The group does not
+queue every run, though: GitHub keeps at most one pending run per group, so a
+newer pending run replaces an older one that has not started. For pushes that
+is harmless, because the later push's version covers the earlier commits. A
+replaced rollback dispatch never runs, so check that a rollback started before
+walking away from it.
 
 **Versions.** `plan` finds the latest tag `<tag_prefix>X.Y.Z` reachable from
 HEAD and reads the commits since it: any breaking change (`type!:` or a
@@ -1149,9 +1158,11 @@ exists on another commit fails the plan.
 | --- | --- | --- |
 | `release` | a new version on a push | build, publish, deploy, github-release |
 | `publish` | a new version with `deploy: false` | build, publish |
-| `resume` | HEAD already carries a `<tag_prefix>X.Y.Z` tag | deploy, github-release |
+| `release` | HEAD already carries a `<tag_prefix>X.Y.Z` tag, but its deploy chart is not in the registry | build, publish, deploy, github-release |
+| `publish` | the same, with `deploy: false` | build, publish |
+| `resume` | HEAD already carries a `<tag_prefix>X.Y.Z` tag and its deploy chart is published from this SHA | deploy, github-release |
 | `rollback` | `workflow_dispatch` with `rollback_version` | deploy, github-release |
-| `none` | `version_source: caller` with no version, or a resume with `deploy: false` | nothing |
+| `none` | `version_source: caller` with no version, or a tagged HEAD whose chart is published, with `deploy: false` | nothing |
 
 `deploy: false` is publish-only, used for cutover step 1: the old route still
 deploys while `wac-cd` publishes the first deploy chart so Lab can register the
@@ -1165,10 +1176,29 @@ deploy, in every mode that deploys, and creates the Release for the tag if it
 is missing, with generated notes. It never edits one that exists, so a resume
 or rollback leaves the original Release as it was.
 
-**Resume.** A run whose HEAD already carries a release tag skips build and
-publish and releases that version, after checking that the chart's recorded
-revision is this push's SHA. That is how a run whose rollout failed after the
-tag is finished: re-run it.
+**Resume.** A run whose HEAD already carries a release tag checks the
+registry for that version's deploy chart. When the chart is there, recorded
+from this push's SHA, the run skips build and publish and releases that
+version. That is how a run whose rollout failed after the tag is finished:
+re-run it. A chart recorded from another SHA fails the plan.
+
+When the chart is absent, the run builds and publishes that same version
+(`release`, or `publish` with `deploy: false`), with this push's SHA as the
+expected SHA: the image and chart state checks accept an empty registry, and
+the tag step accepts a tag already on this SHA. That is the recovery after a
+cluster rebuild empties the registry: re-run `wac-cd` for the commit carrying
+the latest tag. It also covers cutover: a HEAD tagged by the app's old
+pipeline, which never published a deploy chart, publishes one on its first
+`wac-cd` run instead of failing.
+
+**No downgrade by re-run.** "Re-run failed jobs" on an older run skips `plan`
+and reuses its mode, so a run that tagged V and failed at deploy, re-run after
+a later merge released V+1, would put V back. Before its `release` request,
+`deploy` asks the gateway for `status` once (retrying only 503, within
+`wait_timeout`), and when the running `version` is a strict `X.Y.Z` newer than
+the version being released, it fails naming both and pointing at a rollback
+dispatch. A rollback skips that refusal; an equal, older or non-`X.Y.Z`
+running version (the bootstrap tag before the first release) proceeds.
 
 **Rollback** is a `workflow_dispatch` of `cd.yml` with `version`. `plan` reads
 the chart's recorded revision and requires it to be an ancestor of `main`;

@@ -131,6 +131,86 @@ class ReusableWorkflowTests(unittest.TestCase):
     def test_null_nested_job_is_a_problem_not_a_crash(self):
         self.assertTrue(runner_problems({"lint": None}))
 
+    def test_wacd_shared_checkout_leaves_the_app_workspace(self):
+        """The shared checkout must not stay where the app's commands and docker context see it."""
+        import yaml
+
+        workflows = Path(__file__).resolve().parents[1] / "workflows"
+        for name in ("wac-ci.yml", "wac-cd.yml"):
+            doc = yaml.safe_load((workflows / name).read_text())
+            for job_name, job in doc["jobs"].items():
+                steps = (job or {}).get("steps") or []
+                shared = [
+                    index for index, step in enumerate(steps)
+                    if str((step.get("with") or {}).get("repository") or "").lower()
+                    == module.SHARED_REPOSITORY
+                ]
+                for index in shared:
+                    with self.subTest(workflow=name, job=job_name):
+                        self.assertEqual((steps[index]["with"]).get("path"), ".wacd")
+                        self.assertLess(index + 1, len(steps))
+                        self.assertIn('mv .wacd "$RUNNER_TEMP/wacd"', steps[index + 1].get("run", ""))
+                for index, step in enumerate(steps):
+                    if index - 1 in shared:
+                        continue
+                    text = str(step.get("run", "")) + str(step.get("with", "")) + str(step.get("env", ""))
+                    with self.subTest(workflow=name, job=job_name, step=index):
+                        self.assertNotIn(".wacd/", text)
+
+    def test_wac_ci_app_checkouts_do_not_persist_credentials(self):
+        import yaml
+
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
+        for job_name in ("checks", "render"):
+            app = doc["jobs"][job_name]["steps"][0]
+            with self.subTest(job=job_name):
+                self.assertTrue(app["uses"].startswith("actions/checkout@"))
+                self.assertNotIn("repository", app.get("with") or {})
+                self.assertIs((app.get("with") or {}).get("persist-credentials"), False)
+
+    def test_wac_ci_render_fails_when_the_chart_renders_nothing(self):
+        import os
+        import subprocess
+        import yaml
+
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
+        step = next(s for s in doc["jobs"]["render"]["steps"] if s.get("name") == "Render the deploy chart")
+        for label, output, expected in (
+            ("empty", "", 1),
+            ("only separators", "---\n# Source: x\n---\n", 1),
+            ("one object", "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n", 0),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                bin_dir = Path(tmp) / "bin"
+                bin_dir.mkdir()
+                helm = bin_dir / "helm"
+                helm.write_text("#!/bin/sh\nprintf '%s' \"$FAKE_RENDER\"\n")
+                helm.chmod(0o755)
+                env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": tmp,
+                       "APP": "travel", "CHART_DIR": tmp, "FAKE_RENDER": output}
+                result = subprocess.run(["bash", "-e", "-c", step["run"]], env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("::error::", result.stdout)
+
+    def test_wac_cd_rollback_version_must_be_strict_semver(self):
+        import os
+        import subprocess
+        import yaml
+
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-cd.yml").read_text())
+        step = next(s for s in doc["jobs"]["plan"]["steps"] if s.get("name") == "Check the trigger")
+        for value, expected in (
+            ("1.2.3", 0), ("0.0.0", 0), ("10.20.30", 0),
+            ("01.2.3", 1), ("1.02.3", 1), ("1.2.03", 1), ("1.2", 1), ("v1.2.3", 1), ("1.2.3-rc.1", 1), ("", 1),
+        ):
+            with self.subTest(value=value):
+                env = {**os.environ, "GITHUB_REF": "refs/heads/main", "EVENT_NAME": "workflow_dispatch",
+                       "ROLLBACK_VERSION": value, "DEPLOY": "true"}
+                result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
     def test_repository_workflows_pass(self):
         self.assertEqual(module.main(), 0)
 

@@ -90,13 +90,19 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .wacd
           persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Read the wacd profile
         id: profile
         shell: bash
-        run: python3 .wacd/scripts/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+        run: python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
       - name: Check the trigger
         shell: bash
         env:
@@ -109,13 +115,14 @@ jobs:
             echo "::error::wac-cd: $1"
             exit 1
           }
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
           [[ "$GITHUB_REF" == refs/heads/main ]] || fail "runs only on refs/heads/main, not $GITHUB_REF"
           case "$EVENT_NAME" in
             push)
               [[ -z "$ROLLBACK_VERSION" ]] || fail "rollback_version is accepted only on workflow_dispatch"
               ;;
             workflow_dispatch)
-              [[ "$ROLLBACK_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "workflow_dispatch needs rollback_version as X.Y.Z"
+              [[ "$ROLLBACK_VERSION" =~ $semver ]] || fail "workflow_dispatch needs rollback_version as X.Y.Z"
               ;;
             *)
               fail "event $EVENT_NAME is not push or workflow_dispatch"
@@ -139,7 +146,7 @@ jobs:
           registry=registry.network.svc.cluster.local:5000
           revision_of() {
             local line
-            line="$(python3 .wacd/scripts/wacd-chart.py chart-revision --registry "$registry" --app "$APP" --version "$1")"
+            line="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-revision --registry "$registry" --app "$APP" --version "$1")"
             revision="${line#revision=}"
           }
           if [[ -n "$ROLLBACK_VERSION" ]]; then
@@ -153,20 +160,32 @@ jobs:
             tag="$TAG_PREFIX$ROLLBACK_VERSION"
             expected_sha="$revision"
           else
-            planned="$(python3 .wacd/scripts/wacd-version.py --prefix "$TAG_PREFIX" \
-              --version-source "$VERSION_SOURCE" --version "$CALLER_VERSION" --deploy "$DEPLOY")"
-            mode="$(sed -n 's/^mode=//p' <<< "$planned")"
-            version="$(sed -n 's/^version=//p' <<< "$planned")"
-            tag="$(sed -n 's/^tag=//p' <<< "$planned")"
-            expected_sha="$GITHUB_SHA"
-            if [[ "$mode" == resume ]]; then
-              revision_of "$version"
-              expected_sha="$revision"
-              if [[ "$expected_sha" != "$GITHUB_SHA" ]]; then
-                echo "::error::wac-cd: deploy/$APP:$version was built from $expected_sha, not this push's $GITHUB_SHA"
+            plan_version() {
+              local planned
+              planned="$(python3 "$WACD_SCRIPTS"/wacd-version.py --prefix "$TAG_PREFIX" \
+                --version-source "$VERSION_SOURCE" --version "$CALLER_VERSION" --deploy "$DEPLOY" \
+                --published "$1")"
+              mode="$(sed -n 's/^mode=//p' <<< "$planned")"
+              version="$(sed -n 's/^version=//p' <<< "$planned")"
+              tag="$(sed -n 's/^tag=//p' <<< "$planned")"
+            }
+            plan_version unknown
+            if [[ "$mode" == resume || ( "$mode" == none && -n "$version" ) ]]; then
+              if ! state="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-state --registry "$registry" \
+                --app "$APP" --version "$version" --source-sha "$GITHUB_SHA" 2> "$RUNNER_TEMP/chart-state.err")"; then
+                echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/chart-state.err")"
                 exit 1
               fi
+              case "$state" in
+                state=present) plan_version true ;;
+                state=absent) plan_version false ;;
+                *)
+                  echo "::error::wac-cd: unexpected chart state for deploy/$APP:$version: $state"
+                  exit 1
+                  ;;
+              esac
             fi
+            expected_sha="$GITHUB_SHA"
           fi
           {
             echo "mode=$mode"
@@ -206,6 +225,12 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .wacd
           persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -213,7 +238,7 @@ jobs:
         shell: bash
         env:
           CRANE_VERSION: v0.20.6
-        run: bash .wacd/scripts/install-tools.sh crane
+        run: bash "$WACD_SCRIPTS"/install-tools.sh crane
       - name: Build and push the images
         id: images
         shell: bash
@@ -225,7 +250,7 @@ jobs:
         run: |
           set -euo pipefail
           registry=registry.network.svc.cluster.local:5000
-          validated="$(python3 .wacd/scripts/wacd-chart.py build-args --text="$BUILD_ARGS")"
+          validated="$(python3 "$WACD_SCRIPTS"/wacd-chart.py build-args --text="$BUILD_ARGS")"
           extra=()
           if [[ -n "$validated" ]]; then
             while IFS= read -r line; do
@@ -237,10 +262,17 @@ jobs:
               print("\t".join([image["name"], image["dockerfile"], image["context"], image.get("sha_build_arg", "")]))' \
             > "$RUNNER_TEMP/images.tsv"
           : > "$RUNNER_TEMP/digests.tsv"
+          image_state() {
+            local err="$RUNNER_TEMP/image-state.err"
+            if ! state="$(python3 "$WACD_SCRIPTS"/wacd-chart.py image-state --registry "$registry" \
+              --name "$1" --tag "$VERSION" --source-sha "$GITHUB_SHA" 2> "$err")"; then
+              echo "::error::wac-cd: $(tr '\n' ' ' < "$err")"
+              exit 1
+            fi
+          }
           while IFS=$'\t' read -r name dockerfile context sha_arg <&3; do
             ref="$registry/$name:$VERSION"
-            state="$(python3 .wacd/scripts/wacd-chart.py image-state --registry "$registry" \
-              --name "$name" --tag "$VERSION" --source-sha "$GITHUB_SHA")"
+            image_state "$name"
             if [[ "$state" == state=absent ]]; then
               args=(-f "$dockerfile" --label "org.opencontainers.image.revision=$GITHUB_SHA")
               if [[ -n "$sha_arg" ]]; then
@@ -252,8 +284,7 @@ jobs:
               docker save "$name:$VERSION" -o "$RUNNER_TEMP/image.tar"
               crane push --insecure "$RUNNER_TEMP/image.tar" "$ref"
               rm -f "$RUNNER_TEMP/image.tar"
-              state="$(python3 .wacd/scripts/wacd-chart.py image-state --registry "$registry" \
-                --name "$name" --tag "$VERSION" --source-sha "$GITHUB_SHA")"
+              image_state "$name"
               if [[ "$state" != state=present ]]; then
                 echo "::error::wac-cd: $ref is not readable from $GITHUB_SHA after the push: $state"
                 exit 1
@@ -300,6 +331,12 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .wacd
           persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -307,7 +344,7 @@ jobs:
         shell: bash
         env:
           HELM_VERSION: v3.16.3
-        run: bash .wacd/scripts/install-tools.sh helm
+        run: bash "$WACD_SCRIPTS"/install-tools.sh helm
       - name: Pull the wac-app chart
         id: pull
         shell: bash
@@ -332,12 +369,16 @@ jobs:
           set -euo pipefail
           registry=registry.network.svc.cluster.local:5000
           chart_state() {
-            python3 .wacd/scripts/wacd-chart.py chart-state --registry "$registry" \
-              --app "$APP" --version "$VERSION" --source-sha "$GITHUB_SHA"
+            local err="$RUNNER_TEMP/chart-state.err"
+            if ! state="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-state --registry "$registry" \
+              --app "$APP" --version "$VERSION" --source-sha "$GITHUB_SHA" 2> "$err")"; then
+              echo "::error::wac-cd: $(tr '\n' ' ' < "$err")"
+              exit 1
+            fi
           }
-          state="$(chart_state)"
+          chart_state
           if [[ "$state" == state=absent ]]; then
-            line="$(python3 .wacd/scripts/wacd-chart.py package --profile .github/wacd.json \
+            line="$(python3 "$WACD_SCRIPTS"/wacd-chart.py package --profile .github/wacd.json \
               --version "$VERSION" --source-sha "$GITHUB_SHA" --images "$IMAGES" \
               --wac-app-tgz "$WAC_APP_TGZ" --out "$RUNNER_TEMP/deploy-chart")"
             chart_dir="${line#chart_dir=}"
@@ -345,7 +386,7 @@ jobs:
             tgz="$RUNNER_TEMP/packaged/$APP-$VERSION.tgz"
             test -f "$tgz"
             helm push "$tgz" "oci://$registry/deploy" --plain-http
-            state="$(chart_state)"
+            chart_state
             if [[ "$state" != state=present ]]; then
               echo "::error::wac-cd: deploy/$APP:$VERSION is not readable after the push"
               exit 1
@@ -356,7 +397,7 @@ jobs:
             echo "::error::wac-cd: unexpected chart state for deploy/$APP:$VERSION: $state"
             exit 1
           fi
-          python3 .wacd/scripts/wacd-tag.py push-tag --tag "$TAG" --sha "$GITHUB_SHA"
+          python3 "$WACD_SCRIPTS"/wacd-tag.py push-tag --tag "$TAG" --sha "$GITHUB_SHA"
 
   deploy:
     needs: [plan, build, publish]
@@ -381,6 +422,12 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .wacd
           persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -392,7 +439,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          python3 .wacd/scripts/wacd-chart.py chart-images \
+          python3 "$WACD_SCRIPTS"/wacd-chart.py chart-images \
             --registry registry.network.svc.cluster.local:5000 \
             --app "$APP" --version "$VERSION" >> "$GITHUB_OUTPUT"
       - name: Summarize the release
@@ -420,7 +467,7 @@ jobs:
           IMAGES: ${{ steps.chart.outputs.images }}
           WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
         run: |
-          python3 .wacd/scripts/wacd-release.py release --version "$VERSION" \
+          python3 "$WACD_SCRIPTS"/wacd-release.py release --version "$VERSION" \
             --images "$IMAGES" --wait-timeout "$WAIT_TIMEOUT" \
             --mode "$MODE" --tag "$TAG" --expected-sha "$EXPECTED_SHA" \
             --receipt "$RUNNER_TEMP/wac-cd-release.json"
@@ -437,7 +484,7 @@ jobs:
           EXPECTED_SHA: ${{ needs.plan.outputs.expected_sha }}
           EXPECT_DB: ${{ needs.plan.outputs.health_expect_db_ok }}
         run: |
-          python3 .wacd/scripts/wacd-release.py health --url "$HEALTH_URL" \
+          python3 "$WACD_SCRIPTS"/wacd-release.py health --url "$HEALTH_URL" \
             --sha "$EXPECTED_SHA" --expect-db "$EXPECT_DB" --wait-timeout 300
       - name: Record the proof
         shell: bash
@@ -469,10 +516,16 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .wacd
           persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
       - name: Create the GitHub Release
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
           EXPECTED_SHA: ${{ needs.plan.outputs.expected_sha }}
-        run: python3 .wacd/scripts/wacd-release.py github-release --tag "$TAG" --sha "$EXPECTED_SHA"
+        run: python3 "$WACD_SCRIPTS"/wacd-release.py github-release --tag "$TAG" --sha "$EXPECTED_SHA"
