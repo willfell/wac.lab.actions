@@ -28,7 +28,7 @@ on:
         type: string
         default: ''
       wait_timeout:
-        description: Seconds to wait for the gateway proof and for the health check
+        description: Seconds to wait for the gateway release proof; the health check has its own fixed 300 seconds
         type: string
         default: '2100'
     secrets:
@@ -254,7 +254,10 @@ jobs:
               rm -f "$RUNNER_TEMP/image.tar"
               state="$(python3 .wacd/scripts/wacd-chart.py image-state --registry "$registry" \
                 --name "$name" --tag "$VERSION" --source-sha "$GITHUB_SHA")"
-              [[ "$state" == state=present ]]
+              if [[ "$state" != state=present ]]; then
+                echo "::error::wac-cd: $ref is not readable from $GITHUB_SHA after the push: $state"
+                exit 1
+              fi
             elif [[ "$state" != state=present ]]; then
               echo "::error::wac-cd: unexpected image state for $ref: $state"
               exit 1
@@ -363,7 +366,7 @@ jobs:
       needs.plan.outputs.mode == 'resume' ||
       needs.plan.outputs.mode == 'rollback')
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
-    timeout-minutes: 65
+    timeout-minutes: 75
     permissions:
       contents: read
       id-token: write
