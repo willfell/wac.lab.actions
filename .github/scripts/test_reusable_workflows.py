@@ -312,6 +312,20 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertEqual((outputs["version"], outputs["tag"]), ("0.2.0", "v0.2.0"))
                     self.assertNotIn("Superseded", summary.read_text())
 
+    def test_wac_ci_setup_go_takes_the_version_or_the_version_file_from_the_profile(self):
+        import yaml
+
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
+        steps = [s for s in doc["jobs"]["checks"]["steps"] if str(s.get("uses", "")).startswith("actions/setup-go@")]
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(
+            steps[0]["with"],
+            {
+                "go-version": "${{ fromJSON(steps.profile.outputs.ci).go_version }}",
+                "go-version-file": "${{ fromJSON(steps.profile.outputs.ci).go_version_file }}",
+            },
+        )
+
     def test_repository_workflows_pass(self):
         self.assertEqual(module.main(), 0)
 

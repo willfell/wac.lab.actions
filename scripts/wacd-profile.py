@@ -42,7 +42,7 @@ TOP_OPTIONAL = ("health_expect_db_ok",)
 IMAGE_REQUIRED = ("name", "dockerfile", "context")
 IMAGE_OPTIONAL = ("sha_build_arg",)
 CI_REQUIRED = ("stack", "commands")
-CI_OPTIONAL = ("node_version", "go_version", "apt_packages")
+CI_OPTIONAL = ("node_version", "go_version", "go_version_file", "apt_packages")
 
 
 class ProfileError(Exception):
@@ -108,21 +108,31 @@ def check_images(images, path):
             )
 
 
-def check_ci(ci, path):
+def check_ci(ci, path, repo_root):
     if not isinstance(ci, dict):
         fail(path, "must be an object")
     check_keys(ci, path, CI_REQUIRED, CI_OPTIONAL)
     stack = ci["stack"]
     if stack not in ("node", "go"):
         fail(f"{path}.stack", "must be 'node' or 'go'")
-    own, other = (
-        ("node_version", "go_version") if stack == "node" else ("go_version", "node_version")
-    )
-    if own not in ci:
-        fail(f"{path}.{own}", f"required when stack is {stack!r}")
-    if other in ci:
-        fail(f"{path}.{other}", f"not allowed when stack is {stack!r}")
-    check_pattern(ci[own], f"{path}.{own}", VERSION, "a version such as 22 or 1.24")
+    if stack == "node":
+        for other in ("go_version", "go_version_file"):
+            if other in ci:
+                fail(f"{path}.{other}", "not allowed when stack is 'node'")
+        if "node_version" not in ci:
+            fail(f"{path}.node_version", "required when stack is 'node'")
+        check_pattern(ci["node_version"], f"{path}.node_version", VERSION, "a version such as 22 or 1.24")
+    else:
+        if "node_version" in ci:
+            fail(f"{path}.node_version", "not allowed when stack is 'go'")
+        if "go_version" in ci and "go_version_file" in ci:
+            fail(f"{path}.go_version_file", "not allowed together with go_version; set one")
+        if "go_version_file" in ci:
+            check_version_file(ci["go_version_file"], f"{path}.go_version_file", repo_root)
+        elif "go_version" in ci:
+            check_pattern(ci["go_version"], f"{path}.go_version", VERSION, "a version such as 22 or 1.24")
+        else:
+            fail(f"{path}.go_version", "required when stack is 'go', unless go_version_file is set")
     commands = ci["commands"]
     if not isinstance(commands, list) or not commands:
         fail(f"{path}.commands", "must be a non-empty list")
@@ -134,6 +144,13 @@ def check_ci(ci, path):
             fail(here, "must be a single line")
     if "apt_packages" in ci:
         check_apt_packages(ci["apt_packages"], f"{path}.apt_packages")
+
+
+def check_version_file(value, path, repo_root):
+    """A repo-relative file setup-go reads the Go version from, such as go.mod."""
+    check_relative(value, path)
+    if not (repo_root / value).is_file():
+        fail(path, f"{value} does not exist in the repo")
 
 
 def check_apt_packages(packages, path):
@@ -171,7 +188,7 @@ def validate(data, repo_root):
     if "health_expect_db_ok" in data and not isinstance(data["health_expect_db_ok"], bool):
         fail("health_expect_db_ok", "must be a JSON boolean")
     check_images(data["images"], "images")
-    check_ci(data["ci"], "ci")
+    check_ci(data["ci"], "ci", repo_root)
 
 
 def load(path):

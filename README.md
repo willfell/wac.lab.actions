@@ -1013,7 +1013,8 @@ nothing.
 | `health_url` | an in-cluster `http://<host>.svc.cluster.local[:port]/<path>` URL |
 | `health_expect_db_ok` | optional JSON boolean, default `true`; `false` checks only the served `sha` |
 | `images` | a non-empty list of `{name, dockerfile, context, sha_build_arg?}`; `name` matches `^[a-z0-9][a-z0-9._-]{0,63}$` and is unique; `dockerfile` and `context` are repo-relative paths as above; optional `sha_build_arg` is an upper-case build arg name that receives the source SHA |
-| `ci` | `{stack, node_version?, go_version?, commands, apt_packages?}`; `stack` is `node` or `go`; the matching version (`22`, `1.24`) is required and the other is refused; `commands` is a non-empty list of single-line commands |
+| `ci` | `{stack, node_version?, go_version?, go_version_file?, commands, apt_packages?}`; `stack` is `node` or `go`; the matching version (`22`, `1.24`) is required and the other stack's is refused; `commands` is a non-empty list of single-line commands |
+| `ci.go_version_file` | optional, `go` only, in place of `go_version`: a repo-relative file such as `go.mod`, `go.work`, `.go-version` or `.tool-versions` that setup-go reads the Go version from, so the profile does not repeat a version the repo already pins; it must exist, and setting it together with `go_version` fails |
 | `ci.apt_packages` | optional; a non-empty list of unique Debian package names, each matching `^[a-z0-9][a-z0-9.+-]*$`, that `wac-ci`'s `checks` job installs before anything else; omit it rather than writing `[]` |
 
 The values file sets `name`, `image` and everything else the `wac-app` chart
@@ -1052,7 +1053,7 @@ It runs five jobs. `checks` sets up node or go for `ci.stack` and runs
 `npm ci` first, but only when the repo has a root `package.json`; a repo
 without one, such as finance, lists `npm ci --prefix <dir>` in `ci.commands`
 itself. The npm cache is keyed on every `package-lock.json` in the repo.
-Nothing implicit runs for `go`. When the profile lists `ci.apt_packages`,
+Nothing implicit runs for `go`; setup-go takes `ci.go_version`, or reads the version from `ci.go_version_file` when the profile names one. When the profile lists `ci.apt_packages`,
 `checks` first runs `sudo apt-get update` and
 `sudo apt-get install -y --no-install-recommends` with those packages, before
 setup-node, the root `npm ci` and `ci.commands`; a profile without the field

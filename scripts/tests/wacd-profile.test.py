@@ -141,6 +141,46 @@ class ProfileTest(unittest.TestCase):
         data = self.profile(ci={"stack": "go", "commands": ["go test ./..."]})
         self.assertRejected(data, "ci.go_version")
 
+    def go_ci(self, **fields):
+        return self.profile(ci={"stack": "go", "commands": ["go test ./..."], **fields})
+
+    def test_go_version_file_is_accepted_and_reaches_the_ci_output(self):
+        (self.root / "go.mod").write_text("module example.com/x\n\ngo 1.24.2\n")
+        (self.root / "svc").mkdir()
+        (self.root / "svc" / ".go-version").write_text("1.24.2\n")
+        for path in ("go.mod", "svc/.go-version"):
+            with self.subTest(path=path):
+                data = self.go_ci(go_version_file=path)
+                result = self.cli(data)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                ci_line = next(l for l in result.stdout.splitlines() if l.startswith("ci="))
+                self.assertEqual(json.loads(ci_line[3:])["go_version_file"], path)
+                self.assertNotIn("go_version", json.loads(ci_line[3:]))
+
+    def test_go_version_file_and_go_version_are_exclusive(self):
+        (self.root / "go.mod").write_text("module example.com/x\n")
+        self.assertRejected(
+            self.go_ci(go_version="1.24", go_version_file="go.mod"), "ci.go_version_file: not allowed together"
+        )
+
+    def test_go_stack_needs_one_version_source(self):
+        self.assertRejected(self.go_ci(), "ci.go_version: required when stack is 'go', unless go_version_file")
+
+    def test_go_version_file_must_exist_and_stay_inside(self):
+        self.assertRejected(self.go_ci(go_version_file="go.mod"), "ci.go_version_file: go.mod does not exist")
+        (self.root / "dir").mkdir()
+        self.assertRejected(self.go_ci(go_version_file="dir"), "ci.go_version_file: dir does not exist")
+        self.assertRejected(self.go_ci(go_version_file="../go.mod"), "'..' segment")
+        self.assertRejected(self.go_ci(go_version_file="/etc/hostname"), "relative path inside the repo")
+        self.assertRejected(self.go_ci(go_version_file=""), "relative path inside the repo")
+        self.assertRejected(self.go_ci(go_version_file=["go.mod"]), "must be a string")
+
+    def test_go_version_file_is_refused_for_node(self):
+        (self.root / "go.mod").write_text("module example.com/x\n")
+        data = self.profile()
+        data["ci"]["go_version_file"] = "go.mod"
+        self.assertRejected(data, "ci.go_version_file: not allowed when stack is 'node'")
+
     def test_empty_commands_and_multiline_command(self):
         data = self.profile()
         data["ci"]["commands"] = []
