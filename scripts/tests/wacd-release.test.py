@@ -431,6 +431,95 @@ class ReleaseTests(unittest.TestCase):
         )
 
 
+def running(version):
+    value = evidence()
+    value["version"] = version
+    return value
+
+
+class DowngradeTests(unittest.TestCase):
+    def run_release(self, mode, *responses, timeout=60):
+        script = Script(*responses)
+        stack, clock = fake_clock()
+        with stack:
+            try:
+                result = wacd.proved(VERSION, IMAGES, timeout, request=script, mode=mode)[0]
+            except ReleaseError as error:
+                result = error
+        return script, result
+
+    def test_a_newer_running_version_refuses_a_release_without_sending_it(self):
+        for mode in ("release", "resume"):
+            with self.subTest(mode=mode):
+                script, error = self.run_release(mode, (200, running("0.2.0")), (200, released()))
+                self.assertIsInstance(error, ReleaseError)
+                self.assertIn("0.2.0", str(error))
+                self.assertIn(VERSION, str(error))
+                self.assertIn("rollback", str(error))
+                self.assertEqual(len(str(error).splitlines()), 1)
+                self.assertEqual(script.bodies, [wacd.STATUS_BODY()])
+
+    def test_semver_order_is_numeric(self):
+        script, error = self.run_release("release", (200, running("0.10.0")), (200, released()))
+        self.assertIsInstance(error, ReleaseError)
+        self.assertNotIn(wacd.RELEASE_BODY(VERSION), script.bodies)
+
+    def test_a_rollback_may_go_back(self):
+        script, result = self.run_release("rollback", (200, running("0.2.0")), (200, released()))
+        self.assertEqual(result, released())
+        self.assertEqual(script.bodies, [wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION)])
+
+    def test_equal_lower_or_unversioned_running_releases(self):
+        for version in (VERSION, "0.0.9", "bootstrap", "v0.2.0", "0.2.0-rc.1", "02.0.0", "", None, 7):
+            with self.subTest(running=version):
+                status = evidence()
+                if version is None:
+                    del status["version"]
+                else:
+                    status["version"] = version
+                script, result = self.run_release("release", (200, status), (200, released()))
+                self.assertEqual(result, released())
+                self.assertEqual(script.bodies, [wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION)])
+
+    def test_unavailable_pre_check_is_retried(self):
+        script, result = self.run_release(
+            "release", (503, {}), (200, running(VERSION)), (200, released())
+        )
+        self.assertEqual(result, released())
+        self.assertEqual(
+            script.bodies,
+            [wacd.STATUS_BODY(), wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION)],
+        )
+
+    def test_unavailable_pre_check_respects_the_deadline(self):
+        script, error = self.run_release("release", (503, {}), timeout=1)
+        self.assertIsInstance(error, ReleaseError)
+        self.assertIn("deadline", str(error))
+        self.assertNotIn(wacd.RELEASE_BODY(VERSION), script.bodies)
+
+    def test_a_denied_pre_check_fails(self):
+        for code in (400, 403, 409, 500):
+            with self.subTest(code=code):
+                script, error = self.run_release("release", (code, {}), (200, released()))
+                self.assertIsInstance(error, ReleaseError)
+                self.assertIn(f"HTTP {code}", str(error))
+                self.assertEqual(script.bodies, [wacd.STATUS_BODY()])
+
+    def test_cli_release_runs_the_pre_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = str(Path(tmp) / "receipt.json")
+            script = Script((200, running("1.0.0")), (200, released()))
+            with patch.object(wacd, "trust_context", lambda: None), patch.object(
+                wacd.ci, "request", script
+            ):
+                code, out, err = CliTests.main(self, *CliTests.release_argv(self, receipt))
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("1.0.0", err)
+            self.assertEqual(len(err.strip().splitlines()), 1)
+            self.assertEqual(script.bodies, [wacd.STATUS_BODY()])
+            self.assertFalse(Path(receipt).exists())
+
+
 class ServedTests(unittest.TestCase):
     def serve(self, *responses, sha=SOURCE, expect_db=True, timeout=1):
         health = Health(*responses)
@@ -559,13 +648,19 @@ class CliTests(unittest.TestCase):
     def test_cli_receipt_keeps_the_released_record(self):
         with tempfile.TemporaryDirectory() as tmp:
             receipt = str(Path(tmp) / "receipt.json")
-            script = Script((200, released(not_ready())), (200, evidence()))
+            script = Script(
+                (200, evidence()), (200, released(not_ready())), (200, evidence())
+            )
             stack, _ = fake_clock()
             with stack, patch.object(wacd, "trust_context", lambda: None), patch.object(
                 wacd.ci, "request", script
             ):
                 code, _, err = self.main(*self.release_argv(receipt))
             self.assertEqual((code, err), (0, ""), err)
+            self.assertEqual(
+                script.bodies,
+                [wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION), wacd.STATUS_BODY()],
+            )
             written = json.loads(Path(receipt).read_text())
             self.assertEqual(written["released"]["chart_source_sha"], SOURCE)
             self.assertEqual(written["released"], released()["released"])

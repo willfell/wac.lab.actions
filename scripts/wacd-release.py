@@ -4,7 +4,8 @@
 wac-cd publishes the deploy chart, then asks the release gateway to release
 that chart version and polls its status until Argo CD has synced the chart's
 manifest digest, every Deployment has rolled out, and the Deployments run this
-release's images. The transport is scripts/ci-release.py's, which mints a fresh
+release's images. The release CLI first asks for status once and refuses to
+release over a newer running X.Y.Z unless the mode is rollback. The transport is scripts/ci-release.py's, which mints a fresh
 GitHub OIDC token for every request. That file belongs to other components and
 is loaded, never changed.
 
@@ -160,7 +161,30 @@ def release(version, images, wait_timeout, request=None):
     return proved(version, images, wait_timeout, request)[0]
 
 
-def proved(version, images, wait_timeout, request=None):
+def semver(text):
+    if not isinstance(text, str):
+        return None
+    match = VERSION_PATTERN.fullmatch(text)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def refuse_downgrade(running, version, mode):
+    """Refuse to release over a newer running version unless this is a rollback.
+
+    A re-run of an older run's failed deploy job reuses its plan, so without
+    this it would put that older version back over a newer release. A running
+    version that is not strict X.Y.Z (the bootstrap tag, or none) never blocks.
+    """
+    current = semver(running)
+    if mode == "rollback" or current is None or current <= semver(version):
+        return
+    raise ReleaseError(
+        f"{running} is running, which is newer than {version}; "
+        "dispatch a rollback to go back on purpose"
+    )
+
+
+def proved(version, images, wait_timeout, request=None, mode=None):
     if request is None:
         request = transport
         trust = trust_context()
@@ -174,9 +198,20 @@ def proved(version, images, wait_timeout, request=None):
     def wait():
         time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
 
+    checked = mode is None
+    while not checked and time.monotonic() < deadline:
+        code, value = send(STATUS_BODY())
+        if code == 200:
+            refuse_downgrade(value.get("version"), version, mode)
+            checked = True
+        elif code == 503:
+            wait()
+        else:
+            raise ReleaseError(f"status pre-check rejected (HTTP {code})")
+
     digest = None
     record = None
-    while digest is None and time.monotonic() < deadline:
+    while checked and digest is None and time.monotonic() < deadline:
         code, value = send(RELEASE_BODY(version))
         if code == 200:
             digest = released_digest(value, version)
@@ -377,7 +412,7 @@ def run(args):
     if not SHA_PATTERN.fullmatch(args.expected_sha):
         raise ReleaseError("--expected-sha must be 40 lowercase hex characters")
     images = parse_images(args.images, args.version)
-    result, record = proved(args.version, images, timeout)
+    result, record = proved(args.version, images, timeout, mode=args.mode)
     plan = {
         "mode": args.mode,
         "version": args.version,

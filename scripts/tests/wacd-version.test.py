@@ -214,6 +214,46 @@ class RepoTest(unittest.TestCase):
             {"mode": "none", "version": "", "tag": ""},
         )
 
+    def test_tagged_head_without_a_published_chart_releases_again(self):
+        self.commit("feat: first")
+        self.tag("v0.1.0")
+        self.assertEqual(
+            self.plan(published="false"),
+            {"mode": "release", "version": "0.1.0", "tag": "v0.1.0"},
+        )
+        self.assertEqual(
+            self.plan(published="false", deploy=False),
+            {"mode": "publish", "version": "0.1.0", "tag": "v0.1.0"},
+        )
+
+    def test_tagged_head_with_a_published_chart_resumes(self):
+        self.commit("feat: first")
+        self.tag("v0.1.0")
+        for published in ("true", "unknown"):
+            with self.subTest(published=published):
+                self.assertEqual(
+                    self.plan(published=published),
+                    {"mode": "resume", "version": "0.1.0", "tag": "v0.1.0"},
+                )
+                self.assertEqual(
+                    self.plan(published=published, deploy=False),
+                    {"mode": "none", "version": "0.1.0", "tag": "v0.1.0"},
+                )
+
+    def test_published_only_matters_for_a_tagged_head(self):
+        self.commit("feat: first")
+        self.tag("v0.1.0")
+        self.commit("fix: next")
+        self.assertEqual(
+            self.plan(published="true"),
+            {"mode": "release", "version": "0.1.1", "tag": "v0.1.1"},
+        )
+
+    def test_unknown_published_value_fails(self):
+        self.commit("feat: first")
+        with self.assertRaises(version.VersionError):
+            self.plan(published="maybe")
+
     def test_annotated_tags_count(self):
         self.commit("feat: old")
         git(self.repo, "tag", "-a", "v1.4.0", "-m", "release")
@@ -303,6 +343,20 @@ class CliTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertTrue(result.stderr.startswith("wacd version:"))
         self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+
+    def test_cli_published_false_on_a_tagged_head_releases(self):
+        git(self.repo, "tag", "v0.1.0")
+        result = self.cli("--prefix", "v", "--published", "false")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["mode=release", "version=0.1.0", "tag=v0.1.0"],
+        )
+        result = self.cli("--prefix", "v", "--published", "true", "--deploy", "false")
+        self.assertEqual(result.stdout.splitlines()[0], "mode=none")
+        result = self.cli("--prefix", "v", "--published", "maybe")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
 
     def test_cli_rejects_bad_deploy_value(self):
         result = self.cli("--prefix", "v", "--deploy", "yes")

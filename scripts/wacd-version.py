@@ -7,6 +7,11 @@ one-line message.
 
 Modes: release (tag and deploy), publish (tag and push images, no deploy),
 resume (HEAD is already tagged, so finish that release) and none.
+
+--published says whether the deploy chart for HEAD's tagged version is in the
+registry. A tagged HEAD whose chart is absent (`false`) is built and published
+again, which is how a version is recovered after a registry loss and how a HEAD
+tagged by an older pipeline gets its first chart. `true` and `unknown` resume.
 """
 
 import argparse
@@ -20,6 +25,7 @@ SEMVER = re.compile(rf"{NUM}\.{NUM}\.{NUM}")
 BREAKING_HEADER = re.compile(r"\w+(\([^)]*\))?!:")
 FEAT_HEADER = re.compile(r"feat(\([^)]*\))?:")
 BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
+PUBLISHED = ("true", "false", "unknown")
 
 
 class VersionError(Exception):
@@ -95,11 +101,13 @@ def tag_lines(repo, *args):
     return [line for line in git(repo, "tag", *args).splitlines() if line]
 
 
-def plan(repo, prefix, source, caller_version, deploy=True):
+def plan(repo, prefix, source, caller_version, deploy=True, published="unknown"):
     if any(ch in prefix for ch in "\r\n\0"):
         raise VersionError("tag prefix contains a line break")
     if source not in ("commits", "caller"):
         raise VersionError(f"unknown version source {source!r}")
+    if published not in PUBLISHED:
+        raise VersionError(f"published must be one of {', '.join(PUBLISHED)}, not {published!r}")
     repo = Path(repo)
     if git(repo, "rev-parse", "--is-shallow-repository").strip() == "true":
         raise VersionError(
@@ -115,7 +123,7 @@ def plan(repo, prefix, source, caller_version, deploy=True):
     if at_head:
         parsed, tag = max(at_head)
         result = {
-            "mode": "resume",
+            "mode": "release" if published == "false" else "resume",
             "version": ".".join(str(part) for part in parsed),
             "tag": tag,
         }
@@ -158,6 +166,7 @@ def main(argv):
     parser.add_argument("--version-source", choices=("commits", "caller"), default="commits")
     parser.add_argument("--version", default="")
     parser.add_argument("--deploy", choices=("true", "false"), default="true")
+    parser.add_argument("--published", choices=PUBLISHED, default="unknown")
     args = parser.parse_args(argv[1:])
     try:
         result = plan(
@@ -166,6 +175,7 @@ def main(argv):
             args.version_source,
             args.version,
             args.deploy == "true",
+            args.published,
         )
     except VersionError as err:
         message = " ".join(str(err).split())
