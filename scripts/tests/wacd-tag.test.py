@@ -75,9 +75,38 @@ class Repos:
         return bool(self.git_in(self.origin, "tag", "-l"))
 
     def push_tag(self, *args):
+        return self.run_script("push-tag", *args)
+
+    def claim_tag(self, *args):
+        return self.run_script("claim-tag", *args)
+
+    def refuse_tag_pushes(self):
+        """Install a pre-receive hook on origin that rejects every tag ref, as
+        GitHub rejects a GITHUB_TOKEN tag push at a workflow-changing commit."""
+        hook = self.origin / "hooks" / "pre-receive"
+        hook.write_text(
+            "#!/bin/sh\n"
+            "while read old new ref; do\n"
+            "  case \"$ref\" in refs/tags/*)\n"
+            "    echo \"refusing to allow a GitHub App to create or update workflow without workflows permission\" >&2\n"
+            "    exit 1;;\n"
+            "  esac\n"
+            "done\n"
+        )
+        hook.chmod(0o755)
+
+    def advance_origin_main(self, message):
+        """Land a newer commit on origin's main, as a later merge would."""
+        self.git("checkout", "-q", "-b", "newer")
+        newer = self.commit(message)
+        self.git("push", "-q", "origin", "newer:main")
+        self.git("checkout", "-q", "main")
+        return newer
+
+    def run_script(self, command, *args):
         self.assert_contained()
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "push-tag", *args],
+            [sys.executable, str(SCRIPT), command, *args],
             cwd=self.app,
             env=self.env,
             capture_output=True,
@@ -86,7 +115,7 @@ class Repos:
         )
 
 
-class PushTagTests(unittest.TestCase):
+class TagCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -99,6 +128,8 @@ class PushTagTests(unittest.TestCase):
         for needle in needles:
             self.assertIn(needle, result.stderr)
 
+
+class PushTagTests(TagCase):
     def test_absent_tag_is_created_lightweight_and_pushed(self):
         r = self.repos
         result = r.push_tag("--tag", "v0.1.0", "--sha", r.second)
@@ -179,6 +210,71 @@ class PushTagTests(unittest.TestCase):
             timeout=60,
         )
         self.assert_fails(result)
+
+
+class ClaimTagTests(TagCase):
+    def outcome(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 2, result.stdout)
+        self.assertTrue(lines[1].startswith("claim="), result.stdout)
+        return lines[1].removeprefix("claim=")
+
+    def test_absent_tag_is_pushed(self):
+        r = self.repos
+        self.assertEqual(self.outcome(r.claim_tag("--tag", "v0.1.0", "--sha", r.second)), "pushed")
+        self.assertEqual(r.origin_tags(), {"refs/tags/v0.1.0": r.second})
+
+    def test_tag_already_at_the_sha_is_accepted(self):
+        r = self.repos
+        self.assertEqual(self.outcome(r.claim_tag("--tag", "v0.1.0", "--sha", r.second)), "pushed")
+        self.assertEqual(self.outcome(r.claim_tag("--tag", "v0.1.0", "--sha", r.second)), "exists")
+        self.assertEqual(r.push_tag("--tag", "v0.1.0", "--sha", r.second).returncode, 0)
+        self.assertEqual(r.origin_tags(), {"refs/tags/v0.1.0": r.second})
+
+    def test_refused_push_after_main_moved_is_superseded(self):
+        r = self.repos
+        r.refuse_tag_pushes()
+        newer = r.advance_origin_main("ci: bump the shared workflows")
+        result = r.claim_tag("--tag", "v0.2.0", "--sha", r.second)
+        self.assertEqual(self.outcome(result), "superseded")
+        self.assertIn(newer, result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(r.origin_tags(), {})
+
+    def test_refused_push_at_the_tip_fails(self):
+        r = self.repos
+        r.refuse_tag_pushes()
+        result = r.claim_tag("--tag", "v0.2.0", "--sha", r.second)
+        self.assert_fails(result, "git push failed", "still the tip of main")
+        self.assertIn("workflows permission", result.stderr)
+        self.assertEqual(r.origin_tags(), {})
+
+    def test_refused_push_with_the_branch_absent_fails(self):
+        r = self.repos
+        r.refuse_tag_pushes()
+        newer = r.advance_origin_main("feat: elsewhere")
+        self.assertTrue(newer)
+        result = r.claim_tag("--tag", "v0.2.0", "--sha", r.second, "--branch", "release")
+        self.assert_fails(result, "release is absent")
+        self.assertEqual(r.origin_tags(), {})
+
+    def test_tag_on_another_commit_fails_even_when_main_moved(self):
+        r = self.repos
+        r.git("tag", "v0.5.0", r.first)
+        r.git("push", "-q", "origin", "refs/tags/v0.5.0")
+        r.git("tag", "-d", "v0.5.0")
+        r.advance_origin_main("feat: later")
+        result = r.claim_tag("--tag", "v0.5.0", "--sha", r.second)
+        self.assert_fails(result, r.first, r.second)
+        self.assertEqual(r.origin_tags(), {"refs/tags/v0.5.0": r.first})
+
+    def test_bad_branch_pushes_nothing(self):
+        r = self.repos
+        for branch in ("-x", "a..b", ""):
+            with self.subTest(branch=branch):
+                self.assert_fails(r.claim_tag("--tag", "v1.0.0", "--sha", r.second, f"--branch={branch}"))
+        self.assertEqual(r.origin_tags(), {})
 
 
 if __name__ == "__main__":
