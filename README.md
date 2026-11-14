@@ -1093,8 +1093,9 @@ jobs:
 release only from that caller file on `refs/heads/main`, for a `push` or
 `workflow_dispatch` event, whose job workflow ref is exactly
 `willfell/wac.lab.actions/.github/workflows/wac-cd.yml@refs/tags/vX.Y.Z`. That
-is why the gateway call is a job in `wac-cd.yml` itself rather than a
-composite: a composite would carry the caller's identity, and the gateway used
+is why the gateway call is a job in `wac-cd.yml` itself rather than a step in
+the caller's own workflow: such a step would carry the caller's identity, and
+the gateway used
 to deny every reusable-workflow identity before it learned to admit exactly
 this one. It also means this repository cannot be transferred out of
 `willfell` or renamed until the gateway's policy names the new ref first;
@@ -1223,9 +1224,14 @@ If a run fails after images or the chart were pushed but before the tag was,
 re-run that same run. Both state checks accept an image or chart already
 published from this run's SHA and carry on to the tag. A different commit that
 computes the same version fails at the image or chart state check instead,
-naming both SHAs, because a version is never rebuilt from other source. It
-keeps failing until the original run is re-run or a `feat` moves the computed
-version past it.
+naming both SHAs, because a version is never rebuilt from other source.
+
+Re-running the original run is the fix. The stuck version has no tag, and the
+next version is computed from the latest tag, so later commits keep computing
+it again. A different commit escapes only when its bump class is higher than
+the stuck version's: a `feat` past a stuck patch, or a breaking change past a
+stuck patch or minor. Nothing moves past a stuck major except re-running the
+original run.
 
 ## lab-release
 
