@@ -194,6 +194,48 @@ class ReusableWorkflowTests(unittest.TestCase):
                 if expected:
                     self.assertIn("::error::", result.stdout)
 
+    def test_wac_ci_apt_packages_come_from_the_validator_and_precede_the_installs(self):
+        import yaml
+
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
+        steps = doc["jobs"]["checks"]["steps"]
+        names = [s.get("name") or s.get("uses") for s in steps]
+        apt = names.index("Install the profile's apt packages")
+        step = steps[apt]
+        self.assertEqual(step["if"], "steps.profile.outputs.apt_packages != ''")
+        self.assertEqual(step["env"], {"APT_PACKAGES": "${{ steps.profile.outputs.apt_packages }}"})
+        self.assertNotIn("${{", step["run"])
+        self.assertLess(names.index("Read the wacd profile"), apt)
+        for later in ("actions/setup-node@v4", "Install root node dependencies", "Run the profile's CI commands"):
+            with self.subTest(step=later):
+                self.assertLess(apt, names.index(later))
+
+    def test_wac_ci_apt_step_passes_each_package_as_one_word(self):
+        import os
+        import subprocess
+        import yaml
+
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
+        step = next(s for s in doc["jobs"]["checks"]["steps"] if s.get("name") == "Install the profile's apt packages")
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = Path(tmp) / "sudo.log"
+            sudo = bin_dir / "sudo"
+            sudo.write_text('#!/usr/bin/env bash\nprintf "%s|" "$@" >> "$SUDO_LOG"\necho >> "$SUDO_LOG"\n')
+            sudo.chmod(0o755)
+            env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "SUDO_LOG": str(log),
+                   "APT_PACKAGES": "python3 make g++"}
+            result = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                log.read_text().splitlines(),
+                [
+                    "apt-get|update|",
+                    "env|DEBIAN_FRONTEND=noninteractive|apt-get|install|-y|--no-install-recommends|python3|make|g++|",
+                ],
+            )
+
     def test_wac_cd_rollback_version_must_be_strict_semver(self):
         import os
         import subprocess

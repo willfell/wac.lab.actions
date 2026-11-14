@@ -168,6 +168,51 @@ class ProfileTest(unittest.TestCase):
         for bad in ("V", "-v", "v/"):
             self.assertRejected(self.profile(tag_prefix=bad), "tag_prefix")
 
+    def with_apt(self, packages):
+        data = self.profile()
+        data["ci"]["apt_packages"] = packages
+        return data
+
+    def test_apt_packages_are_accepted_and_printed_space_separated(self):
+        data = self.with_apt(["python3", "make", "g++", "libssl3t64", "lib.x-1"])
+        self.write(data)
+        self.assertEqual(profile.load(self.path), data)
+        result = self.cli(data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "apt_packages=python3 make g++ libssl3t64 lib.x-1", result.stdout.splitlines()
+        )
+
+    def test_apt_packages_are_optional_and_print_empty_when_absent(self):
+        result = self.cli(TRAVEL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt_packages=", result.stdout.splitlines())
+
+    def test_apt_packages_apply_to_go_too(self):
+        data = self.profile(
+            ci={"stack": "go", "go_version": "1.24", "commands": ["go test ./..."], "apt_packages": ["make"]}
+        )
+        self.write(data)
+        self.assertEqual(profile.load(self.path), data)
+
+    def test_apt_packages_reject_bad_names(self):
+        for bad in ("Make", "-o", "", "make g++", "make;rm", "$(id)", "make\n", "a/b", "make:arm64", "é"):
+            with self.subTest(name=bad):
+                self.assertRejected(self.with_apt(["python3", bad]), "ci.apt_packages[1]")
+        self.assertRejected(self.with_apt([1]), "ci.apt_packages[0]")
+        self.assertRejected(self.with_apt([None]), "ci.apt_packages[0]")
+
+    def test_apt_packages_reject_duplicates(self):
+        self.assertRejected(self.with_apt(["make", "g++", "make"]), "ci.apt_packages[2]: duplicate")
+
+    def test_apt_packages_reject_an_empty_list(self):
+        self.assertRejected(self.with_apt([]), "ci.apt_packages: must be a non-empty list")
+
+    def test_apt_packages_must_be_a_list(self):
+        for bad in ("make", {"make": True}, None, True):
+            with self.subTest(value=bad):
+                self.assertRejected(self.with_apt(bad), "ci.apt_packages: must be a non-empty list")
+
     def test_cli_prints_outputs_and_fails_cleanly(self):
         result = self.cli(TRAVEL)
         self.assertEqual(result.returncode, 0, result.stderr)
