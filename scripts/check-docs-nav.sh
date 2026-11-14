@@ -3,7 +3,7 @@
 #
 # Usage: check-docs-nav.sh <mkdocs.yml> [<mkdocs.yml> ...]
 #
-# The standard lives in the wac:docs-onboard-repo skill. This script is the
+# The standard lives in the portal:docs-onboard-repo skill. This script is the
 # executable half of it: the seven category names, their order, the Overview
 # rule, and the standing exclude_docs block. It does NOT check that a page is
 # filed under the RIGHT category - only a reader can judge that. It checks the
