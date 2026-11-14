@@ -418,12 +418,14 @@ def parse_images_arg(text):
 def build_args(text):
     """Validate wac-cd's newline-separated KEY=VALUE build args.
 
-    Blank lines are skipped; every other line must be KEY=VALUE with an
+    A trailing carriage return is dropped from each line (a CRLF caller
+    string), blank lines are skipped, and every other line must be KEY=VALUE with an
     upper-case shell-style KEY. The value is passed through unchanged, so the
     lines returned are exactly what reaches `docker build --build-arg`.
     """
     accepted = []
     for number, line in enumerate(text.split("\n"), start=1):
+        line = line.removesuffix("\r")
         if not line.strip():
             continue
         key, sep, _ = line.partition("=")

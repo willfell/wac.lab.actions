@@ -10,7 +10,8 @@ is loaded, never changed.
 
 The gateway contract (Plan 2, "Chart releases (wac-cd)") is isolated in
 RELEASE_BODY, STATUS_BODY and ready(). After the proof, github-release creates
-the GitHub Release for the tag with the job's GITHUB_TOKEN. Any problem exits 1 with one stable
+the GitHub Release for the tag with the job's GITHUB_TOKEN when none exists
+yet, and never edits one that does. Any problem exits 1 with one stable
 "wacd release: ..." stderr line, and no token is ever printed.
 """
 
@@ -46,6 +47,7 @@ MAX_WAIT = 3600
 GITHUB_TIMEOUT = 30
 TAG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+RELEASED_MODES = ("release", "resume", "rollback")
 
 
 def RELEASE_BODY(version):
@@ -280,6 +282,14 @@ def github_release(tag, sha, environ):
     if not token:
         raise ReleaseError("GITHUB_TOKEN is empty")
     releases = f"{api}/repos/{repository}/releases"
+    lookup = f"{releases}/tags/{urllib.parse.quote(tag, safe='')}"
+    # Look before writing: an existing release is left exactly as it is, so a
+    # resume or rollback never duplicates or edits one.
+    found = github_call("GET", lookup, token)
+    if found == 200:
+        return f"GitHub Release {tag} already exists; left unchanged"
+    if found != 404:
+        raise ReleaseError(f"GitHub release lookup for {tag} failed (HTTP {found})")
     body = {
         "tag_name": tag,
         "name": tag,
@@ -289,18 +299,10 @@ def github_release(tag, sha, environ):
     code = github_call("POST", releases, token, body)
     if code == 201:
         return f"Created GitHub Release {tag}"
-    if code == 422:
-        # 422 is also what GitHub answers for a bad tag or commitish, so it
-        # only counts as "already released" when the release really exists.
-        found = github_call(
-            "GET", f"{releases}/tags/{urllib.parse.quote(tag, safe='')}", token
-        )
-        if found == 200:
-            return f"GitHub Release {tag} already exists"
-        raise ReleaseError(
-            f"GitHub refused the release (HTTP 422) and no release exists for {tag} (HTTP {found})"
-        )
-    raise ReleaseError(f"GitHub refused the release (HTTP {code})")
+    if code == 422 and github_call("GET", lookup, token) == 200:
+        # Another run created it between the lookup and the create.
+        return f"GitHub Release {tag} already exists; left unchanged"
+    raise ReleaseError(f"GitHub refused the release for {tag} (HTTP {code})")
 
 
 def parse_images(text, version):
@@ -345,6 +347,9 @@ def build_parser():
     rel.add_argument("--images", required=True)
     rel.add_argument("--wait-timeout", required=True)
     rel.add_argument("--receipt", required=True)
+    rel.add_argument("--mode", required=True, choices=RELEASED_MODES)
+    rel.add_argument("--tag", required=True)
+    rel.add_argument("--expected-sha", required=True)
     health = commands.add_parser("health")
     health.add_argument("--url", required=True)
     health.add_argument("--sha", required=True)
@@ -367,9 +372,19 @@ def run(args):
         return f"Verified served build: {value['sha']}"
     if not VERSION_PATTERN.fullmatch(args.version):
         raise ReleaseError("--version must be X.Y.Z")
+    if not TAG_PATTERN.fullmatch(args.tag):
+        raise ReleaseError("--tag is not a valid tag name")
+    if not SHA_PATTERN.fullmatch(args.expected_sha):
+        raise ReleaseError("--expected-sha must be 40 lowercase hex characters")
     images = parse_images(args.images, args.version)
     result, record = proved(args.version, images, timeout)
-    result = {**result, "released": record}
+    plan = {
+        "mode": args.mode,
+        "version": args.version,
+        "tag": args.tag,
+        "expected_sha": args.expected_sha,
+    }
+    result = {**result, "released": record, "wac_cd": plan}
     Path(args.receipt).write_text(json.dumps(result, indent=2) + "\n")
     return "Verified release receipt: " + args.receipt
 

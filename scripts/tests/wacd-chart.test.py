@@ -661,6 +661,14 @@ class BuildArgsTests(unittest.TestCase):
             ["NEXT_PUBLIC_BASE=/travel", "_X1=a=b c", "EMPTY="],
         )
 
+    def test_build_args_strips_a_trailing_carriage_return(self):
+        self.assertEqual(
+            chart.build_args("A=1\r\nB=two\r\n\r\nC=x\ry\n"),
+            ["A=1", "B=two", "C=x\ry"],
+        )
+        with self.assertRaises(chart.ChartError):
+            chart.build_args("A\r=1")
+
     def test_build_args_rejects_malformed_lines(self):
         for line in ("NOEQUALS", "lower=1", "1ABC=x", "=x", " KEY=x", "KEY-NAME=x", "KEY =x", "K\u00c9Y=x"):
             with self.subTest(line=line), self.assertRaises(chart.ChartError) as caught:

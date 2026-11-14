@@ -34,6 +34,7 @@ IMAGES = {
 }
 IMAGE_REF = f"localhost:30500/travel-app:{VERSION}@{IMAGE_DIGEST}"
 TOKEN = "fake.token.value"
+WAC_CD = {"mode": "release", "version": VERSION, "tag": "v" + VERSION, "expected_sha": SOURCE}
 ReleaseError = wacd.ReleaseError
 
 
@@ -530,13 +531,17 @@ class CliTests(unittest.TestCase):
             code = wacd.main(["wacd-release.py", *argv])
         return code, out.getvalue(), err.getvalue()
 
-    def release_argv(self, receipt, images=IMAGES, timeout="30", version=VERSION):
+    def release_argv(self, receipt, images=IMAGES, timeout="30", version=VERSION,
+                     mode="release", tag="v" + VERSION, expected_sha=SOURCE):
         return (
             "release",
             "--version", version,
             "--images", json.dumps(images),
             "--wait-timeout", timeout,
             "--receipt", receipt,
+            "--mode", mode,
+            "--tag", tag,
+            "--expected-sha", expected_sha,
         )
 
     def test_cli_release_writes_the_receipt(self):
@@ -549,7 +554,7 @@ class CliTests(unittest.TestCase):
                 code, out, err = self.main(*self.release_argv(receipt))
             self.assertEqual((code, err), (0, ""), err)
             self.assertIn(receipt, out)
-            self.assertEqual(json.loads(Path(receipt).read_text()), released())
+            self.assertEqual(json.loads(Path(receipt).read_text()), {**released(), "wac_cd": WAC_CD})
 
     def test_cli_receipt_keeps_the_released_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -564,7 +569,22 @@ class CliTests(unittest.TestCase):
             written = json.loads(Path(receipt).read_text())
             self.assertEqual(written["released"]["chart_source_sha"], SOURCE)
             self.assertEqual(written["released"], released()["released"])
-            self.assertEqual(written, {**evidence(), "released": released()["released"]})
+            self.assertEqual(
+                written, {**evidence(), "released": released()["released"], "wac_cd": WAC_CD}
+            )
+
+    def test_cli_receipt_records_the_wac_cd_plan(self):
+        rollback = {"mode": "rollback", "version": VERSION, "tag": "app-v" + VERSION,
+                    "expected_sha": "b" * 40}
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = str(Path(tmp) / "receipt.json")
+            with patch.object(wacd, "trust_context", lambda: None), patch.object(
+                wacd.ci, "request", Script((200, released()))
+            ):
+                code, _, err = self.main(*self.release_argv(
+                    receipt, mode="rollback", tag="app-v" + VERSION, expected_sha="b" * 40))
+            self.assertEqual((code, err), (0, ""), err)
+            self.assertEqual(json.loads(Path(receipt).read_text())["wac_cd"], rollback)
 
     def test_cli_never_prints_the_token(self):
         def explode(body, trust, timeout):
@@ -616,6 +636,10 @@ class CliTests(unittest.TestCase):
                     },
                 ),
                 "no images": self.release_argv(receipt, images={}),
+                "mode publish is never released": self.release_argv(receipt, mode="publish"),
+                "mode none": self.release_argv(receipt, mode="none"),
+                "blank tag": self.release_argv(receipt, tag=""),
+                "short expected sha": self.release_argv(receipt, expected_sha="abc"),
                 "bad digest": self.release_argv(
                     receipt,
                     images={"a": {"repository": "localhost:30500/a", "tag": VERSION, "digest": "x"}},
@@ -642,8 +666,10 @@ class CliTests(unittest.TestCase):
         code, _, err = self.main(
             "release", "--version", VERSION, "--images", "{", "--wait-timeout", "5",
             "--receipt", "/nonexistent/receipt.json",
+            "--mode", "release", "--tag", "v" + VERSION, "--expected-sha", SOURCE,
         )
         self.assertEqual(code, 1)
+        self.assertIn("JSON", err)
         self.assertEqual(len(err.strip().splitlines()), 1)
 
     def test_cli_health_rejects_a_malformed_sha(self):
@@ -691,11 +717,15 @@ class CliTests(unittest.TestCase):
 
 
 class ReleasesApi:
-    """A stub GitHub REST API for the releases endpoints."""
+    """A stub GitHub REST API for the releases endpoints.
 
-    def __init__(self, post_status, get_status=404):
+    GET answers come from `gets` in order (the last one repeats); every request,
+    including any write other than the POST under test, is recorded in `seen`.
+    """
+
+    def __init__(self, gets, post_status=201):
+        self.gets = list(gets)
         self.post_status = post_status
-        self.get_status = get_status
         self.seen = []
         outer = self
 
@@ -708,16 +738,32 @@ class ReleasesApi:
                 self.end_headers()
                 self.wfile.write(raw)
 
-            def do_POST(self):
+            def record(self, method):
                 size = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(size))
-                outer.seen.append(("POST", self.path, self.headers["Authorization"], body))
-                self.reply(outer.post_status, {"tag_name": body.get("tag_name")})
+                body = json.loads(self.rfile.read(size)) if size else None
+                outer.seen.append((method, self.path, self.headers["Authorization"], body))
+                return body
 
             def do_GET(self):
-                outer.seen.append(("GET", self.path, self.headers["Authorization"], None))
-                tag = self.path.rsplit("/", 1)[-1]
-                self.reply(outer.get_status, {"tag_name": tag})
+                self.record("GET")
+                status = outer.gets.pop(0) if len(outer.gets) > 1 else outer.gets[0]
+                self.reply(status, {"tag_name": self.path.rsplit("/", 1)[-1]})
+
+            def do_POST(self):
+                body = self.record("POST")
+                self.reply(outer.post_status, {"tag_name": (body or {}).get("tag_name")})
+
+            def do_PATCH(self):
+                self.record("PATCH")
+                self.reply(200, {})
+
+            def do_PUT(self):
+                self.record("PUT")
+                self.reply(200, {})
+
+            def do_DELETE(self):
+                self.record("DELETE")
+                self.reply(204, {})
 
             def log_message(self, *args):
                 pass
@@ -734,6 +780,7 @@ class ReleasesApi:
 class GithubReleaseTests(unittest.TestCase):
     TAG = "v0.1.0"
     GH_TOKEN = "ghs_fake_release_token"
+    RELEASES = "/repos/willfell/travel/releases"
 
     def publish(self, api, tag=TAG, sha=SOURCE, env=None):
         environ = {
@@ -755,55 +802,77 @@ class GithubReleaseTests(unittest.TestCase):
         self.assertNotIn(self.GH_TOKEN, result.stdout + result.stderr)
         return result
 
-    def serve(self, post_status, get_status=404):
-        api = ReleasesApi(post_status, get_status)
+    def serve(self, gets, post_status=201):
+        api = ReleasesApi(gets, post_status)
         self.addCleanup(api.close)
         return api
 
-    def test_github_release_created_or_already_there(self):
-        created = self.serve(201)
-        result = self.publish(created)
+    def calls(self, api):
+        return [(method, path) for method, path, _, _ in api.seen]
+
+    def assert_one_line_failure(self, result):
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith("wacd release: "), result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertEqual(result.stdout, "")
+
+    def test_github_release_created_when_absent(self):
+        api = self.serve([404], 201)
+        result = self.publish(api)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            created.seen,
-            [(
-                "POST",
-                "/repos/willfell/travel/releases",
-                f"Bearer {self.GH_TOKEN}",
-                {
-                    "tag_name": self.TAG,
-                    "name": self.TAG,
-                    "target_commitish": SOURCE,
-                    "generate_release_notes": True,
-                },
-            )],
-        )
         self.assertIn(self.TAG, result.stdout)
-
-        existing = self.serve(422, 200)
-        result = self.publish(existing)
-        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            [(method, path, auth) for method, path, auth, _ in existing.seen],
-            [
-                ("POST", "/repos/willfell/travel/releases", f"Bearer {self.GH_TOKEN}"),
-                ("GET", f"/repos/willfell/travel/releases/tags/{self.TAG}", f"Bearer {self.GH_TOKEN}"),
-            ],
+            self.calls(api),
+            [("GET", f"{self.RELEASES}/tags/{self.TAG}"), ("POST", self.RELEASES)],
+        )
+        self.assertTrue(all(auth == f"Bearer {self.GH_TOKEN}" for _, _, auth, _ in api.seen))
+
+    def test_rollback_of_a_version_with_no_release_creates_it(self):
+        revision = "b" * 40
+        api = self.serve([404], 201)
+        result = self.publish(api, tag="app-v0.0.7", sha=revision)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        posts = [body for method, _, _, body in api.seen if method == "POST"]
+        self.assertEqual(
+            posts,
+            [{
+                "tag_name": "app-v0.0.7",
+                "name": "app-v0.0.7",
+                "target_commitish": revision,
+                "generate_release_notes": True,
+            }],
         )
 
-        for label, post, get in (("422 without a release", 422, 404), ("forbidden", 403, 200)):
+    def test_rollback_of_a_version_with_a_release_leaves_it(self):
+        api = self.serve([200], 201)
+        result = self.publish(api, sha="b" * 40)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already exists", result.stdout)
+        self.assertEqual(self.calls(api), [("GET", f"{self.RELEASES}/tags/{self.TAG}")])
+
+    def test_github_release_created_concurrently_is_accepted(self):
+        api = self.serve([404, 200], 422)
+        result = self.publish(api)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [method for method, _ in self.calls(api)], ["GET", "POST", "GET"]
+        )
+
+    def test_github_release_failures(self):
+        for label, gets, post, methods in (
+            ("422 and still no release", [404], 422, ["GET", "POST", "GET"]),
+            ("forbidden create", [404], 403, ["GET", "POST"]),
+            ("forbidden lookup", [403], 201, ["GET"]),
+            ("server error lookup", [500], 201, ["GET"]),
+        ):
             with self.subTest(case=label):
-                api = self.serve(post, get)
+                api = self.serve(gets, post)
                 result = self.publish(api)
-                self.assertEqual(result.returncode, 1)
-                self.assertTrue(result.stderr.startswith("wacd release: "), result.stderr)
-                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
-                self.assertEqual(result.stdout, "")
-                if post == 403:
-                    self.assertEqual(len(api.seen), 1)
+                self.assert_one_line_failure(result)
+                self.assertEqual([method for method, _ in self.calls(api)], methods)
 
     def test_github_release_validates_before_calling(self):
-        api = self.serve(201)
+        api = self.serve([404], 201)
         for label, kwargs in (
             ("short sha", {"sha": "abc"}),
             ("blank tag", {"tag": ""}),
@@ -819,10 +888,8 @@ class GithubReleaseTests(unittest.TestCase):
         self.assertEqual(api.seen, [])
 
     def test_github_release_unreachable_api_fails_cleanly(self):
-        result = self.publish(None)
-        self.assertEqual(result.returncode, 1)
-        self.assertTrue(result.stderr.startswith("wacd release: "), result.stderr)
-        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assert_one_line_failure(self.publish(None))
+
 
 if __name__ == "__main__":
     unittest.main()

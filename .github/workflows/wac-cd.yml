@@ -148,32 +148,39 @@ jobs:
               echo "::error::wac-cd: deploy/$APP:$ROLLBACK_VERSION was built from $revision, which is not an ancestor of main"
               exit 1
             fi
-            {
-              echo "mode=rollback"
-              echo "version=$ROLLBACK_VERSION"
-              echo "tag=$TAG_PREFIX$ROLLBACK_VERSION"
-              echo "expected_sha=$revision"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          planned="$(python3 .wacd/scripts/wacd-version.py --prefix "$TAG_PREFIX" \
-            --version-source "$VERSION_SOURCE" --version "$CALLER_VERSION" --deploy "$DEPLOY")"
-          echo "$planned"
-          mode="$(sed -n 's/^mode=//p' <<< "$planned")"
-          version="$(sed -n 's/^version=//p' <<< "$planned")"
-          expected_sha="$GITHUB_SHA"
-          if [[ "$mode" == resume ]]; then
-            revision_of "$version"
+            mode=rollback
+            version="$ROLLBACK_VERSION"
+            tag="$TAG_PREFIX$ROLLBACK_VERSION"
             expected_sha="$revision"
-            if [[ "$expected_sha" != "$GITHUB_SHA" ]]; then
-              echo "::error::wac-cd: deploy/$APP:$version was built from $expected_sha, not this push's $GITHUB_SHA"
-              exit 1
+          else
+            planned="$(python3 .wacd/scripts/wacd-version.py --prefix "$TAG_PREFIX" \
+              --version-source "$VERSION_SOURCE" --version "$CALLER_VERSION" --deploy "$DEPLOY")"
+            mode="$(sed -n 's/^mode=//p' <<< "$planned")"
+            version="$(sed -n 's/^version=//p' <<< "$planned")"
+            tag="$(sed -n 's/^tag=//p' <<< "$planned")"
+            expected_sha="$GITHUB_SHA"
+            if [[ "$mode" == resume ]]; then
+              revision_of "$version"
+              expected_sha="$revision"
+              if [[ "$expected_sha" != "$GITHUB_SHA" ]]; then
+                echo "::error::wac-cd: deploy/$APP:$version was built from $expected_sha, not this push's $GITHUB_SHA"
+                exit 1
+              fi
             fi
           fi
           {
-            echo "$planned"
+            echo "mode=$mode"
+            echo "version=$version"
+            echo "tag=$tag"
             echo "expected_sha=$expected_sha"
-          } >> "$GITHUB_OUTPUT"
+          } | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "### wac-cd plan"
+            echo
+            echo "| mode | version | tag | expected sha |"
+            echo "| --- | --- | --- | --- |"
+            echo "| $mode | ${version:--} | ${tag:--} | $expected_sha |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: plan
@@ -249,6 +256,7 @@ jobs:
                 --name "$name" --tag "$VERSION" --source-sha "$GITHUB_SHA")"
               [[ "$state" == state=present ]]
             elif [[ "$state" != state=present ]]; then
+              echo "::error::wac-cd: unexpected image state for $ref: $state"
               exit 1
             else
               echo "$ref already exists from $GITHUB_SHA; reusing it"
@@ -342,29 +350,10 @@ jobs:
           elif [[ "$state" == state=present ]]; then
             echo "deploy/$APP:$VERSION is already published from $GITHUB_SHA"
           else
+            echo "::error::wac-cd: unexpected chart state for deploy/$APP:$VERSION: $state"
             exit 1
           fi
-          remote="$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")"
-          if [[ -z "$remote" ]]; then
-            local_sha="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" || true)"
-            if [[ -z "$local_sha" ]]; then
-              git tag "$TAG" "$GITHUB_SHA"
-            elif [[ "$local_sha" != "$GITHUB_SHA" ]]; then
-              echo "::error::wac-cd: local tag $TAG is on $local_sha, not $GITHUB_SHA"
-              exit 1
-            fi
-            git push origin "refs/tags/$TAG"
-            echo "Pushed tag $TAG at $GITHUB_SHA"
-          else
-            peeled="$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1}' <<< "$remote")"
-            direct="$(awk -v ref="refs/tags/$TAG" '$2 == ref {print $1}' <<< "$remote")"
-            remote_sha="${peeled:-$direct}"
-            if [[ "$remote_sha" != "$GITHUB_SHA" ]]; then
-              echo "::error::wac-cd: tag $TAG already exists on $remote_sha, not $GITHUB_SHA"
-              exit 1
-            fi
-            echo "Tag $TAG already exists at $GITHUB_SHA"
-          fi
+          python3 .wacd/scripts/wacd-tag.py push-tag --tag "$TAG" --sha "$GITHUB_SHA"
 
   deploy:
     needs: [plan, build, publish]
@@ -374,7 +363,7 @@ jobs:
       needs.plan.outputs.mode == 'resume' ||
       needs.plan.outputs.mode == 'rollback')
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
-    timeout-minutes: 40
+    timeout-minutes: 65
     permissions:
       contents: read
       id-token: write
@@ -403,31 +392,53 @@ jobs:
           python3 .wacd/scripts/wacd-chart.py chart-images \
             --registry registry.network.svc.cluster.local:5000 \
             --app "$APP" --version "$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Summarize the release
+        shell: bash
+        env:
+          MODE: ${{ needs.plan.outputs.mode }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.plan.outputs.expected_sha }}
+        run: |
+          {
+            echo "### wac-cd deploy"
+            echo
+            echo "| mode | version | tag | expected sha |"
+            echo "| --- | --- | --- | --- |"
+            echo "| $MODE | $VERSION | $TAG | $EXPECTED_SHA |"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Release through the gateway
         shell: bash
         env:
+          MODE: ${{ needs.plan.outputs.mode }}
           VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.plan.outputs.expected_sha }}
           IMAGES: ${{ steps.chart.outputs.images }}
           WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
         run: |
           python3 .wacd/scripts/wacd-release.py release --version "$VERSION" \
             --images "$IMAGES" --wait-timeout "$WAIT_TIMEOUT" \
+            --mode "$MODE" --tag "$TAG" --expected-sha "$EXPECTED_SHA" \
             --receipt "$RUNNER_TEMP/wac-cd-release.json"
       - uses: actions/upload-artifact@v4
         with:
           name: wac-cd-release-${{ needs.plan.outputs.version }}
           path: ${{ runner.temp }}/wac-cd-release.json
           if-no-files-found: error
+          overwrite: true
       - name: Prove the served build
         shell: bash
         env:
           HEALTH_URL: ${{ needs.plan.outputs.health_url }}
           EXPECTED_SHA: ${{ needs.plan.outputs.expected_sha }}
           EXPECT_DB: ${{ needs.plan.outputs.health_expect_db_ok }}
-          WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
         run: |
           python3 .wacd/scripts/wacd-release.py health --url "$HEALTH_URL" \
-            --sha "$EXPECTED_SHA" --expect-db "$EXPECT_DB" --wait-timeout "$WAIT_TIMEOUT"
+            --sha "$EXPECTED_SHA" --expect-db "$EXPECT_DB" --wait-timeout 300
+      - name: Record the proof
+        shell: bash
+        run: echo "Release proved by gateway status and served sha" >> "$GITHUB_STEP_SUMMARY"
 
   github-release:
     needs: [plan, deploy]
@@ -435,7 +446,8 @@ jobs:
       !cancelled() && !failure() &&
       needs.deploy.result == 'success' && (
       needs.plan.outputs.mode == 'release' ||
-      needs.plan.outputs.mode == 'resume')
+      needs.plan.outputs.mode == 'resume' ||
+      needs.plan.outputs.mode == 'rollback')
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 5
     permissions:
