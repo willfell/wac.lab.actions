@@ -33,6 +33,13 @@ FLOATING_REFS = ("@main", "@master")
 RUNNER_INPUT = "runner"
 DEFAULT_RUNNER = ""
 RUNS_ON_EXPRESSION = "${{ inputs.runner || vars.CI_RUNNER_SMALL }}"
+RUNNER_PASSTHROUGH = "${{ inputs.runner }}"
+
+#: This repo as a checkout target, the ref a gate must use for it, and the
+#: guard step that proves the ref is a full commit sha before it is trusted.
+SHARED_REPOSITORY = "willfell/wac.lab.actions"
+WORKFLOW_SHA_EXPRESSION = "${{ job.workflow_sha }}"
+WORKFLOW_SHA_GUARD = '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
 
 
 def _action_files() -> list[Path]:
@@ -96,6 +103,57 @@ def _check_reusable_workflow(path: Path, doc: dict) -> list[str]:
     problems.extend(_check_no_floating_refs(path))
     problems.extend(_check_runner_is_a_caller_choice(path, doc))
     problems.extend(_check_gate_identity(path, doc))
+    problems.extend(_check_shared_checkouts(path, doc))
+    problems.extend(_check_no_environment(path, doc))
+    return problems
+
+
+def _check_no_environment(path: Path, doc: dict) -> list[str]:
+    """A reusable workflow job may not name an environment.
+
+    A job that names an environment puts an `environment` claim in its OIDC
+    token, and the release gateway rejects tokens that carry one. The job
+    would also bind every caller to an environment it may not have.
+    """
+    return [
+        f"{path}: job {name!r} declares `environment` -- environments belong to the "
+        "caller's workflow, not to a shared one"
+        for name, job in (doc.get("jobs") or {}).items()
+        if "environment" in (job or {})
+    ]
+
+
+def _check_shared_checkouts(path: Path, doc: dict) -> list[str]:
+    """Every checkout of this repo must be pinned to the defining commit.
+
+    A reusable workflow runs this repo's scripts from a checkout. Anything but
+    the commit the caller pinned (`job.workflow_sha`) would let a push to main
+    change a consumer's CI, and the sha is validated first so an empty or
+    malformed expression cannot fall back to the default branch. Credentials
+    are not persisted because the checked-out scripts are not trusted with the
+    caller's token.
+    """
+    problems = []
+    for name, job in (doc.get("jobs") or {}).items():
+        steps = (job or {}).get("steps") or []
+        for index, step in enumerate(steps):
+            with_ = step.get("with") or {}
+            if str(with_.get("repository") or "").lower() != SHARED_REPOSITORY:
+                continue
+            where = f"{path}: job {name!r} steps[{index}]"
+            if with_.get("ref") != WORKFLOW_SHA_EXPRESSION:
+                problems.append(
+                    f"{where}: shared checkout must use ref {WORKFLOW_SHA_EXPRESSION}, "
+                    f"not {with_.get('ref')!r}"
+                )
+            if with_.get("persist-credentials") is not False:
+                problems.append(f"{where}: shared checkout must set `persist-credentials: false`")
+            if not any(
+                (previous.get("env") or {}).get("SHARED_WORKFLOW_SHA") == WORKFLOW_SHA_EXPRESSION
+                and previous.get("run") == WORKFLOW_SHA_GUARD
+                for previous in steps[:index]
+            ):
+                problems.append(f"{where}: no SHA validation step before the shared checkout")
     return problems
 
 
@@ -145,6 +203,22 @@ def _check_runner_is_a_caller_choice(path: Path, doc: dict) -> list[str]:
         )
 
     for name, job in (doc.get("jobs") or {}).items():
+        job = job or {}
+        if "uses" in job:
+            # A nested call has no runner of its own: the callee picks one from
+            # the `runner` input, so the only thing to hold is the pass-through.
+            if "runs-on" in job:
+                problems.append(
+                    f"{path}: job {name!r} calls a reusable workflow and must not set "
+                    "`runs-on`; the called workflow chooses its runner"
+                )
+            if (job.get("with") or {}).get(RUNNER_INPUT) != RUNNER_PASSTHROUGH:
+                problems.append(
+                    f"{path}: job {name!r} calls a reusable workflow without "
+                    f"`with.{RUNNER_INPUT}: {RUNNER_PASSTHROUGH}`, so the caller's runner "
+                    "choice would not reach it"
+                )
+            continue
         runs_on = job.get("runs-on")
         if runs_on != RUNS_ON_EXPRESSION:
             problems.append(

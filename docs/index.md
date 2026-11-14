@@ -24,10 +24,13 @@ consuming repository.
 | `lab-tools` | Install the fleet's k8s and registry tooling, arch-aware, onto `PATH` |
 | `lab-route` | Send heavy jobs to a Lab runner pool when it has room, and to an overflow label otherwise |
 
-Five reusable workflows ride the same tags: `actionlint.yml` (the fleet's
+Seven reusable workflows ride the same tags: `actionlint.yml` (the fleet's
 shared lint and runner-policy gate), `nextjs-site-check.yml`,
-`nextjs-site-deploy.yml`, `techdocs.yml` (the fleet TechDocs gate), and
-`agents-md.yml` (the fleet AGENTS.md gate).
+`nextjs-site-deploy.yml`, `techdocs.yml` (the fleet TechDocs gate),
+`agents-md.yml` (the fleet AGENTS.md gate), and the wacd pair, `wac-ci.yml`
+(an app's pull-request checks and chart render) and `wac-cd.yml` (version,
+build, publish and release through Lab's gateway on a merge to `main`), both
+driven by the app's `.github/wacd.json` profile.
 
 ## The pinning rule
 

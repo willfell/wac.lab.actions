@@ -8,3 +8,9 @@ paths:
   .github/workflows/actionlint.yml:
     ignore:
       - 'property "workflow_sha" is not defined'
+  .github/workflows/wac-ci.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined'
+  .github/workflows/wac-cd.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined'

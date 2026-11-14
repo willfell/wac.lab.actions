@@ -1,0 +1,207 @@
+name: wac-ci
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Runner label; empty uses the caller's CI_RUNNER_SMALL variable
+        type: string
+        default: ''
+      parity_kustomize_dir:
+        description: Kustomize directory whose render must match the Helm render; empty skips the parity check
+        type: string
+        default: ''
+    secrets:
+      npm_token:
+        description: Token for private npm packages; empty uses the job's GitHub token
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read the wacd profile
+        id: profile
+        shell: bash
+        run: python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+      - name: Read the node package layout
+        id: layout
+        if: fromJSON(steps.profile.outputs.ci).stack == 'node'
+        shell: bash
+        run: python3 "$WACD_SCRIPTS"/wacd-profile.py node-layout . >> "$GITHUB_OUTPUT"
+      - if: fromJSON(steps.profile.outputs.ci).stack == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ fromJSON(steps.profile.outputs.ci).node_version }}
+          cache: ${{ steps.layout.outputs.lockfiles != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ steps.layout.outputs.lockfiles }}
+      - if: fromJSON(steps.profile.outputs.ci).stack == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ fromJSON(steps.profile.outputs.ci).go_version }}
+      - name: Install root node dependencies
+        if: fromJSON(steps.profile.outputs.ci).stack == 'node' && steps.layout.outputs.root_package == 'true'
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.npm_token || github.token }}
+        run: npm ci
+      - name: Run the profile's CI commands
+        shell: bash
+        env:
+          CI_PROFILE: ${{ steps.profile.outputs.ci }}
+          NODE_AUTH_TOKEN: ${{ secrets.npm_token || github.token }}
+        run: |
+          count="$(python3 -c 'import json, os; print(len(json.loads(os.environ["CI_PROFILE"])["commands"]))')"
+          for ((index = 0; index < count; index++)); do
+            command="$(python3 -c 'import json, os, sys; print(json.loads(os.environ["CI_PROFILE"])["commands"][int(sys.argv[1])])' "$index")"
+            echo "::group::$command"
+            bash -euo pipefail -c "$command"
+            echo "::endgroup::"
+          done
+
+  render:
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read the wacd profile
+        id: profile
+        shell: bash
+        run: python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+      - name: Install the render tools
+        shell: bash
+        env:
+          HELM_VERSION: v3.16.3
+          KUBECONFORM_VERSION: v0.7.0
+          KUSTOMIZE_VERSION: v5.7.1
+          PARITY_KUSTOMIZE_DIR: ${{ inputs.parity_kustomize_dir }}
+        run: |
+          tools=helm,kubeconform
+          if [[ -n "$PARITY_KUSTOMIZE_DIR" ]]; then
+            tools="$tools,kustomize"
+          fi
+          bash "$WACD_SCRIPTS"/install-tools.sh "$tools"
+      - name: Pull the wac-app chart
+        id: pull
+        shell: bash
+        env:
+          CHART_VERSION: ${{ steps.profile.outputs.chart_version }}
+        run: |
+          helm pull oci://registry.network.svc.cluster.local:5000/charts/wac-app \
+            --version "$CHART_VERSION" --plain-http -d "$RUNNER_TEMP"
+          tgz="$RUNNER_TEMP/wac-app-$CHART_VERSION.tgz"
+          test -f "$tgz"
+          echo "tgz=$tgz" >> "$GITHUB_OUTPUT"
+      - name: Package the deploy chart with CI images
+        id: package
+        shell: bash
+        env:
+          WAC_APP_TGZ: ${{ steps.pull.outputs.tgz }}
+        run: |
+          images_line="$(python3 "$WACD_SCRIPTS"/wacd-chart.py ci-images --profile .github/wacd.json)"
+          python3 "$WACD_SCRIPTS"/wacd-chart.py package --profile .github/wacd.json \
+            --version 0.0.0 --source-sha "$GITHUB_SHA" --ci \
+            --images "${images_line#images=}" \
+            --wac-app-tgz "$WAC_APP_TGZ" --out "$RUNNER_TEMP/deploy-chart" >> "$GITHUB_OUTPUT"
+      - name: Lint the deploy chart
+        shell: bash
+        env:
+          CHART_DIR: ${{ steps.package.outputs.chart_dir }}
+        run: helm lint "$CHART_DIR"
+      - name: Render the deploy chart
+        shell: bash
+        env:
+          APP: ${{ steps.profile.outputs.app }}
+          CHART_DIR: ${{ steps.package.outputs.chart_dir }}
+        run: |
+          helm template "$APP" "$CHART_DIR" --namespace "$APP" > "$RUNNER_TEMP/render.yaml"
+          if ! grep -Eq '^kind: *[A-Za-z]' "$RUNNER_TEMP/render.yaml"; then
+            echo "::error::wac-ci: the deploy chart rendered no Kubernetes objects"
+            exit 1
+          fi
+      - name: Validate the render against Kubernetes schemas
+        shell: bash
+        run: |
+          kubeconform -strict -summary -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            "$RUNNER_TEMP/render.yaml"
+      - if: inputs.parity_kustomize_dir != ''
+        uses: astral-sh/setup-uv@v5
+      - name: Render the kustomize tree
+        if: inputs.parity_kustomize_dir != ''
+        shell: bash
+        env:
+          PARITY_KUSTOMIZE_DIR: ${{ inputs.parity_kustomize_dir }}
+        run: kustomize build "$PARITY_KUSTOMIZE_DIR" > "$RUNNER_TEMP/kustomize.yaml"
+      - name: Compare the kustomize and Helm renders
+        if: inputs.parity_kustomize_dir != ''
+        shell: bash
+        run: uv run --no-project --with pyyaml python "$WACD_SCRIPTS"/wacd-parity.py "$RUNNER_TEMP/kustomize.yaml" "$RUNNER_TEMP/render.yaml"
+
+  lint:
+    uses: ./.github/workflows/actionlint.yml
+    with:
+      runner: ${{ inputs.runner }}
+      runner_policy: fleet
+
+  techdocs:
+    uses: ./.github/workflows/techdocs.yml
+    with:
+      runner: ${{ inputs.runner }}
+
+  agents-md:
+    uses: ./.github/workflows/agents-md.yml
+    with:
+      runner: ${{ inputs.runner }}

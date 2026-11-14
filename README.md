@@ -961,6 +961,308 @@ The consequence is deliberate: bumping a repo's pin to a tag that changed
 new rules ride the bump and cannot go stale silently. A `CHANGELOG.md` row for
 such a tag says so.
 
+## wacd: wac-ci and wac-cd
+
+Two reusable workflows that replace an app's own deploy pipeline. `wac-ci`
+runs on pull requests; `wac-cd` runs on a merge to `main` and releases
+through Lab's gateway. Both are driven by one file in the app repo,
+`.github/wacd.json`, so the app holds its profile, a values file for the
+shared `wac-app` chart, a Dockerfile per image, and two short caller
+workflows. It holds no `deploy/k8s`, no `Chart.yaml` and no templates.
+
+Both workflows reach their scripts by checking this repo out at
+`job.workflow_sha`, the commit the caller pinned, exactly as the `techdocs`
+and `agents-md` gates do. `actions/checkout` only writes under the workspace,
+so every job checks it out to `.wacd` and its next step moves it to
+`$RUNNER_TEMP/wacd`, before anything else runs. Left in place it would be
+linted, tested and globbed by the app's `ci.commands`, and sent in a `.`
+docker build context, where `COPY . .` would bake it into the image. Both default `runner` to the caller's
+`CI_RUNNER_SMALL`. Both pull from the in-cluster registry, so they run on Lab
+runners only.
+
+### The profile
+
+`scripts/wacd-profile.py` validates `.github/wacd.json` before anything else
+runs, in both workflows. Every field is required unless marked optional, and an
+unknown field fails at every level, so a typo is an error naming its dotted
+path (`images[1].sha_build_arg`) rather than a setting that silently does
+nothing.
+
+```json
+{
+  "schema_version": 1,
+  "app": "travel",
+  "chart_version": "1.0.0",
+  "values_file": "deploy/values.yaml",
+  "tag_prefix": "v",
+  "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health",
+  "images": [
+    {"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}
+  ],
+  "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"]}
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `schema_version` | the integer `1` exactly; `true` is not `1` |
+| `app` | `^[a-z][a-z0-9-]{0,39}$`; the deploy chart's name, which must equal the Application name Lab registered |
+| `chart_version` | `X.Y.Z` of the `wac-app` chart to vendor |
+| `values_file` | a repo-relative path with no `..` segment and no leading `/`; the file must exist |
+| `tag_prefix` | empty, or a lowercase prefix such as `v` or `app-v` |
+| `health_url` | an in-cluster `http://<host>.svc.cluster.local[:port]/<path>` URL |
+| `health_expect_db_ok` | optional JSON boolean, default `true`; `false` checks only the served `sha` |
+| `images` | a non-empty list of `{name, dockerfile, context, sha_build_arg?}`; `name` matches `^[a-z0-9][a-z0-9._-]{0,63}$` and is unique; `dockerfile` and `context` are repo-relative paths as above; optional `sha_build_arg` is an upper-case build arg name that receives the source SHA |
+| `ci` | `{stack, node_version?, go_version?, commands}`; `stack` is `node` or `go`; the matching version (`22`, `1.24`) is required and the other is refused; `commands` is a non-empty list of single-line commands |
+
+The values file sets `name`, `image` and everything else the `wac-app` chart
+takes. It never sets `app`, `images` or `global`: `wac-cd` writes `app` from the
+profile and `images` from the build, and the packager refuses a values file
+that tries, because a value it could override is a value two places would
+disagree about.
+
+### wac-ci
+
+```yaml
+name: ci
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  wac-ci:
+    uses: willfell/wac.lab.actions/.github/workflows/wac-ci.yml@v1.24.0
+    permissions:
+      contents: read
+      packages: read
+```
+
+| Input | Meaning | Default |
+| --- | --- | --- |
+| `runner` | `runs-on` label for every job, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
+| `parity_kustomize_dir` | a kustomize directory whose render must match the Helm render | empty: no parity check |
+
+| Secret | Meaning |
+| --- | --- |
+| `npm_token` | optional token for private npm packages; empty uses the job's GitHub token |
+
+It runs five jobs. `checks` sets up node or go for `ci.stack` and runs
+`ci.commands` in order, each in its own log group. For `stack: node` it runs
+`npm ci` first, but only when the repo has a root `package.json`; a repo
+without one, such as finance, lists `npm ci --prefix <dir>` in `ci.commands`
+itself. The npm cache is keyed on every `package-lock.json` in the repo.
+Nothing implicit runs for `go`. `render` pulls `wac-app` at `chart_version`,
+packages the deploy chart with placeholder `ci` images, runs `helm lint` and
+`helm template`, and validates the render with strict kubeconform against the
+core and Datree CRD schemas. `lint` (`actionlint` with `runner_policy: fleet`),
+`techdocs` and `agents-md` are the existing gates, called from the same commit.
+It builds no image and pushes nothing.
+
+`parity_kustomize_dir` exists for cutover only. When set, `render` also builds
+that kustomize tree and `scripts/wacd-parity.py` compares the two renders
+object by object, failing on any difference its normalization does not cover
+(namespaces, object labels, image tags and digests, and port names are the
+covered ones). The normalization is ported from lab's `tests/wac_app/render.py`
+and is the one copy outside lab. The caller removes the input at cutover step
+3, when `deploy/k8s` is deleted.
+
+### wac-cd
+
+```yaml
+name: cd
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published version to roll back to, X.Y.Z
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  wac-cd:
+    uses: willfell/wac.lab.actions/.github/workflows/wac-cd.yml@v1.24.0
+    permissions:
+      contents: write
+      id-token: write
+      packages: read
+    with:
+      runner: ${{ vars.CI_RUNNER_STANDARD }}
+      rollback_version: ${{ inputs.version }}
+```
+
+**The caller file must be `.github/workflows/cd.yml`.** The gateway admits a
+release only from that caller file on `refs/heads/main`, for a `push` or
+`workflow_dispatch` event, whose job workflow ref is exactly
+`willfell/wac.lab.actions/.github/workflows/wac-cd.yml@refs/tags/vX.Y.Z`. That
+is why the gateway call is a job in `wac-cd.yml` itself rather than a step in
+the caller's own workflow: such a step would carry the caller's identity, and
+the gateway used
+to deny every reusable-workflow identity before it learned to admit exactly
+this one. It also means this repository cannot be transferred out of
+`willfell` or renamed until the gateway's policy names the new ref first;
+otherwise every app's next release is denied.
+
+The calling job grants `contents: write` (the tag and the GitHub Release),
+`id-token: write` (the gateway's OIDC token) and `packages: read` (private npm
+packages during the build), and declares no `environment`: the gateway rejects
+a token that carries that claim. The trigger is a push to `main` plus a
+`workflow_dispatch` whose own `version` input is passed as `rollback_version`;
+on a push that input is empty.
+
+| Input | Meaning | Default |
+| --- | --- | --- |
+| `runner` | `runs-on` label for every job, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
+| `version_source` | `commits` computes the version from conventional commits; `caller` takes it from `version` | `commits` |
+| `version` | the caller-computed bare `X.Y.Z` with `version_source: caller`; empty means no release | empty |
+| `rollback_version` | a published version to release again; only on `workflow_dispatch` | empty |
+| `deploy` | `false` publishes the images, chart and tag without releasing them | `true` |
+| `build_args` | newline-separated `KEY=VALUE` build args passed to every image build | empty |
+| `wait_timeout` | seconds to wait for the gateway's release proof | `2100` |
+
+| Secret | Meaning |
+| --- | --- |
+| `npm_token` | optional token for private npm packages; empty uses the job's GitHub token |
+
+| Output | Meaning |
+| --- | --- |
+| `mode` | `release`, `publish`, `resume`, `rollback` or `none` |
+| `version` | the released or published version, bare `X.Y.Z` |
+| `tag` | the git tag for that version |
+| `images` | JSON map of the built images with digests; empty on resume and rollback |
+
+The jobs are `plan`, `build`, `publish`, `deploy` and `github-release`,
+serialized per repository by a concurrency group that never cancels a run in
+progress. A cancelled release is worse than a queued one. The group does not
+queue every run, though: GitHub keeps at most one pending run per group, so a
+newer pending run replaces an older one that has not started. For pushes that
+is harmless, because the later push's version covers the earlier commits. A
+replaced rollback dispatch never runs, so check that a rollback started before
+walking away from it.
+
+**Versions.** `plan` finds the latest tag `<tag_prefix>X.Y.Z` reachable from
+HEAD and reads the commits since it: any breaking change (`type!:` or a
+`BREAKING CHANGE:` footer) is a major, any `feat` is a minor, and anything else
+is a patch. A repo with no such tag releases `0.1.0`. Every merge to `main`
+releases. The one version is the image tag, the deploy chart version, the git
+tag suffix and the GitHub Release name. Baton keeps its own version rules, so
+it passes `version_source: caller` and its computed `version`; an empty
+`version` there is a `none` run that ends green. A computed tag that already
+exists on another commit fails the plan.
+
+**Modes.**
+
+| Mode | When | Runs |
+| --- | --- | --- |
+| `release` | a new version on a push | build, publish, deploy, github-release |
+| `publish` | a new version with `deploy: false` | build, publish |
+| `release` | HEAD already carries a `<tag_prefix>X.Y.Z` tag, but its deploy chart is not in the registry | build, publish, deploy, github-release |
+| `publish` | the same, with `deploy: false` | build, publish |
+| `resume` | HEAD already carries a `<tag_prefix>X.Y.Z` tag and its deploy chart is published from this SHA | deploy, github-release |
+| `rollback` | `workflow_dispatch` with `rollback_version` | deploy, github-release |
+| `none` | `version_source: caller` with no version, or a tagged HEAD whose chart is published, with `deploy: false` | nothing |
+
+`deploy: false` is publish-only, used for cutover step 1: the old route still
+deploys while `wac-cd` publishes the first deploy chart so Lab can register the
+app at that version. `rollback_version` with `deploy: false` fails.
+
+**A tag means "published"; a GitHub Release means "ran".** `publish` pushes
+the deploy chart and then the git tag in the same step, so a version whose
+rollout fails is still tagged, and the next merge computes the next version
+rather than this one again. `github-release` runs after any successful
+deploy, in every mode that deploys, and creates the Release for the tag if it
+is missing, with generated notes. It never edits one that exists, so a resume
+or rollback leaves the original Release as it was.
+
+**Resume.** A run whose HEAD already carries a release tag checks the
+registry for that version's deploy chart. When the chart is there, recorded
+from this push's SHA, the run skips build and publish and releases that
+version. That is how a run whose rollout failed after the tag is finished:
+re-run it. A chart recorded from another SHA fails the plan.
+
+When the chart is absent, the run builds and publishes that same version
+(`release`, or `publish` with `deploy: false`), with this push's SHA as the
+expected SHA: the image and chart state checks accept an empty registry, and
+the tag step accepts a tag already on this SHA. That is the recovery after a
+cluster rebuild empties the registry: re-run `wac-cd` for the commit carrying
+the latest tag. It also covers cutover: a HEAD tagged by the app's old
+pipeline, which never published a deploy chart, publishes one on its first
+`wac-cd` run instead of failing.
+
+**No downgrade by re-run.** "Re-run failed jobs" on an older run skips `plan`
+and reuses its mode, so a run that tagged V and failed at deploy, re-run after
+a later merge released V+1, would put V back. Before its `release` request,
+`deploy` asks the gateway for `status` once (retrying only 503, within
+`wait_timeout`), and when the running `version` is a strict `X.Y.Z` newer than
+the version being released, it fails naming both and pointing at a rollback
+dispatch. A rollback skips that refusal; an equal, older or non-`X.Y.Z`
+running version (the bootstrap tag before the first release) proceeds.
+
+**Rollback** is a `workflow_dispatch` of `cd.yml` with `version`. `plan` reads
+the chart's recorded revision and requires it to be an ancestor of `main`;
+build and publish are skipped and the chart that already exists is released
+again, expecting its own revision at the health check. A version not in the
+registry fails the plan before any gateway call. Rollback is supported only
+back to the last release that added a database migration: there are no down
+migrations, and an older image meeting a newer schema is the app's to refuse.
+Nothing in `wac-cd` or the gateway enforces that limit; the `wacd:release`
+skill states it before rolling back.
+
+**Proof.** `deploy` reads the image map back from the published chart, so
+release, resume and rollback take one path, and asks the gateway to `release`
+the version. The gateway pins the Application to the chart's manifest digest
+and requests a sync; `wac-cd` then polls `status` until the Application is
+Synced at that digest and Healthy with automated sync on, every Deployment has
+observed its generation with every replica updated, ready and available, and
+every Deployment image naming one of this release's repositories is exactly
+`localhost:30500/<name>:<version>@<digest>`, with at least one such image. A
+cron-only image never appears in a Deployment, which that rule allows. The
+gateway receipt is uploaded as
+the artifact `wac-cd-release-<version>`. Last, `health_url` must serve the
+expected source SHA (and `db: ok`, unless `health_expect_db_ok` is `false`)
+within a fixed 300 seconds.
+
+### Where releases live
+
+The deploy chart is pushed to
+`oci://registry.network.svc.cluster.local:5000/deploy/<app>:<version>`: the
+`wac-app` chart at `chart_version` vendored as a dependency, the app's values
+nested under it, and `appVersion` equal to the version. Its `Chart.yaml`
+carries two annotations the gateway reads back from the Helm config blob:
+`org.opencontainers.image.revision` (the source SHA) and `wacwini.com/images`
+(the space-separated image references, sorted by name). A published chart
+version is never overwritten.
+
+Images are built once per version and pushed through the push address, then
+recorded and pulled as `localhost:30500/<name>:<version>@<digest>`. These are
+the same two addresses as in [lab-gitops-deploy](#the-registry-split), and
+they are never collapsed into one: the push address is the fully qualified
+in-cluster name a runner pod resolves, and the pull address is the registry's
+NodePort as the node itself sees it, which no public domain can shadow. Each
+image is labelled with `org.opencontainers.image.revision`, and the
+source SHA is also passed as the image's `sha_build_arg` when it has one.
+
+Image builds need BuildKit, because the npm token reaches the build as a
+`--secret` (`id=node_auth_token`), never as a build arg that would be baked
+into a layer.
+
+### When a run fails before the tag
+
+If a run fails after images or the chart were pushed but before the tag was,
+re-run that same run. Both state checks accept an image or chart already
+published from this run's SHA and carry on to the tag. A different commit that
+computes the same version fails at the image or chart state check instead,
+naming both SHAs, because a version is never rebuilt from other source.
+
+Re-running the original run is the fix. The stuck version has no tag, and the
+next version is computed from the latest tag, so later commits keep computing
+it again. A different commit escapes only when its bump class is higher than
+the stuck version's: a `feat` past a stuck patch, or a breaking change past a
+stuck patch or minor. Nothing moves past a stuck major except re-running the
+original run.
+
 ## lab-release
 
 Planned for v1.17.0. This component requires Lab's activated scoped deployment

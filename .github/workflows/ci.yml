@@ -16,7 +16,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +40,24 @@ jobs:
           python scripts/tests/ci-release.test.py
           python scripts/tests/runner-policy.test.py
           python scripts/tests/lab-route.test.py
+          python .github/scripts/test_reusable_workflows.py
+
+      - name: Install helm
+        env:
+          HELM_VERSION: v3.16.3
+        run: bash scripts/install-tools.sh helm
+
+      - name: Run the wacd script tests
+        env:
+          WACD_REQUIRE_HELM: "1"
+        run: |
+          helm version
+          python scripts/tests/wacd-profile.test.py
+          python scripts/tests/wacd-version.test.py
+          python scripts/tests/wacd-chart.test.py
+          python scripts/tests/wacd-release.test.py
+          python scripts/tests/wacd-parity.test.py
+          python scripts/tests/wacd-tag.test.py
 
       - name: Run the script tests
         run: |
