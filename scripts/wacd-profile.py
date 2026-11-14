@@ -26,6 +26,7 @@ HEALTH_URL = re.compile(
 IMAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 BUILD_ARG = re.compile(r"[A-Z_][A-Z0-9_]*")
 VERSION = re.compile(r"[0-9]+(\.[0-9]+){0,2}")
+APT_PACKAGE = re.compile(r"[a-z0-9][a-z0-9.+-]*")
 
 TOP_REQUIRED = (
     "schema_version",
@@ -41,7 +42,7 @@ TOP_OPTIONAL = ("health_expect_db_ok",)
 IMAGE_REQUIRED = ("name", "dockerfile", "context")
 IMAGE_OPTIONAL = ("sha_build_arg",)
 CI_REQUIRED = ("stack", "commands")
-CI_OPTIONAL = ("node_version", "go_version")
+CI_OPTIONAL = ("node_version", "go_version", "apt_packages")
 
 
 class ProfileError(Exception):
@@ -131,6 +132,21 @@ def check_ci(ci, path):
             fail(here, "must be a non-empty string")
         if "\n" in command or "\r" in command:
             fail(here, "must be a single line")
+    if "apt_packages" in ci:
+        check_apt_packages(ci["apt_packages"], f"{path}.apt_packages")
+
+
+def check_apt_packages(packages, path):
+    """Debian package names only, so wac-ci can pass them to apt-get as words."""
+    if not isinstance(packages, list) or not packages:
+        fail(path, "must be a non-empty list")
+    seen = set()
+    for i, package in enumerate(packages):
+        here = f"{path}[{i}]"
+        check_pattern(package, here, APT_PACKAGE, "a Debian package name such as g++")
+        if package in seen:
+            fail(here, f"duplicate package {package!r}")
+        seen.add(package)
 
 
 def validate(data, repo_root):
@@ -185,6 +201,7 @@ def outputs(data):
         f"health_expect_db_ok={'true' if expect_db else 'false'}",
         f"images={json.dumps(data['images'], **compact)}",
         f"ci={json.dumps(data['ci'], **compact)}",
+        f"apt_packages={' '.join(data['ci'].get('apt_packages', []))}",
     ]
 
 

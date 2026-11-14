@@ -53,6 +53,15 @@ jobs:
         id: profile
         shell: bash
         run: python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+      - name: Install the profile's apt packages
+        if: steps.profile.outputs.apt_packages != ''
+        shell: bash
+        env:
+          APT_PACKAGES: ${{ steps.profile.outputs.apt_packages }}
+        run: |
+          read -ra packages <<< "$APT_PACKAGES"
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
       - name: Read the node package layout
         id: layout
         if: fromJSON(steps.profile.outputs.ci).stack == 'node'

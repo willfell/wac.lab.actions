@@ -1013,7 +1013,8 @@ nothing.
 | `health_url` | an in-cluster `http://<host>.svc.cluster.local[:port]/<path>` URL |
 | `health_expect_db_ok` | optional JSON boolean, default `true`; `false` checks only the served `sha` |
 | `images` | a non-empty list of `{name, dockerfile, context, sha_build_arg?}`; `name` matches `^[a-z0-9][a-z0-9._-]{0,63}$` and is unique; `dockerfile` and `context` are repo-relative paths as above; optional `sha_build_arg` is an upper-case build arg name that receives the source SHA |
-| `ci` | `{stack, node_version?, go_version?, commands}`; `stack` is `node` or `go`; the matching version (`22`, `1.24`) is required and the other is refused; `commands` is a non-empty list of single-line commands |
+| `ci` | `{stack, node_version?, go_version?, commands, apt_packages?}`; `stack` is `node` or `go`; the matching version (`22`, `1.24`) is required and the other is refused; `commands` is a non-empty list of single-line commands |
+| `ci.apt_packages` | optional; a non-empty list of unique Debian package names, each matching `^[a-z0-9][a-z0-9.+-]*$`, that `wac-ci`'s `checks` job installs before anything else; omit it rather than writing `[]` |
 
 The values file sets `name`, `image` and everything else the `wac-app` chart
 takes. It never sets `app`, `images` or `global`: `wac-cd` writes `app` from the
@@ -1051,7 +1052,19 @@ It runs five jobs. `checks` sets up node or go for `ci.stack` and runs
 `npm ci` first, but only when the repo has a root `package.json`; a repo
 without one, such as finance, lists `npm ci --prefix <dir>` in `ci.commands`
 itself. The npm cache is keyed on every `package-lock.json` in the repo.
-Nothing implicit runs for `go`. `render` pulls `wac-app` at `chart_version`,
+Nothing implicit runs for `go`. When the profile lists `ci.apt_packages`,
+`checks` first runs `sudo apt-get update` and
+`sudo apt-get install -y --no-install-recommends` with those packages, before
+setup-node, the root `npm ci` and `ci.commands`; a profile without the field
+installs nothing. This is for dependencies that compile natively on install:
+finance lists `["python3", "make", "g++"]` because `better-sqlite3` builds
+with node-gyp, which stops at `not found: make` on a runner image without
+them. The list reaches the shell only as the validator's space-separated
+`apt_packages` output, never as interpolated profile JSON, and the name
+pattern admits no whitespace, quote or shell metacharacter. `wac-cd` installs
+nothing: it builds images with `docker build`, so a native toolchain belongs
+in the Dockerfile. It does validate the same profile, so a repo that sets
+`ci.apt_packages` pins both workflows at a tag that knows the field. `render` pulls `wac-app` at `chart_version`,
 packages the deploy chart with placeholder `ci` images, runs `helm lint` and
 `helm template`, and validates the render with strict kubeconform against the
 core and Datree CRD schemas. `lint` (`actionlint` with `runner_policy: fleet`),
