@@ -16,10 +16,9 @@ default-branch pins; an open bump PR does not change a row.
 baton's `deploy.yml` was deleted at its cutover, so none of them has such rows;
 `baton` keeps `lab-kubeconform`, `actionlint`, `agents-md` and `techdocs` in
 `ci.yml` at `v1.27.0`. The other wacwini repositories were bumped to `v1.28.0`
-on 2026-11-17, and `wac.lab` then to `v1.29.0` (wacwini/wac.lab#549), except
-`wac.fantasy`, which stays at `v1.22.0`: its bump PR
-(wacwini/wac.fantasy#2) is open because its `techdocs / gate` fails on its
-default branch as well. jack-creek-patch's default branch is `dev`, which is
+on 2026-11-17, and `wac.lab` then to `v1.29.0` (wacwini/wac.lab#549).
+`wac.fantasy` took its bump (wacwini/wac.fantasy#2) after wacwini/wac.fantasy#3
+fixed its nav for the `techdocs / gate`. jack-creek-patch's default branch is `dev`, which is
 what this table records. `sauce` lives at `wacwini/sauce` and still pins
 `v1.10.5`; the personal `willfell` repositories (`ero-copilot-iac`,
 `homebrew-sauce`, `mac-config`) pin older tags and are listed as they are.
@@ -43,7 +42,7 @@ wacwini/wac.lab `.github/workflows/warehouse-image.yml` and
 | `actionlint` | wacwini/wac.app.flights | `.github/workflows/ci.yml` | `v1.28.0` |
 | `actionlint` | wacwini/wac.app.handbook | `.github/workflows/ci.yml` | `v1.28.0` |
 | `actionlint` | wacwini/wac.docs | `.github/workflows/ci.yml` | `v1.28.0` |
-| `actionlint` | wacwini/wac.fantasy | `.github/workflows/ci.yml` | `v1.22.0` |
+| `actionlint` | wacwini/wac.fantasy | `.github/workflows/ci.yml` | `v1.28.0` |
 | `actionlint` | wacwini/wac.lab | `.github/workflows/ci.yml` | `v1.29.0` |
 | `actionlint` | wacwini/wac.lab.iac | `.github/workflows/tofu-plan.yml` | `v1.28.0` |
 | `actionlint` | wacwini/wac.lab.remote | `.github/workflows/ci.yml` | `v1.28.0` |
@@ -59,7 +58,7 @@ wacwini/wac.lab `.github/workflows/warehouse-image.yml` and
 | `agents-md` | wacwini/wac.app.flights | `.github/workflows/ci.yml` | `v1.28.0` |
 | `agents-md` | wacwini/wac.app.handbook | `.github/workflows/ci.yml` | `v1.28.0` |
 | `agents-md` | wacwini/wac.docs | `.github/workflows/ci.yml` | `v1.28.0` |
-| `agents-md` | wacwini/wac.fantasy | `.github/workflows/ci.yml` | `v1.22.0` |
+| `agents-md` | wacwini/wac.fantasy | `.github/workflows/ci.yml` | `v1.28.0` |
 | `agents-md` | wacwini/wac.lab | `.github/workflows/ci.yml` | `v1.29.0` |
 | `agents-md` | wacwini/wac.lab.iac | `.github/workflows/ci.yml` | `v1.28.0` |
 | `agents-md` | wacwini/wac.lab.remote | `.github/workflows/ci.yml` | `v1.28.0` |
@@ -88,7 +87,7 @@ wacwini/wac.lab `.github/workflows/warehouse-image.yml` and
 | `techdocs` | wacwini/wac.app.flights | `.github/workflows/ci.yml` | `v1.28.0` |
 | `techdocs` | wacwini/wac.app.handbook | `.github/workflows/ci.yml` | `v1.28.0` |
 | `techdocs` | wacwini/wac.docs | `.github/workflows/ci.yml` | `v1.28.0` |
-| `techdocs` | wacwini/wac.fantasy | `.github/workflows/ci.yml` | `v1.22.0` |
+| `techdocs` | wacwini/wac.fantasy | `.github/workflows/ci.yml` | `v1.28.0` |
 | `techdocs` | wacwini/wac.lab | `.github/workflows/ci.yml` | `v1.29.0` |
 | `techdocs` | wacwini/wac.lab.iac | `.github/workflows/ci.yml` | `v1.28.0` |
 | `techdocs` | wacwini/wac.lab.remote | `.github/workflows/ci.yml` | `v1.28.0` |
