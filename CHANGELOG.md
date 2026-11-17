@@ -17,8 +17,8 @@ Reading the table:
 
   | Path | Components |
   |---|---|
-  | `scripts/install-tools.sh` | `lab-build`, `lab-deploy`, `lab-gitops-deploy`, `lab-kubeconform`, `lab-tools`, `wac-ci`, `wac-cd` |
-  | `scripts/argo-await-sync.sh` | `lab-gitops-deploy` |
+  | `scripts/install-tools.sh` | `lab-kubeconform`, `lab-tools`, `wac-ci`, `wac-cd` |
+  | `scripts/validate-kustomize.sh`, `scripts/schema-api-proxy.py` | `lab-kubeconform` |
   | `scripts/check-docs-nav.sh` | `techdocs` |
   | `scripts/agents-md.py`, `agents-md/` | `agents-md` |
   | `scripts/runner-policy.py` | `actionlint` |
@@ -36,6 +36,7 @@ Reading the table:
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.30.0` | 2026-11-17 | `lab-build`, `lab-deploy`, `lab-gitops-deploy` | removes `lab-build`, `lab-deploy` and `lab-gitops-deploy`, which no maintained repository pins since the wacd cutover (the archived egnyte-mcp keeps its `v1.7.0` pins under the old repository path, and they still resolve), together with `scripts/argo-await-sync.sh`. A caller still using one of them must stay on `v1.29.0` or earlier, or move to `wac-ci` and `wac-cd`, before bumping. No other component changes and no fleet-rule changes |
 | `v1.29.0` | 2026-11-16 | `lab-release`, `lab-gitops-deploy` | the gateway's retired pin route loses its client (wac.lab #544 stopped accepting `status`, `sync` and `pin_sha`). `lab-release` drops the `pin_sha`, `expected_image` and `min_replicas` inputs, and `operation` accepts only `migrate`; a caller still passing a removed input gets GitHub's unexpected-input warning and a `status` or `sync` call fails before any request. The `migrate` call (wac.lab `warehouse-image.yml`: `operation`, `wait_timeout`, `image_tag`, `image_digest`) is unchanged. `lab-gitops-deploy` drops the `authorization` input and its `oidc` route; its Kubernetes route is byte-identical to `v1.16.0`, and no consumer pins it. `scripts/ci-release.py` changed, but every name `wac-cd` loads from it is byte-identical, so `wac-cd` is not listed. No fleet-rule changes |
 | `v1.28.0` | 2026-11-13 | `wac-ci`, `wac-cd` | new optional profile field `ci.go_version_file` for `stack: go`, in place of `ci.go_version`: a repo-relative file (`go.mod`, `go.work`, `.go-version`, `.tool-versions`) that `wac-ci`'s `checks` passes to setup-go as `go-version-file`. A go profile sets exactly one of the two; the file must exist, and the field is refused for `stack: node`. Profiles without it are unchanged; `schema_version` stays `1`. `wac-cd` validates the same profile, so a profile that sets the field needs both pins at `v1.28.0` or later. No fleet-rule changes |
 | `v1.27.0` | 2026-11-13 | `wac-cd` | the release tag is now pushed by `plan` as soon as the version is decided, before any image is built; `publish` still runs the same push and accepts the tag already on its commit. A `release` or `publish` run whose tag push GitHub refuses (a `GITHUB_TOKEN` cannot push a ref at a commit whose workflow files differ from `main`'s, which happens when a pin bump merges while the run is queued) now checks `main`: if `main` has moved on, the run is superseded, reports mode `none` with a summary line, builds and publishes nothing and ends green, and the newer run releases its commits; if the commit is still `main`'s tip, the plan fails. A caller can notice a tag that exists before its images and chart do, a skipped version when a failed run is not re-run, and `none` from a run that used to fail at publish. The plan job now asks for `contents: write`, which callers already grant. No input, output or fleet-rule changes |

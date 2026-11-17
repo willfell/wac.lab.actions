@@ -41,6 +41,7 @@ jobs:
           python scripts/tests/runner-policy.test.py
           python scripts/tests/lab-route.test.py
           python .github/scripts/test_reusable_workflows.py
+          python .github/scripts/test_docs.py
 
       - name: Install helm
         env:
@@ -61,7 +62,6 @@ jobs:
 
       - name: Run the script tests
         run: |
-          bash scripts/tests/argo-await-sync.test.sh
           bash scripts/tests/helm-install.test.sh
 
       - uses: astral-sh/setup-uv@v5

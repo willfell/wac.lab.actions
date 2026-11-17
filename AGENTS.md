@@ -1,11 +1,12 @@
 # wac.lab.actions
 
-The fleet's shared CI library, catalog Component `lab-actions`: ten composite
+The fleet's shared CI library, catalog Component `lab-actions`: seven composite
 GitHub Actions and seven reusable workflows that the other repos' workflows call
 at exact tags. It has no runtime. It builds no image, deploys nothing, and runs
 no service; every effect it has happens inside someone else's CI. It is public
 on purpose: callers supply credentials as inputs or through GitHub's native job
-authentication environment, and the gates can check it out without a token.
+authentication environment, and the reusable workflows can check it out without
+a token.
 
 ## The one thing to understand
 
@@ -16,41 +17,37 @@ whose code is byte-identical between the two tags. So a change here is only
 shipped when three things have happened: it merged, a human cut the tag, and
 each affected consumer took a bump PR.
 
-What makes that walk possible is two files. `CHANGELOG.md` names the
-**components** (not paths) each tag changed, so a consumer can tell a real bump
-from a no-op; its row goes in the PR that makes the change, never at tag time.
-`CONSUMERS.md` lists every repo, file and pin, so the bump walk knows where to
-go. A change under `scripts/` changes whichever component runs that script, which
-is why the changelog speaks in components.
-
-Nothing stands between a broken component and a consumer's red pipeline except
-the checks in this repo's own CI. A malformed `action.yml` is not caught here at
-review; it is caught when someone else's deploy fails to start.
+`CHANGELOG.md` names the **components** (not paths) each tag changed, and its
+row goes in the PR that makes the change. `CONSUMERS.md` lists every repo, file
+and pin, so the bump walk knows where to go. Nothing stands between a broken
+component and a consumer's red pipeline except this repo's own CI.
 
 ## Commands
 
 ```sh
-python3 .github/scripts/check_actions.py  # needs PyYAML and shellcheck on PATH
-uv run --with pyyaml python .github/scripts/check_actions.py  # the same, without installing PyYAML
-shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
-bash scripts/tests/argo-await-sync.test.sh  # lab-gitops-deploy's Argo wait, against a fake kubectl
-python3 scripts/tests/runner-policy.test.py  # fleet routing and legacy compatibility
-python3 scripts/tests/lab-route.test.py  # lab-route decisions, against a stub Prometheus
-uv run --with pyyaml python scripts/tests/ci-release.test.py  # lab-release's migrate client and the transport wac-cd loads
+uv run --with pyyaml python .github/scripts/check_actions.py  # structural rules for every action and reusable workflow; needs shellcheck
 uv run --with pyyaml python .github/scripts/test_reusable_workflows.py  # check_actions rules for nested calls and shared checkouts
-python3 scripts/tests/wacd-profile.test.py  # the wacd.json profile validator
-python3 scripts/tests/wacd-version.test.py  # version planning, against temp git repos
-WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-chart.test.py  # deploy chart packaging and registry reads; needs helm
+uv run --with pyyaml python .github/scripts/test_workflow_identity.py  # the gates' job.workflow_sha checkout
+uv run --with pyyaml python .github/scripts/test_docs.py  # reference pages, owner table and overviews match the components
+shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
+python3 scripts/tests/schema-api-proxy.test.py  # lab-kubeconform's schema fallback
+bash scripts/tests/validate-kustomize.test.sh  # lab-kubeconform end to end; needs kustomize and kubeconform
+bash scripts/tests/helm-install.test.sh  # install-tools.sh's helm path, against a fake curl
+uv run --with pyyaml python scripts/tests/ci-release.test.py  # lab-release's client and the names wac-cd and wac.lab load from it
+python3 scripts/tests/runner-policy.test.py  # actionlint's fleet runner policy
+python3 scripts/tests/lab-route.test.py  # lab-route, against a stub Prometheus
+python3 scripts/tests/wacd-profile.test.py  # the wacd.json validator
+python3 scripts/tests/wacd-version.test.py  # wac-cd version planning, against temp git repos
+WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-chart.test.py  # deploy chart packaging; needs helm
 python3 scripts/tests/wacd-release.test.py  # wac-cd's gateway client, against a stub gateway
 uv run --with pyyaml python scripts/tests/wacd-parity.test.py  # kustomize and Helm render parity
 python3 scripts/tests/wacd-tag.test.py  # wac-cd's tag push, against a local bare remote
-bash scripts/tests/agents-md.test.sh  # the AGENTS.md gate, against fixture repos; needs uv and git
-bash scripts/tests/validate-kustomize.test.sh  # requires kubeconform; schema recovery and strict rejection scenarios
+bash scripts/tests/agents-md.test.sh  # the agents-md gate, against fixture repos; needs uv and git
 uv run scripts/agents-md.py check  # this file against the fleet contract
 uv run scripts/agents-md.py render  # rewrite this file's tail after a catalog or fleet-rules edit
 bash scripts/check-docs-nav.sh mkdocs.yml
 uvx --from mkdocs-techdocs-core==1.6.1 --with mkdocs==1.6.0 mkdocs build --strict --site-dir "$(mktemp -d)/site"
-actionlint  # CI runs it through .github/workflows/actionlint.yml
+actionlint
 ```
 
 Releasing, only when the user asks, after the PR has merged:
@@ -61,42 +58,31 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
 
 ## Layout
 
-- `lab-*/action.yml`: the ten composite actions, one directory each:
-  `lab-build`, `lab-deploy`, `lab-gitops-deploy`, `lab-release`, `lab-kubeconform`,
-  `lab-route`, `lab-tofu-plan`, `lab-tofu-apply`, `lab-tofu-validate`, `lab-tools`.
-- `.github/workflows/`: the reusable workflows `actionlint.yml`,
-  `nextjs-site-check.yml`, `nextjs-site-deploy.yml`, `techdocs.yml`,
-  `agents-md.yml`, `wac-ci.yml` and `wac-cd.yml`, plus `ci.yml`, this repo's
-  own CI, which calls `actionlint`, `techdocs` and `agents-md` on this repo by
-  local path. `wac-ci` and `wac-cd` are the wacd pair, driven by a caller's
-  `.github/wacd.json` profile.
-- `scripts/`: what the components run from their pinned checkout. Owners:
-  `install-tools.sh` is `lab-build`, `lab-deploy`, `lab-gitops-deploy`,
-  `lab-kubeconform`, `lab-tools`, `wac-ci` and `wac-cd`;
-  `wacd-profile.py` and `wacd-chart.py` are `wac-ci` and `wac-cd`;
-  `wacd-parity.py` is `wac-ci`; `wacd-version.py`, `wacd-release.py` and
-  `wacd-tag.py` are `wac-cd`; `ci-release.py` is `lab-release`, and
-  `wac-cd` loads its transport; `argo-await-sync.sh` is
-  `lab-gitops-deploy`; `check-docs-nav.sh` is `techdocs`; `agents-md.py` is
-  `agents-md`; `validate-kustomize.sh` and `schema-api-proxy.py` are
-  `lab-kubeconform`; `runner-policy.py` is `actionlint`; `lab-route.py` is
-  `lab-route`.
-- `agents-md/fleet-rules.md`: the fleet-wide rules every fleet AGENTS.md tail
-  carries verbatim.
-- `scripts/tests/`: scenario tests, run by `ci.yml` and shipped to no consumer.
-  `fixtures/agents-md/` holds fixture repos, with their prose stored as
-  `AGENTS.prose.md` so it is never loaded as instructions.
-- `.github/scripts/check_actions.py`: structural validation of every
-  `action.yml` and reusable workflow. `test_reusable_workflows.py` and
-  `test_workflow_identity.py` beside it test that validation.
-- `.github/actionlint.yaml`: the narrow `job.workflow_sha` ignore each
-  workflow that checks this repo out at its own commit needs.
-- `README.md`: the full reference, per component: inputs, outputs, and the
-  incident history behind each design choice. Read a component's section before
-  changing it.
-- `CHANGELOG.md` and `CONSUMERS.md`: see above.
-- `catalog-info.yaml`, `mkdocs.yml`, `docs/index.md`: the catalog entity and the
-  TechDocs page on docs.wacwini.com.
+Read the page for what you are changing before you change it; each holds the
+inputs, outputs and the incident history behind its design.
+
+| Changing | Code | Read first |
+| --- | --- | --- |
+| `lab-tools` | `lab-tools/`, `scripts/install-tools.sh` | `docs/reference/lab-tools.md` |
+| `lab-kubeconform` | `lab-kubeconform/`, `scripts/validate-kustomize.sh`, `scripts/schema-api-proxy.py` | `docs/reference/lab-kubeconform.md` |
+| `lab-tofu-plan`, `lab-tofu-apply`, `lab-tofu-validate` | `lab-tofu-*/` | `docs/reference/opentofu.md` |
+| `lab-route` | `lab-route/`, `scripts/lab-route.py` | `docs/reference/lab-route.md` |
+| `lab-release` | `lab-release/`, `scripts/ci-release.py` | `docs/reference/lab-release.md` |
+| `actionlint` | `.github/workflows/actionlint.yml`, `scripts/runner-policy.py` | `docs/reference/actionlint.md` |
+| `techdocs` | `.github/workflows/techdocs.yml`, `scripts/check-docs-nav.sh` | `docs/reference/techdocs.md` |
+| `agents-md` | `.github/workflows/agents-md.yml`, `scripts/agents-md.py`, `agents-md/fleet-rules.md` | `docs/reference/agents-md.md` |
+| `nextjs-site-check`, `nextjs-site-deploy` | `.github/workflows/nextjs-site-*.yml` | `docs/reference/nextjs-site.md` |
+| `wac-ci`, `wac-cd` | `.github/workflows/wac-c[id].yml`, `scripts/wacd-*.py` | `docs/reference/wacd-profile.md`, then `wac-ci.md` or `wac-cd.md` |
+| A reusable workflow's checkout of this repo | the shared-checkout steps | `docs/architecture/shared-checkout.md` |
+| Anything, then releasing it | `CHANGELOG.md` | `docs/guides/releasing.md` |
+
+- A script's components are in the owner table at the top of `CHANGELOG.md`;
+  changing a script changes every component it names.
+- `scripts/tests/` and `.github/scripts/` hold the tests, which ship to no
+  consumer. `ci.yml` is this repo's own CI and calls `actionlint`, `techdocs`
+  and `agents-md` by local path, at the commit under review.
+- `docs/superpowers/` holds the dated wacd specs, plans and handoff: the repo as
+  it was on their date. The reference pages describe it now.
 
 ## Invariants
 
@@ -105,12 +91,13 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    another repo deploys, and `v1` already went stale once.
    `check_actions.py` fails on `@main` or `@master` in any action or reusable
    workflow.
-2. One tag for the whole repo, versioned by the README's rules: patch is a fix
-   that changes no input, output or caller obligation; minor is a new
-   component, a new optional input, or a behaviour change a caller could notice
-   (a new required input is a minor too); major is reserved.
+2. One tag for the whole repo, versioned by `docs/guides/releasing.md`: patch is
+   a fix that changes no input, output or caller obligation; minor is a new or
+   removed component or input, or a behaviour change a caller could notice (a
+   new required input is a minor too); major is reserved.
 3. The `CHANGELOG.md` row lands in the PR that makes the change and names
-   components. README-only and CI-only changes are not releases and get no row.
+   components. README-only, docs-only and CI-only changes are not releases and
+   get no row.
 4. Every reusable workflow declares a `runner` input of `type: string` with
    `default: ''`, and every one of its jobs has
    `runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}`. Its jobs run on the
@@ -126,9 +113,9 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    input has a description; a required input has no default; bash bodies pass
    `shellcheck --severity=warning`. `check_actions.py` enforces all of it.
 6. Credentials arrive as inputs or, for scoped releases, through GitHub's
-   native OIDC job environment. Nothing secret lives here. The `techdocs`
-   and `agents-md` gates check this repo out at `job.workflow_sha`, so a
-   consumer runs the script from the tag it pinned; that needs no token only
+   native OIDC job environment. Nothing secret lives here. The reusable
+   workflows that run this repo's scripts check it out at `job.workflow_sha`, so
+   a consumer runs the scripts from the tag it pinned; that needs no token only
    because the repo is public.
 7. A gate that discovers its own inputs fails when it discovers none, rather
    than passing vacuously: `lab-tofu-validate` with zero roots,
@@ -136,18 +123,22 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    with no Component in the catalog or no command in `## Commands`. The
    documented exception is `techdocs`: its `detect` job skips a repo with no
    `mkdocs.yml`, so the workflow can be wired in before the docs exist.
-8. `lab-gitops-deploy` keeps `push_registry` and `pull_registry` as two
-   addresses, verifies the served build against the source sha (never the bump
-   sha), and marks its pin commit `[skip ci]`. The README's `lab-gitops-deploy`
-   section explains each.
+8. `wac-cd` pushes to `registry.network.svc.cluster.local:5000` and records and
+   pulls as `localhost:30500`, two addresses for one registry that are never
+   collapsed into one, and verifies the served build against the source SHA it
+   built. `docs/reference/wac-cd.md` ("The registry split") explains why.
 9. The OpenTofu actions keep `tofu_wrapper: false`; `lab-tofu-apply` applies the
-   plan file the plan step wrote, never a fresh plan; guard logic stays in the
+   plan file it wrote and guarded, never a fresh plan; guard logic stays in the
    consuming repo, passed in as `guard_command`.
 10. The gateway admits `wac-cd` only as the job workflow ref
     `willfell/wac.lab.actions/.github/workflows/wac-cd.yml@refs/tags/vX.Y.Z`
     called from a caller file named `.github/workflows/cd.yml`, so the gateway
     call stays a job in `wac-cd.yml` itself and this repo cannot be renamed or
     transferred without a gateway change first.
+11. Each component's inputs, secrets and outputs are documented in one place,
+    its `docs/reference/` page, and `test_docs.py` fails when that page, the
+    `CHANGELOG.md` owner table, `README.md`, `docs/index.md` or this file's
+    Layout falls out of step with the components.
 
 ## Boundaries
 
@@ -159,26 +150,9 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
   The bump walk is its own task, driven by `CHANGELOG.md` and `CONSUMERS.md`.
 - `CONSUMERS.md` records what consumers actually pin on their default
   branches. Change it from those repos' state, never from intent.
-- Do not hand-edit this file from `## Dependencies` on. Edit
-  `catalog-info.yaml` or `agents-md/fleet-rules.md` and run `render`. A
-  fleet-rules change fails every consumer's gate at its next bump until that
-  consumer re-renders; that is intended, and the CHANGELOG row must say so.
-- No `CLAUDE.md` or `CLAUDE.local.md` anywhere in the tree, fixtures included.
-  The tests that need one create it in a temp dir.
-- `scripts/tests/fixtures/` are test inputs. Changing one changes what the
-  tests prove, so change it only alongside the test that relies on it.
-
-`lab-release` runs Lab's warehouse `migrate` through `scripts/ci-release.py`
-against Lab's fixed TLS service; that is the only operation the gateway still
-takes from it, since wac.lab #544 retired the `status`/`sync` pin route and
-`v1.29.0` removed its client, including `lab-gitops-deploy`'s former
-`authorization: oidc` route. Direct release jobs need `id-token: write` and the
-public runner trust mount. The service derives Kubernetes targets from
-repository identity. The client never falls back to a Kubernetes token or
-unverified TLS. `scripts/wacd-release.py` and wac.lab's `ci-deploy-proof.py`
-load `ci-release.py` by path for its transport, so its exported names are a
-contract with `wac-cd` and wac.lab. The client scenario gate is
-`python scripts/tests/ci-release.test.py`.
+- `scripts/ci-release.py` is loaded as a module by `wacd-release.py` and by
+  wac.lab's `ci-deploy-proof.py`; keep the names its test pins.
+- Do not hand-edit this file from `
 
 ## Dependencies
 
