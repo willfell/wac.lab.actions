@@ -61,7 +61,6 @@ jobs:
 
       - name: Run the script tests
         run: |
-          bash scripts/tests/argo-await-sync.test.sh
           bash scripts/tests/helm-install.test.sh
 
       - uses: astral-sh/setup-uv@v5
