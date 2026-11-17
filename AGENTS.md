@@ -36,6 +36,7 @@ shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
 bash scripts/tests/argo-await-sync.test.sh  # lab-gitops-deploy's Argo wait, against a fake kubectl
 python3 scripts/tests/runner-policy.test.py  # fleet routing and legacy compatibility
 python3 scripts/tests/lab-route.test.py  # lab-route decisions, against a stub Prometheus
+uv run --with pyyaml python scripts/tests/ci-release.test.py  # lab-release's migrate client and the transport wac-cd loads
 uv run --with pyyaml python .github/scripts/test_reusable_workflows.py  # check_actions rules for nested calls and shared checkouts
 python3 scripts/tests/wacd-profile.test.py  # the wacd.json profile validator
 python3 scripts/tests/wacd-version.test.py  # version planning, against temp git repos
@@ -74,7 +75,8 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
   `lab-kubeconform`, `lab-tools`, `wac-ci` and `wac-cd`;
   `wacd-profile.py` and `wacd-chart.py` are `wac-ci` and `wac-cd`;
   `wacd-parity.py` is `wac-ci`; `wacd-version.py`, `wacd-release.py` and
-  `wacd-tag.py` are `wac-cd`; `argo-await-sync.sh` is
+  `wacd-tag.py` are `wac-cd`; `ci-release.py` is `lab-release`, and
+  `wac-cd` loads its transport; `argo-await-sync.sh` is
   `lab-gitops-deploy`; `check-docs-nav.sh` is `techdocs`; `agents-md.py` is
   `agents-md`; `validate-kustomize.sh` and `schema-api-proxy.py` are
   `lab-kubeconform`; `runner-policy.py` is `actionlint`; `lab-route.py` is
@@ -166,13 +168,17 @@ git tag v<X.Y.Z> && git push origin v<X.Y.Z>
 - `scripts/tests/fixtures/` are test inputs. Changing one changes what the
   tests prove, so change it only alongside the test that relies on it.
 
-`lab-release` and the opt-in `authorization: oidc` route in `lab-gitops-deploy`
-use `scripts/ci-release.py` against Lab's fixed TLS service. Direct release jobs
-need `id-token: write` and the public runner trust mount. The service derives
-Kubernetes targets from repository identity. The action never falls back to a
-Kubernetes token or unverified TLS. Existing GitOps callers retain their default
-route; OIDC callers retain served-source and database health checks. The client
-scenario gate is `python scripts/tests/ci-release.test.py`.
+`lab-release` runs Lab's warehouse `migrate` through `scripts/ci-release.py`
+against Lab's fixed TLS service; that is the only operation the gateway still
+takes from it, since wac.lab #544 retired the `status`/`sync` pin route and
+`v1.29.0` removed its client, including `lab-gitops-deploy`'s former
+`authorization: oidc` route. Direct release jobs need `id-token: write` and the
+public runner trust mount. The service derives Kubernetes targets from
+repository identity. The client never falls back to a Kubernetes token or
+unverified TLS. `scripts/wacd-release.py` and wac.lab's `ci-deploy-proof.py`
+load `ci-release.py` by path for its transport, so its exported names are a
+contract with `wac-cd` and wac.lab. The client scenario gate is
+`python scripts/tests/ci-release.test.py`.
 
 ## Dependencies
 

@@ -1,11 +1,11 @@
-"""Release evidence must fail closed without leaking tokens or skipping health."""
+"""Migration evidence and the shared transport must fail closed without leaking tokens."""
 
 import argparse
-import copy
 import importlib.util
 import os
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -22,99 +22,74 @@ SPEC = importlib.util.spec_from_file_location(
 release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
 SOURCE = "a" * 40
-PIN = "b" * 40
-IMAGE = "localhost:30500/baton:release@sha256:" + "c" * 64
+DIGEST = "sha256:" + "c" * 64
 
 
-def evidence():
+def migrate_args(**overrides):
+    values = {
+        "operation": "migrate",
+        "image_tag": "release",
+        "image_digest": DIGEST,
+        "wait_timeout": 30,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def receipt():
     return {
         "source_sha": SOURCE,
-        "pin_sha": PIN,
-        "sync": {"revision": PIN, "status": "Synced"},
-        "health": {"status": "Healthy"},
-        "deployments": [
-            {
-                "name": "baton",
-                "generation": 2,
-                "replicas": 2,
-                "images": [IMAGE],
-                "status": {
-                    "observedGeneration": 2,
-                    "replicas": 2,
-                    "updatedReplicas": 2,
-                    "readyReplicas": 2,
-                    "availableReplicas": 2,
-                },
-            }
+        "image": "localhost:30500/warehouse:release@" + DIGEST,
+        "run_id": "123",
+        "run_attempt": "2",
+        "succeeded": True,
+        "jobs": [
+            {"target": n, "uid": n + "-uid", "succeeded": True}
+            for n in ["warehouse", "ecosystem"]
         ],
     }
 
 
-class ReleaseTests(unittest.TestCase):
-    def test_exact_revision_image_and_two_ready_replicas(self):
-        value = evidence()
-        self.assertTrue(release.ready(value, PIN, SOURCE, IMAGE, 2))
-        for path, replacement in [
-            (("sync", "revision"), SOURCE),
-            (("health", "status"), "Progressing"),
-        ]:
-            wrong = copy.deepcopy(value)
-            wrong[path[0]][path[1]] = replacement
-            self.assertFalse(release.ready(wrong, PIN, SOURCE, IMAGE, 2))
-        for key in [
-            "observedGeneration",
-            "replicas",
-            "updatedReplicas",
-            "readyReplicas",
-            "availableReplicas",
-        ]:
-            wrong = copy.deepcopy(value)
-            wrong["deployments"][0]["status"][key] = 1
-            self.assertFalse(release.ready(wrong, PIN, SOURCE, IMAGE, 2))
-        self.assertFalse(release.ready(value, PIN, SOURCE, IMAGE + "wrong", 2))
-        with self.assertRaises(release.ReleaseError):
-            release.ready(value, SOURCE, SOURCE, IMAGE, 2)
+RUN_ENV = {"GITHUB_SHA": SOURCE, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}
 
-    def test_status_without_a_pin_waits_for_the_tagged_image_at_any_revision(self):
-        tagged = "localhost:30500/baton:main-" + SOURCE
-        value = evidence()
-        value["pin_sha"] = ""
-        value["sync"]["revision"] = "d" * 40
-        value["deployments"][0]["images"] = [tagged]
-        self.assertTrue(release.ready(value, "", SOURCE, tagged, 2))
-        self.assertFalse(
-            release.ready(value, "", SOURCE, "localhost:30500/baton:main-" + "e" * 40, 2)
-        )
-        for path, replacement in [
-            (("sync", "status"), "OutOfSync"),
-            (("health", "status"), "Progressing"),
-        ]:
-            wrong = copy.deepcopy(value)
-            wrong[path[0]][path[1]] = replacement
-            self.assertFalse(release.ready(wrong, "", SOURCE, tagged, 2))
-        with self.assertRaises(release.ReleaseError):
-            release.ready(evidence(), "", SOURCE, tagged, 2)
-        args = argparse.Namespace(
-            operation="status", pin_sha="", expected_image=tagged, wait_timeout=30, min_replicas=2
-        )
+
+class ReleaseTests(unittest.TestCase):
+    def test_migrate_sends_only_the_image_identity_and_returns_the_receipt(self):
         with (
-            patch.dict(os.environ, {"GITHUB_SHA": SOURCE}),
+            patch.dict(os.environ, RUN_ENV),
             patch.object(release.ssl, "create_default_context"),
-            patch.object(release, "request", return_value=(200, value)) as request,
+            patch.object(release, "request", return_value=(200, receipt())) as request,
         ):
-            self.assertEqual(release.run(args), value)
-            self.assertEqual(request.call_args.args[0], {"operation": "status"})
-        for operation, image in [
-            ("sync", tagged),
-            ("status", ""),
-            ("status", "localhost:30500/baton:main-" + "e" * 40),
-            ("status", "localhost:30500/baton:latest"),
-        ]:
-            args = argparse.Namespace(
-                operation=operation, pin_sha="", expected_image=image, wait_timeout=30, min_replicas=2
+            self.assertEqual(release.run(migrate_args()), receipt())
+            self.assertEqual(
+                request.call_args.args[0],
+                {"operation": "migrate", "image_tag": "release", "image_digest": DIGEST},
             )
+
+    def test_busy_service_is_retried_within_the_deadline(self):
+        with (
+            patch.dict(os.environ, RUN_ENV),
+            patch.object(release.ssl, "create_default_context"),
+            patch.object(release.time, "sleep"),
+            patch.object(
+                release,
+                "request",
+                side_effect=[(409, {}), (503, {}), (200, receipt())],
+            ) as request,
+        ):
+            self.assertEqual(release.run(migrate_args()), receipt())
+            self.assertEqual(request.call_count, 3)
+
+    def test_retired_operations_and_bad_images_never_reach_the_service(self):
+        for args in [
+            migrate_args(operation="status"),
+            migrate_args(operation="sync"),
+            migrate_args(image_tag=""),
+            migrate_args(image_tag="-bad"),
+            migrate_args(image_digest="sha256:short"),
+        ]:
             with (
-                patch.dict(os.environ, {"GITHUB_SHA": SOURCE}),
+                patch.dict(os.environ, RUN_ENV),
                 patch.object(release, "request") as request,
             ):
                 with self.assertRaises(release.ReleaseError):
@@ -122,29 +97,15 @@ class ReleaseTests(unittest.TestCase):
                 request.assert_not_called()
 
     def test_migrations_require_both_jobs_and_this_attempt(self):
-        digest = "sha256:" + "c" * 64
-        receipt = {
-            "source_sha": SOURCE,
-            "image": "localhost:30500/warehouse:release@" + digest,
-            "run_id": "123",
-            "run_attempt": "2",
-            "succeeded": True,
-            "jobs": [
-                {"target": n, "uid": n + "-uid", "succeeded": True}
-                for n in ["warehouse", "ecosystem"]
-            ],
-        }
-        with patch.dict(
-            os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}
-        ):
-            release.migrated(receipt, SOURCE, "release", digest)
+        with patch.dict(os.environ, RUN_ENV):
+            release.migrated(receipt(), SOURCE, "release", DIGEST)
             for change in [
                 {"run_attempt": "1"},
                 {"succeeded": False},
-                {"jobs": receipt["jobs"][:1]},
+                {"jobs": receipt()["jobs"][:1]},
             ]:
                 with self.assertRaises(release.ReleaseError):
-                    release.migrated(dict(receipt, **change), SOURCE, "release", digest)
+                    release.migrated(dict(receipt(), **change), SOURCE, "release", DIGEST)
 
     def test_oidc_url_is_https_github_and_audience_is_fixed(self):
         with (
@@ -191,13 +152,7 @@ class ReleaseTests(unittest.TestCase):
                 [c.args[0].headers["Authorization"] for c in fetch.call_args_list],
                 ["Bearer first", "Bearer second"],
             )
-        args = argparse.Namespace(
-            operation="status",
-            pin_sha=PIN,
-            expected_image=IMAGE,
-            wait_timeout=30,
-            min_replicas=2,
-        )
+        args = migrate_args()
         with (
             patch.dict(os.environ, {"GITHUB_SHA": SOURCE}),
             patch.object(release.ssl, "create_default_context"),
@@ -208,13 +163,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(request.call_count, 1)
 
     def test_missing_trust_never_sends_token(self):
-        args = argparse.Namespace(
-            operation="status",
-            pin_sha=PIN,
-            expected_image=IMAGE,
-            wait_timeout=30,
-            min_replicas=2,
-        )
+        args = migrate_args()
         with (
             patch.dict(os.environ, {"GITHUB_SHA": SOURCE}),
             patch.object(
@@ -296,26 +245,49 @@ class ReleaseTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
 
-    def test_oidc_route_skips_kubernetes_but_retains_served_source_proof(self):
-        root = Path(__file__).resolve().parents[2]
-        action = yaml.safe_load((root / "lab-gitops-deploy/action.yml").read_text())
-        self.assertEqual(action["inputs"]["authorization"]["default"], "kubernetes")
-        steps = action["runs"]["steps"]
-        for step in steps:
-            script = step.get("run", "")
-            if "kubectl -n" in script or "argo-await-sync.sh" in script:
-                self.assertIn(
-                    "inputs.authorization == 'kubernetes'", step.get("if", "")
-                )
-        health = next(
-            s
-            for s in steps
-            if s.get("name") == "Verify the running build is the one just built"
-        )
-        self.assertIn("inputs.authorization == 'oidc'", health["if"])
-        self.assertEqual(health["env"]["WANT_SHA"], "${{ github.sha }}")
-        self.assertIn('j.db !== "ok"', health["run"])
+    def test_loaders_find_the_names_they_depend_on(self):
+        for name in ["URL", "CA_FILE", "ReleaseError", "NoRedirect"]:
+            self.assertTrue(hasattr(release, name), name)
+        for name in ["request", "oidc_token", "fetch", "migrated"]:
+            self.assertTrue(callable(getattr(release, name, None)), name)
 
+    def run_action(self, operation):
+        root = Path(__file__).resolve().parents[2]
+        action = yaml.safe_load((root / "lab-release/action.yml").read_text())
+        self.assertEqual(
+            set(action["inputs"]),
+            {"operation", "image_tag", "image_digest", "wait_timeout"},
+        )
+        step = next(s for s in action["runs"]["steps"] if s.get("id") == "release")
+        script = step["run"].replace(
+            "${{ github.action_path }}", str(root / "lab-release")
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory) / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "python").symlink_to(sys.executable)
+            env = {
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "RUNNER_TEMP": directory,
+                "GITHUB_OUTPUT": str(Path(directory) / "output"),
+                "RELEASE_OPERATION": operation,
+                "RELEASE_TAG": "release",
+                "RELEASE_DIGEST": DIGEST,
+                "RELEASE_TIMEOUT": "2700",
+            }
+            return subprocess.run(
+                ["bash", "-c", script], env=env, capture_output=True, text=True
+            )
+
+    def test_action_passes_only_flags_the_client_accepts(self):
+        result = self.run_action("migrate")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Release verification failed", result.stderr)
+
+    def test_action_refuses_a_retired_operation_before_any_request(self):
+        result = self.run_action("sync")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("invalid choice", result.stderr)
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,7 @@ consuming repository.
 | `lab-tofu-apply` | Guard and apply the reviewed plan file on merge |
 | `lab-tofu-validate` | Check formatting and validate every OpenTofu root under a directory, no credentials needed |
 | `lab-tools` | Install the fleet's k8s and registry tooling, arch-aware, onto `PATH` |
-| `lab-release` | Verify fixed migration or deployment receipts with GitHub OIDC and TLS |
+| `lab-release` | Run Lab's warehouse migration through the scoped gateway and verify its receipt with GitHub OIDC and TLS |
 | `lab-gitops-deploy` | Build, push, pin via a kustomize commit-back, sync Argo, verify the served build |
 | `lab-kubeconform` | Validate a kustomize overlay by piping its build through kubeconform |
 | `lab-route` | Send heavy jobs to a Lab runner pool when it has room, and to an overflow label otherwise |
@@ -238,7 +238,6 @@ finance, flight-checker, and wac each carried and drifted independently.
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `authorization` | `kubernetes` for legacy repository runners, `oidc` for the scoped service | `kubernetes` |
 | `image` | Image name, also the default deployment name | required |
 | `extra_images` | Space-separated additional image names pinned to the same sha inside the same deploy commit; empty disables | `""` |
 | `argo_app` | Argo CD Application to sync and wait on | required |
@@ -1308,47 +1307,57 @@ running version.
 
 ## lab-release
 
-Planned for v1.17.0. This component requires Lab's activated scoped deployment
-service and the runner's public `/etc/ci-deploy/ca.crt` mount. It never uses a
-Kubernetes token. The direct release job must grant `id-token: write`; the
-service authorizes the repository ID, current owner, main branch, source SHA
-and trusted workflow. It supports only the first-wave repositories listed in
-[Lab's service contract](https://github.com/wacwini/wac.lab/blob/main/docs/guides/ci-deploy-gateway.md).
-Do not route an existing release here before its live proof and activation gates.
+Runs Lab's warehouse migration through Lab's scoped deployment service and
+verifies its receipt. It requires the activated service and the runner's public
+`/etc/ci-deploy/ca.crt` mount, and never uses a Kubernetes token. The direct
+release job must grant `id-token: write`; the service authorizes the repository
+ID, current owner, main branch, source SHA and trusted workflow, as
+[Lab's service contract](https://github.com/wacwini/wac.lab/blob/main/docs/guides/ci-deploy-gateway.md)
+describes. Its one caller is wac.lab's `warehouse-image.yml`.
+
+```yaml
+- uses: willfell/wac.lab.actions/lab-release@v1.29.0
+  with:
+    operation: migrate
+    wait_timeout: "2700"
+    image_tag: ${{ steps.tag.outputs.tag }}
+    image_digest: ${{ steps.build.outputs.digest }}
+```
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `operation` | `status` for Baton, `sync` for Finance/Wealth, `migrate` for Lab | required |
-| `pin_sha` | Exact pin commit for status/sync; empty for Baton's status by image tag | empty |
-| `expected_image` | Exact image reference, including digest where the caller pins one | empty |
-| `image_tag`, `image_digest` | Warehouse image identity for migrate | empty |
-| `min_replicas` | Required ready replica floor; Baton must pass `2` | `1` |
+| `operation` | `migrate`, the only operation the service accepts from this action | required |
+| `image_tag`, `image_digest` | Warehouse image identity for the migration | empty |
 | `wait_timeout` | Overall evidence deadline, up to 3600 seconds | `2100` |
 
 Output `receipt` is a local JSON file; the caller may upload it with its existing
-release evidence. TLS trust is mandatory, redirects are rejected, and each poll
-obtains a fresh OIDC token. Denial fails immediately. Busy/dependency responses
-retry within the deadline. A migration succeeds only with matching source,
-image, run ID/attempt and successful warehouse then ecosystem receipts. Call
-this before publishing the Lab image pin. A status/sync succeeds only when Argo
-is Synced and Healthy at the exact pin and the fixed Deployment has observed
-its generation, updated/ready/available replicas and the expected image. With an
-empty `pin_sha`, status sends only the operation (Lab admits that for Baton
-alone), `expected_image` must end in `:main-<GITHUB_SHA>`, and it succeeds when
-Argo is Synced and Healthy at any revision and the Deployment runs that image
-with every replica ready. Baton
-still checks its served source SHA separately and must preserve its immutable
-digest and two-replica release contract.
+release evidence. TLS trust is mandatory with no insecure fallback, redirects
+are rejected, and each poll obtains a fresh OIDC token. Denial fails
+immediately. Busy/dependency responses (HTTP 409 and 503) retry within the
+deadline. A migration succeeds only with matching source, image, run
+ID/attempt and successful warehouse then ecosystem receipts. Call this before
+publishing the Lab image pin.
 
-`lab-gitops-deploy` adds optional `authorization: oidc`. That route replaces its
-Kubernetes discovery/sync/rollout steps with the same client, keeps the source
-SHA image tag and deploy-key pin, and retains the served-source/database health
-check. Missing onboarding fails in the service instead of silently succeeding.
-Existing callers default to `kubernetes`. OIDC does not forward caller-selected
-Application or namespace names: the service derives the fixed target from the
-verified repository. Package scopes and image identities do not change.
+The client is `scripts/ci-release.py`. `wac-cd` loads the same file for its
+gateway transport (`scripts/wacd-release.py`), and wac.lab's denial proof job
+loads it to build migrate requests, so its transport names (`URL`, `CA_FILE`,
+`ReleaseError`, `NoRedirect`, `request`, `oidc_token`, `fetch`, `migrated`) are
+part of its contract.
 
-This release does not bump consumers automatically. Each authorized consumer
-change must pin all components from this repo to the same released exact tag.
-No fleet rules change, but the v1.16.0 transport improvements are included in a
-bump from v1.15.1. `CONSUMERS.md` remains a record of current main-branch pins.
+### The retired pin route
+
+From `v1.17.0` to `v1.28.0` this action also sent `status` and `sync`
+operations: `status` for Baton, `sync` for Finance and Wealth, with `pin_sha`,
+`expected_image` and `min_replicas` inputs, and it waited until Argo was Synced
+and Healthy at the exact pin with the fixed Deployment fully rolled out on the
+expected image. `v1.23.0` let `status` run without a pin for Baton's release
+by image tag. `lab-gitops-deploy` had a matching opt-in
+`authorization: oidc` input that replaced its Kubernetes discovery, sync and
+rollout steps with a `sync` call through the same client.
+
+Lab's gateway retired that pin route in wac.lab #544: it now accepts only
+`migrate` and `wac-cd`'s chart `release`, and no longer takes `status`, `sync`
+or a `pin_sha`. `v1.29.0` removed the client side. `lab-release` keeps only
+`migrate`, and `lab-gitops-deploy` is back to its Kubernetes route alone,
+byte-identical to its `v1.16.0` form. Apps that released through the pin route
+release through `wac-cd` instead.
