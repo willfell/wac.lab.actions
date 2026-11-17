@@ -1,24 +1,15 @@
 name: lab-release
-description: Obtain GitHub OIDC authorization and verify fixed deployment or migration evidence through Lab's TLS service
+description: Obtain GitHub OIDC authorization and verify Lab's fixed migration evidence through Lab's TLS service
 inputs:
   operation:
-    description: status for Baton observation, sync for Finance or Wealth, migrate for Lab
+    description: migrate, the only operation Lab's service accepts from this action
     required: true
-  pin_sha:
-    description: Exact main-branch pin commit for status or sync; empty for a status check by image tag alone
-    default: ""
-  expected_image:
-    description: Exact deployment image reference for status or sync
-    default: ""
   image_tag:
     description: Warehouse image tag for migrate
     default: ""
   image_digest:
     description: Warehouse image digest for migrate
     default: ""
-  min_replicas:
-    description: Minimum ready deployment replicas, with Baton callers requiring two
-    default: "1"
   wait_timeout:
     description: Overall evidence deadline in seconds, at most 3600
     default: "2100"
@@ -37,18 +28,14 @@ runs:
       shell: bash
       env:
         RELEASE_OPERATION: ${{ inputs.operation }}
-        RELEASE_PIN: ${{ inputs.pin_sha }}
-        RELEASE_IMAGE: ${{ inputs.expected_image }}
         RELEASE_TAG: ${{ inputs.image_tag }}
         RELEASE_DIGEST: ${{ inputs.image_digest }}
-        RELEASE_MIN_REPLICAS: ${{ inputs.min_replicas }}
         RELEASE_TIMEOUT: ${{ inputs.wait_timeout }}
       run: |
         set -euo pipefail
         receipt="$(mktemp "$RUNNER_TEMP/release-receipt.XXXXXX.json")"
         python "${{ github.action_path }}/../scripts/ci-release.py" \
-          --operation "$RELEASE_OPERATION" --pin-sha "$RELEASE_PIN" \
-          --expected-image "$RELEASE_IMAGE" --image-tag "$RELEASE_TAG" \
-          --image-digest "$RELEASE_DIGEST" --min-replicas "$RELEASE_MIN_REPLICAS" \
+          --operation "$RELEASE_OPERATION" --image-tag "$RELEASE_TAG" \
+          --image-digest "$RELEASE_DIGEST" \
           --wait-timeout "$RELEASE_TIMEOUT" --receipt "$receipt"
         echo "receipt=$receipt" >> "$GITHUB_OUTPUT"

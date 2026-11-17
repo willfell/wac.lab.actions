@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""TLS-verified client for Lab's repository-scoped GitHub OIDC release service."""
+"""TLS-verified client for Lab's repository-scoped GitHub OIDC release service.
+
+The CLI runs Lab's warehouse migration, the one operation lab-release sends.
+Two callers load this file by path and depend on its names:
+scripts/wacd-release.py uses URL, CA_FILE, ReleaseError, NoRedirect and
+request(), which mints a fresh OIDC token through oidc_token() for every POST
+through fetch(); wac.lab's .github/jobs/ci-deploy-proof.py uses URL, CA_FILE,
+oidc_token(), fetch() and migrated().
+"""
 
 from __future__ import annotations
 
@@ -116,37 +124,6 @@ def request(
     )
 
 
-def ready(
-    value: dict[str, Any], pin: str, source: str, image: str, minimum: int
-) -> bool:
-    if value.get("pin_sha") != pin or value.get("source_sha") != source:
-        raise ReleaseError("release response does not match this source and pin")
-    if (
-        (pin and value.get("sync", {}).get("revision") != pin)
-        or value.get("sync", {}).get("status") != "Synced"
-        or value.get("health", {}).get("status") != "Healthy"
-    ):
-        return False
-    deployments = value.get("deployments")
-    if not isinstance(deployments, list) or len(deployments) != 1:
-        raise ReleaseError("fixed deployment evidence is missing")
-    deployment = deployments[0]
-    status = deployment.get("status", {})
-    replicas = deployment.get("replicas")
-    generation = deployment.get("generation")
-    if type(replicas) is not int or replicas < minimum or type(generation) is not int:
-        return False
-    return (
-        status.get("observedGeneration", 0) >= generation
-        and status.get("replicas") == replicas
-        and status.get("updatedReplicas") == replicas
-        and status.get("readyReplicas") == replicas
-        and status.get("availableReplicas") == replicas
-        and status.get("unavailableReplicas", 0) == 0
-        and image in deployment.get("images", [])
-    )
-
-
 def migrated(value: dict[str, Any], source: str, tag: str, digest: str) -> None:
     expected = {
         "source_sha": source,
@@ -169,29 +146,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     source = os.environ.get("GITHUB_SHA", "")
     if not re.fullmatch("[0-9a-f]{40}", source):
         raise ReleaseError("source SHA is missing")
-    if args.operation == "migrate":
-        if not re.fullmatch(
-            r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", args.image_tag
-        ) or not re.fullmatch(r"sha256:[0-9a-f]{64}", args.image_digest):
-            raise ReleaseError("invalid migration image")
-        body = {
-            "operation": "migrate",
-            "image_tag": args.image_tag,
-            "image_digest": args.image_digest,
-        }
-    else:
-        if not args.expected_image:
-            raise ReleaseError("an expected image is required")
-        if args.pin_sha == "" and args.operation == "status":
-            # A release that deploys from an image tag (Baton, through Argo CD Image
-            # Updater) has no pin commit, so the image itself must name this build.
-            if not args.expected_image.endswith(":main-" + source):
-                raise ReleaseError("a status without a pin needs an image tagged main-<source sha>")
-            body = {"operation": "status"}
-        elif re.fullmatch("[0-9a-f]{40}", args.pin_sha):
-            body = {"operation": args.operation, "pin_sha": args.pin_sha}
-        else:
-            raise ReleaseError("an exact pin is required except for status by image tag")
+    if args.operation != "migrate":
+        raise ReleaseError("migrate is the only release operation")
+    if not re.fullmatch(
+        r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", args.image_tag
+    ) or not re.fullmatch(r"sha256:[0-9a-f]{64}", args.image_digest):
+        raise ReleaseError("invalid migration image")
+    body = {
+        "operation": "migrate",
+        "image_tag": args.image_tag,
+        "image_digest": args.image_digest,
+    }
     try:
         trust = ssl.create_default_context(cafile=CA_FILE)
     except (OSError, ssl.SSLError):
@@ -202,14 +167,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     while time.monotonic() < deadline:
         code, value = request(body, trust, max(1, deadline - time.monotonic()))
         if code == 200:
-            if args.operation == "migrate":
-                migrated(value, source, args.image_tag, args.image_digest)
-                return value
-            if ready(
-                value, args.pin_sha, source, args.expected_image, args.min_replicas
-            ):
-                return value
-        elif code not in (409, 503):
+            migrated(value, source, args.image_tag, args.image_digest)
+            return value
+        if code not in (409, 503):
             raise ReleaseError(f"release request rejected (HTTP {code})")
         time.sleep(min(5, max(0, deadline - time.monotonic())))
     raise ReleaseError("release evidence deadline exceeded")
@@ -217,19 +177,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--operation", choices=["status", "sync", "migrate"], required=True
-    )
-    parser.add_argument("--pin-sha", default="")
-    parser.add_argument("--expected-image", default="")
+    parser.add_argument("--operation", choices=["migrate"], required=True)
     parser.add_argument("--image-tag", default="")
     parser.add_argument("--image-digest", default="")
-    parser.add_argument("--min-replicas", type=int, default=1)
     parser.add_argument("--wait-timeout", type=int, default=2100)
     parser.add_argument("--receipt", required=True)
     args = parser.parse_args()
-    if not 1 <= args.min_replicas <= 10 or not 1 <= args.wait_timeout <= 3600:
-        parser.error("replica or wait bound exceeded")
+    if not 1 <= args.wait_timeout <= 3600:
+        parser.error("wait bound exceeded")
     try:
         result = run(args)
         Path(args.receipt).write_text(json.dumps(result, indent=2) + "\n")
