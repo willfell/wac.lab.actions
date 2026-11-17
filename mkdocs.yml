@@ -16,3 +16,21 @@ validation:
     unrecognized_links: warn
 nav:
   - Overview: index.md
+  - Guides:
+      - Consuming a component: guides/consuming.md
+      - Changing and releasing a component: guides/releasing.md
+  - Reference:
+      - lab-tools: reference/lab-tools.md
+      - lab-kubeconform: reference/lab-kubeconform.md
+      - OpenTofu actions: reference/opentofu.md
+      - lab-route: reference/lab-route.md
+      - lab-release: reference/lab-release.md
+      - actionlint: reference/actionlint.md
+      - techdocs: reference/techdocs.md
+      - agents-md: reference/agents-md.md
+      - Next.js site workflows: reference/nextjs-site.md
+      - The wacd profile: reference/wacd-profile.md
+      - wac-ci: reference/wac-ci.md
+      - wac-cd: reference/wac-cd.md
+  - Architecture:
+      - The shared checkout: architecture/shared-checkout.md
