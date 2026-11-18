@@ -93,13 +93,13 @@ wacwini/wac.lab `.github/workflows/warehouse-image.yml` and
 | `techdocs` | wacwini/wac.lab.remote | `.github/workflows/ci.yml` | `v1.28.0` |
 | `techdocs` | wacwini/wac.plugins | `.github/workflows/ci.yml` | `v1.28.0` |
 | `wac-cd` | wacwini/baton | `.github/workflows/cd.yml` | `v1.27.0` |
-| `wac-cd` | wacwini/mcp.argo | `.github/workflows/cd.yml` | `v1.27.0` |
+| `wac-cd` | wacwini/mcp.argo | `.github/workflows/cd.yml` | `v1.31.0` |
 | `wac-cd` | wacwini/wac | `.github/workflows/cd.yml` | `v1.27.0` |
 | `wac-cd` | wacwini/wac.app.finance | `.github/workflows/cd.yml` | `v1.27.0` |
 | `wac-cd` | wacwini/wac.app.travel | `.github/workflows/cd.yml` | `v1.27.0` |
 | `wac-cd` | wacwini/wac.app.wealth | `.github/workflows/cd.yml` | `v1.27.0` |
 | `wac-ci` | wacwini/baton | `.github/workflows/ci.yml` | `v1.27.0` |
-| `wac-ci` | wacwini/mcp.argo | `.github/workflows/ci.yml` | `v1.27.0` |
+| `wac-ci` | wacwini/mcp.argo | `.github/workflows/ci.yml` | `v1.31.0` |
 | `wac-ci` | wacwini/wac | `.github/workflows/ci.yml` | `v1.27.0` |
 | `wac-ci` | wacwini/wac.app.finance | `.github/workflows/ci.yml` | `v1.27.0` |
 | `wac-ci` | wacwini/wac.app.travel | `.github/workflows/ci.yml` | `v1.27.0` |
