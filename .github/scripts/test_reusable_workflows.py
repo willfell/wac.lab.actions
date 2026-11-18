@@ -312,6 +312,30 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertEqual((outputs["version"], outputs["tag"]), ("0.2.0", "v0.2.0"))
                     self.assertNotIn("Superseded", summary.read_text())
 
+    def test_wac_cd_shadow_observes_and_never_holds_a_release(self):
+        """A hemi outage must not fail or delay a release: the shadow job is off the release path."""
+        import yaml
+
+        root = Path(__file__).resolve().parents[2]
+        doc = yaml.safe_load((root / ".github" / "workflows" / "wac-cd.yml").read_text())
+        jobs = doc["jobs"]
+        job = jobs["shadow"]
+        self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write"})
+        self.assertIs(job["continue-on-error"], True)
+        self.assertEqual(job["needs"], "plan")
+        self.assertEqual(job["if"], "needs.plan.outputs.mode != 'none'")
+        for name, other in jobs.items():
+            needs = other.get("needs") or []
+            with self.subTest(job=name):
+                self.assertNotIn("shadow", [needs] if isinstance(needs, str) else needs)
+        app = job["steps"][0]
+        self.assertTrue(app["uses"].startswith("actions/checkout@"))
+        self.assertNotIn("repository", app.get("with") or {})
+        self.assertIs((app.get("with") or {}).get("persist-credentials"), False)
+        runs = [s["run"] for s in job["steps"] if "wacd-shadow.py" in s.get("run", "")]
+        self.assertEqual(runs, ['python3 "$WACD_SCRIPTS"/wacd-shadow.py .github/wacd.json'])
+        self.assertTrue((root / "scripts" / "wacd-shadow.py").is_file())
+
     def test_wac_ci_setup_go_takes_the_version_or_the_version_file_from_the_profile(self):
         import yaml
 

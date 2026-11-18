@@ -25,7 +25,7 @@ Reading the table:
   | `scripts/lab-route.py` | `lab-route` |
   | `scripts/wacd-profile.py`, `scripts/wacd-chart.py` | `wac-ci`, `wac-cd` |
   | `scripts/wacd-parity.py` | `wac-ci` |
-  | `scripts/wacd-version.py`, `scripts/wacd-release.py`, `scripts/wacd-tag.py` | `wac-cd` |
+  | `scripts/wacd-version.py`, `scripts/wacd-release.py`, `scripts/wacd-tag.py`, `scripts/wacd-shadow.py` | `wac-cd` |
   | `scripts/ci-release.py` | `lab-release`, `wac-cd` |
   | `scripts/tests/` | none; CI only |
 
@@ -36,6 +36,7 @@ Reading the table:
 
 | Tag | Date | Components changed | What |
 |---|---|---|---|
+| `v1.32.0` | 2026-11-18 | `wac-cd` | new job `shadow`, observation only: after `plan`, in every mode but `none`, it mints a GitHub OIDC job token (audience `wacwini:hemi`), reads hemi's contract for the app at `http://hemi-app.hemi.svc.cluster.local:3000/api/v1/contract` and posts `.github/wacd.json` and the values file it names to `/api/v1/shadow`; the job summary says whether hemi's copy matched the files, with one line per difference, or that hemi did not answer. The job is `continue-on-error`, no job needs it and `scripts/wacd-shadow.py` exits 0 on every path, so a hemi outage never fails or delays a release. A caller sees a new job in its runs; its `cd.yml` already grants the `id-token: write` the job asks for. No input, output or fleet-rule changes |
 | `v1.31.0` | 2026-11-18 | `agents-md` | new fleet rule 9: never use docker on the lab's Mac mini, whose only Docker daemon is the Colima VM that runs the lab cluster; kind clusters, image builds and other container work run in CI or on another machine. The rule had lived only in the wacd program's handoff, so a repo's own AGENTS.md could, and mcp.argo's did, tell agents to bring up kind locally. No workflow or script behaviour changes, but every consumer must re-render its AGENTS.md tail at this bump or its gate fails |
 | `v1.30.0` | 2026-11-17 | `lab-build`, `lab-deploy`, `lab-gitops-deploy` | removes `lab-build`, `lab-deploy` and `lab-gitops-deploy`, which no maintained repository pins since the wacd cutover (the archived egnyte-mcp keeps its `v1.7.0` pins under the old repository path, and they still resolve), together with `scripts/argo-await-sync.sh`. A caller still using one of them must stay on `v1.29.0` or earlier, or move to `wac-ci` and `wac-cd`, before bumping. No other component changes and no fleet-rule changes |
 | `v1.29.0` | 2026-11-16 | `lab-release`, `lab-gitops-deploy` | the gateway's retired pin route loses its client (wac.lab #544 stopped accepting `status`, `sync` and `pin_sha`). `lab-release` drops the `pin_sha`, `expected_image` and `min_replicas` inputs, and `operation` accepts only `migrate`; a caller still passing a removed input gets GitHub's unexpected-input warning and a `status` or `sync` call fails before any request. The `migrate` call (wac.lab `warehouse-image.yml`: `operation`, `wait_timeout`, `image_tag`, `image_digest`) is unchanged. `lab-gitops-deploy` drops the `authorization` input and its `oidc` route; its Kubernetes route is byte-identical to `v1.16.0`, and no consumer pins it. `scripts/ci-release.py` changed, but every name `wac-cd` loads from it is byte-identical, so `wac-cd` is not listed. No fleet-rule changes |

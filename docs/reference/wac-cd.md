@@ -70,7 +70,8 @@ on a push that input is empty.
 | `tag` | the git tag for that version |
 | `images` | JSON map of the built images with digests; empty on resume and rollback |
 
-The jobs are `plan`, `build`, `publish`, `deploy` and `github-release`,
+The jobs are `plan`, `build`, `publish`, `deploy`, `github-release` and the
+observation-only `shadow` (below),
 serialized per repository by a concurrency group that never cancels a run in
 progress. A cancelled release is worse than a queued one. The group does not
 queue every run, though: GitHub keeps at most one pending run per group, so a
@@ -163,6 +164,23 @@ gateway receipt is uploaded as
 the artifact `wac-cd-release-<version>`. Last, `health_url` must serve the
 expected source SHA (and `db: ok`, unless `health_expect_db_ok` is `false`)
 within a fixed 300 seconds.
+
+**Shadow.** In every mode but `none`, the `shadow` job asks hemi whether its
+stored copy of the app's configuration matches the files. It mints a GitHub
+OIDC job token with audience `wacwini:hemi` for each request, reads
+`GET http://hemi-app.hemi.svc.cluster.local:3000/api/v1/contract` for the copy
+number (`identity.revision`), then posts `{"revision", "profile", "values"}`
+to `/api/v1/shadow`: the copy number, `.github/wacd.json` parsed as JSON, and the text of the values
+file the profile names. Each request has a 10-second timeout, no proxy and no
+redirects. The job summary gets one line, `hemi's copy matched the files
+(copy <n>).` or `hemi's copy differs from the files in <k> places (copy <n>).`
+followed by one line per difference, or `hemi did not answer; nothing was
+compared.` for any other status, a timeout, a dropped connection or a missing
+token. It is observation only: the files stay the truth and nothing acts on the
+answer. The job is `continue-on-error`, no other job lists it in `needs`, and
+`scripts/wacd-shadow.py` exits 0 on every path, so a hemi outage never fails or
+delays a release. It asks for `contents: read` and `id-token: write`, which the
+calling job already grants; neither token is ever printed.
 
 ## Where releases live
 
