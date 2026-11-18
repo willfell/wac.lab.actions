@@ -59,6 +59,7 @@ jobs:
           python scripts/tests/wacd-release.test.py
           python scripts/tests/wacd-parity.test.py
           python scripts/tests/wacd-tag.test.py
+          python scripts/tests/wacd-shadow.test.py
 
       - name: Run the script tests
         run: |
