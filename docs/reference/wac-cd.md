@@ -174,13 +174,16 @@ to `/api/v1/shadow`: the copy number, `.github/wacd.json` parsed as JSON, and th
 file the profile names. Each request has a 10-second timeout, no proxy and no
 redirects. The job summary gets one line, `hemi's copy matched the files
 (copy <n>).` or `hemi's copy differs from the files in <k> places (copy <n>).`
-followed by one line per difference, or `hemi did not answer; nothing was
+(`in 1 place` for a single difference) followed by one line per difference, or `hemi did not answer; nothing was
 compared.` for any other status, a timeout, a dropped connection or a missing
 token. It is observation only: the files stay the truth and nothing acts on the
 answer. The job is `continue-on-error`, no other job lists it in `needs`, and
 `scripts/wacd-shadow.py` exits 0 on every path, so a hemi outage never fails or
-delays a release. It asks for `contents: read` and `id-token: write`, which the
-calling job already grants; neither token is ever printed.
+delays a release. The job is bounded at two minutes, because the run holds its
+concurrency group until every job ends and the next queued release waits for
+it. It asks for `contents: read` and `id-token: write`, which the calling job
+already grants. Neither token is ever printed: every token it minted is
+replaced with `[token]` in any line it writes, even one hemi echoed back.
 
 ## Where releases live
 

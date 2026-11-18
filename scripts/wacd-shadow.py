@@ -10,7 +10,9 @@ line in the job summary, followed by one line per difference.
 This is observation only. The files remain the truth and nothing acts on the
 answer, so every path exits 0: a hemi outage, a refused token, a malformed
 answer or a bug here never fails or delays a release. Neither the runner's
-request bearer nor a minted token is ever printed.
+request bearer nor a minted token is ever printed: every token minted is kept,
+and any occurrence of one in an output line, including one hemi echoed back in
+a difference, is replaced with [token] before the line is written.
 
 ci-release.py mints its token the same way. It is not imported because wac.lab
 loads that file by path and its names are pinned; this script keeps its own.
@@ -35,6 +37,8 @@ TOKEN_HOST_SUFFIX = ".actions.githubusercontent.com"
 TIMEOUT = 10
 MAX_RESPONSE = 1048576
 SILENT = "hemi did not answer; nothing was compared."
+REDACTED = "[token]"
+MINTED: list[str] = []
 
 
 class Unanswered(Exception):
@@ -98,6 +102,7 @@ def oidc_token() -> str:
     token = value.get("value")
     if not isinstance(token, str) or not token.isascii() or not 1 <= len(token) <= 16384:
         raise Unanswered("GitHub did not return a usable OIDC token")
+    MINTED.append(token)
     return token
 
 
@@ -111,6 +116,13 @@ def call(method: str, route: str, body: dict[str, Any] | None = None) -> dict[st
         urllib.request.Request(URL + route, data=data, headers=headers, method=method),
         f"hemi's {route}",
     )
+
+
+def redact(text: str) -> str:
+    for token in MINTED:
+        for form in (token, json.dumps(token)[1:-1]):
+            text = text.replace(form, REDACTED)
+    return text
 
 
 def one_line(value: Any) -> str:
@@ -139,9 +151,8 @@ def compare(profile_path: str) -> list[str]:
         raise Unanswered("hemi's comparison is not in the expected shape")
     if equal:
         return [f"hemi's copy matched the files (copy {revision})."]
-    lines = [
-        f"hemi's copy differs from the files in {len(differences)} places (copy {revision})."
-    ]
+    places = "1 place" if len(differences) == 1 else f"{len(differences)} places"
+    lines = [f"hemi's copy differs from the files in {places} (copy {revision})."]
     for difference in differences:
         where = " ".join(difference["path"].split())
         lines.append(
@@ -152,17 +163,19 @@ def compare(profile_path: str) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    MINTED.clear()
     try:
         if len(argv) != 2:
             raise Unanswered("usage: wacd-shadow.py <path to .github/wacd.json>")
         lines = compare(argv[1])
     except Unanswered as reason:
-        print(f"wacd shadow: {reason}")
+        print(redact(f"wacd shadow: {reason}"))
         lines = [SILENT]
     except Exception as error:
-        print(f"wacd shadow: stopped on {type(error).__name__}")
+        print(redact(f"wacd shadow: stopped on {type(error).__name__}"))
         lines = [SILENT]
     try:
+        lines = [redact(line) for line in lines]
         print("\n".join(lines))
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:

@@ -322,6 +322,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         job = jobs["shadow"]
         self.assertEqual(job["permissions"], {"contents": "read", "id-token": "write"})
         self.assertIs(job["continue-on-error"], True)
+        self.assertEqual(job["timeout-minutes"], 2, "the next queued release waits for the run to end")
         self.assertEqual(job["needs"], "plan")
         self.assertEqual(job["if"], "needs.plan.outputs.mode != 'none'")
         for name, other in jobs.items():

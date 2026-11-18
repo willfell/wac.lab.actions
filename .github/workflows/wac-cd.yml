@@ -224,7 +224,7 @@ jobs:
     if: needs.plan.outputs.mode != 'none'
     continue-on-error: true
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
-    timeout-minutes: 5
+    timeout-minutes: 2
     permissions:
       contents: read
       id-token: write

@@ -60,6 +60,8 @@ class Stub:
                     reply = (200, {"value": f"{TOKEN}.{outer.minted}"})
                 else:
                     reply = outer.replies[url.path]
+                if callable(reply):
+                    reply = reply(self.headers.get("Authorization"))
                 if reply is CLOSE:
                     self.close_connection = True
                     self.connection.shutdown(2)
@@ -201,21 +203,54 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual((code, summary), (0, SILENT))
 
     def test_the_token_is_never_echoed_from_what_hemi_answers(self):
-        """hemi answers garbage that carries the minted token; the script reports none of it."""
+        """hemi answers with the token it was sent; the script reports none of it."""
+
+        def echoed(auth):
+            difference = {"path": "values.token", "contract": auth.removeprefix("Bearer "), "files": None}
+            return (200, {"equal": False, "differences": [difference]})
+
         cases = {
-            "copy number": ((200, {"identity": {"revision": f"{TOKEN}.1"}}), None),
-            "refusal": ((200, contract(1)), (401, {"error": f"rejected {TOKEN}.2"})),
-            "comparison": ((200, contract(1)), (200, {"equal": False, "differences": f"{TOKEN}.2"})),
+            "copy number": ((200, {"identity": {"revision": f"{TOKEN}.1"}}), None, [SILENT]),
+            "refusal": ((200, contract(1)), (401, {"error": f"rejected {TOKEN}.2"}), [SILENT]),
+            "comparison": (
+                (200, contract(1)),
+                (200, {"equal": False, "differences": f"{TOKEN}.2"}),
+                [SILENT],
+            ),
+            "a well-formed difference": (
+                (200, contract(1)),
+                echoed,
+                [
+                    "hemi's copy differs from the files in 1 place (copy 1).",
+                    "- values.token: hemi's copy has \"[token]\", the files have null",
+                ],
+            ),
         }
-        for label, (contract_reply, shadow_reply) in cases.items():
+        for label, (contract_reply, shadow_reply, expected) in cases.items():
             with self.subTest(label):
                 stub = Stub(contract_reply, shadow_reply)
                 try:
                     code, _, _, summary = self.run_against(stub)
                 finally:
                     stub.close()
-                self.assertEqual((code, summary), (0, SILENT))
+                self.assertEqual(code, 0)
+                self.assertEqual(summary.splitlines(), [line.rstrip("\n") for line in expected])
                 self.assertEqual(len(stub.hemi_requests()), 1 if shadow_reply is None else 2)
+
+    def test_an_answer_that_contradicts_itself_compares_nothing(self):
+        difference = {"path": "values.replicas", "contract": 3, "files": 2}
+        cases = {
+            "equal with a difference": {"equal": True, "differences": [difference]},
+            "not equal with no difference": {"equal": False, "differences": []},
+        }
+        for label, answer in cases.items():
+            with self.subTest(label):
+                stub = Stub((200, contract(3)), (200, answer))
+                try:
+                    code, _, _, summary = self.run_against(stub)
+                finally:
+                    stub.close()
+                self.assertEqual((code, summary), (0, SILENT))
 
 
 class CommandLineTests(unittest.TestCase):
