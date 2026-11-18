@@ -20,7 +20,8 @@ jobs:
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `runner` | `runs-on` label for every job, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
+| `runner` | `runs-on` label for every job but `checks` when `build_runner` is set, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
+| `build_runner` | `runs-on` label for `checks`, the job that installs, tests and builds | empty: `runner` |
 | `parity_kustomize_dir` | a kustomize directory whose render must match the Helm render | empty: no parity check |
 
 | Secret | Meaning |
@@ -50,6 +51,16 @@ packages the deploy chart with placeholder `ci` images, runs `helm lint` and
 core and Datree CRD schemas. `lint` (`actionlint` with `runner_policy: fleet`),
 `techdocs` and `agents-md` are the existing gates, called from the same commit.
 It builds no image and pushes nothing.
+
+`checks` is the only job that needs more than a small runner: it installs the
+app's dependencies, runs its tests and builds it. `render`, `lint`, `techdocs`
+and `agents-md` peak under 400Mi and run for seconds to a minute. A caller
+that passes `build_runner: ${{ vars.CI_RUNNER_STANDARD }}` and no `runner`
+sends `checks` there and leaves the other four jobs on its `CI_RUNNER_SMALL`.
+Passing only `runner` still puts every job on that runner, as before
+`build_runner` existed. Six jobs per pull request on a three-pod dind pool is
+how wac.hemi waited up to 17 minutes for a slot on 2026-11-18 while each job
+ran for under four.
 
 `parity_kustomize_dir` exists for cutover only. When set, `render` also builds
 that kustomize tree and `scripts/wacd-parity.py` compares the two renders

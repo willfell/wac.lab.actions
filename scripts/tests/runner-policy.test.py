@@ -77,6 +77,18 @@ class RunnerPolicyTests(unittest.TestCase):
         self.assertEqual(self.scan('on:\n  workflow_call:\njobs:\n  a:\n    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}'), [])
         self.assertTrue(self.scan('jobs:\n  a:\n    runs-on: ${{ inputs.runner }}'))
 
+    def test_reusable_build_job_accepts_the_build_runner_before_the_runner(self):
+        self.assertEqual(self.scan('on:\n  workflow_call:\njobs:\n  a:\n    runs-on: ${{ inputs.build_runner || inputs.runner || vars.CI_RUNNER_SMALL }}', repository=self.ORG), [])
+
+    def test_caller_build_runner_is_checked_like_the_runner(self):
+        call = 'jobs:\n  a:\n    uses: willfell/wac.lab.actions/.github/workflows/wac-ci.yml@v1.33.0\n    with:\n      build_runner: '
+        for value in [self.SMALL, self.STANDARD, '${{ vars.CI_RUNNER_LARGE }}']:
+            with self.subTest(value=value):
+                self.assertEqual(self.scan(call + value, repository=self.ORG), [])
+        for value in ['ci-standard', 'ubuntu-latest', '${{ vars.CI_RUNNER_SMAL }}']:
+            with self.subTest(value=value):
+                self.assertTrue(self.scan(call + value, repository=self.ORG))
+
     def test_personal_repositories_keep_hosted_arm_and_declared_hosts(self):
         for value in ['ubuntu-24.04-arm', self.SMALL, '[self-hosted, rpo-mac-mini]']:
             with self.subTest(value=value):

@@ -61,6 +61,39 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(runner_problems({"gate": good}), [])
         self.assertTrue(runner_problems({"gate": {"runs-on": "ubuntu-latest", "steps": []}}))
 
+    def test_build_job_may_take_the_build_runner_when_declared(self):
+        declared = workflow({"checks": {"runs-on": module.BUILD_RUNS_ON_EXPRESSION, "steps": []}})
+        declared["on"]["workflow_call"]["inputs"]["build_runner"] = {"type": "string", "default": ""}
+        self.assertEqual(module._check_runner_is_a_caller_choice(Path("wac-ci.yml"), declared), [])
+
+    def test_build_runner_expression_needs_the_input_with_an_empty_default(self):
+        undeclared = workflow({"checks": {"runs-on": module.BUILD_RUNS_ON_EXPRESSION, "steps": []}})
+        self.assertTrue(module._check_runner_is_a_caller_choice(Path("wac-ci.yml"), undeclared))
+        defaulted = workflow({"checks": {"runs-on": module.BUILD_RUNS_ON_EXPRESSION, "steps": []}})
+        defaulted["on"]["workflow_call"]["inputs"]["build_runner"] = {"type": "string", "default": "ci-standard"}
+        self.assertTrue(module._check_runner_is_a_caller_choice(Path("wac-ci.yml"), defaulted))
+
+    def test_build_runner_without_the_runner_fallback_fails(self):
+        for runs_on in ("${{ inputs.build_runner || vars.CI_RUNNER_SMALL }}", "${{ inputs.build_runner }}"):
+            with self.subTest(runs_on=runs_on):
+                doc = workflow({"checks": {"runs-on": runs_on, "steps": []}})
+                doc["on"]["workflow_call"]["inputs"]["build_runner"] = {"type": "string", "default": ""}
+                self.assertTrue(module._check_runner_is_a_caller_choice(Path("wac-ci.yml"), doc))
+
+    def test_wac_ci_and_wac_cd_route_only_their_build_job_to_the_build_runner(self):
+        import yaml
+
+        root = Path(__file__).parents[1] / "workflows"
+        for name, heavy in (("wac-ci.yml", "checks"), ("wac-cd.yml", "build")):
+            with self.subTest(workflow=name):
+                doc = yaml.safe_load((root / name).read_text())
+                for job_name, job in doc["jobs"].items():
+                    expected = module.BUILD_RUNS_ON_EXPRESSION if job_name == heavy else module.RUNS_ON_EXPRESSION
+                    if "uses" in job:
+                        self.assertEqual(job["with"]["runner"], module.RUNNER_PASSTHROUGH, job_name)
+                        continue
+                    self.assertEqual(job["runs-on"], expected, job_name)
+
     def test_shared_checkout_needs_workflow_sha_and_guard(self):
         path = Path("wac-ci.yml")
 
