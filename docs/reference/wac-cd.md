@@ -26,7 +26,7 @@ jobs:
       id-token: write
       packages: read
     with:
-      runner: ${{ vars.CI_RUNNER_STANDARD }}
+      build_runner: ${{ vars.CI_RUNNER_STANDARD }}
       rollback_version: ${{ inputs.version }}
 ```
 
@@ -51,7 +51,8 @@ on a push that input is empty.
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `runner` | `runs-on` label for every job, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
+| `runner` | `runs-on` label for every job but `build` when `build_runner` is set, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
+| `build_runner` | `runs-on` label for `build`, the one job that runs `docker build` | empty: `runner` |
 | `version_source` | `commits` computes the version from conventional commits; `caller` takes it from `version` | `commits` |
 | `version` | the caller-computed bare `X.Y.Z` with `version_source: caller`; empty means no release | empty |
 | `rollback_version` | a published version to release again; only on `workflow_dispatch` | empty |
@@ -79,6 +80,13 @@ newer pending run replaces an older one that has not started. For pushes that
 is harmless, because the later push's version covers the earlier commits. A
 replaced rollback dispatch never runs, so check that a rollback started before
 walking away from it.
+
+Only `build` runs `docker build`, so only `build` needs a dind runner; the
+others push a chart with helm, call the gateway or the GitHub API, and run on
+`CI_RUNNER_SMALL` when the caller passes `build_runner` and no `runner`. A
+caller that passes only `runner` keeps every job on it. `plan` through
+`github-release` run one after another, so on a three-pod dind pool each of
+them used to queue again for a slot behind every other repo's jobs.
 
 **Versions.** `plan` finds the latest tag `<tag_prefix>X.Y.Z` reachable from
 HEAD and reads the commits since it: any breaking change (`type!:` or a

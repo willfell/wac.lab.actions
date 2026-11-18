@@ -7,6 +7,10 @@ on:
         description: Runner label; empty uses the caller's CI_RUNNER_SMALL variable
         type: string
         default: ''
+      build_runner:
+        description: Runner label for the job that builds; empty uses runner
+        type: string
+        default: ''
       version_source:
         description: commits computes the version from conventional commits; caller takes it from the version input
         type: string
@@ -258,7 +262,7 @@ jobs:
   build:
     needs: plan
     if: needs.plan.outputs.mode == 'release' || needs.plan.outputs.mode == 'publish'
-    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    runs-on: ${{ inputs.build_runner || inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 45
     permissions:
       contents: read

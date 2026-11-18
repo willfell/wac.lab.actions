@@ -31,10 +31,12 @@ The runner policy itself is `scripts/runner-policy.py`, tested by
 arms the original direct-label scanner, preserving existing callers.
 
 `runner_policy: fleet` validates direct `runs-on`, matrices and reusable
-`with.runner` choices independently of where lint runs. Inside `wacwini`,
-`runs-on` and `with.runner` accept only `${{ vars.CI_RUNNER_SMALL }}`,
+`with.runner` and `with.build_runner` choices independently of where lint
+runs. Inside `wacwini`, `runs-on`, `with.runner` and `with.build_runner`
+accept only `${{ vars.CI_RUNNER_SMALL }}`,
 `${{ vars.CI_RUNNER_STANDARD }}`, `${{ vars.CI_RUNNER_LARGE }}`,
 `${{ inputs.runner || vars.CI_RUNNER_<SIZE> }}`,
+`${{ inputs.build_runner || inputs.runner || vars.CI_RUNNER_<SIZE> }}`,
 bare `${{ inputs.runner }}` in a `workflow_call` workflow, matrices of those,
 and `allowed_host_labels`. There are three sizes: small, standard, and large;
 large is for heavy test suites. Literal `vars.*` text and empty `runs-on` values

@@ -104,7 +104,11 @@ inputs, outputs and the incident history behind its design.
    `runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}`. Its jobs run on the
    caller's runners, so a hardcoded label lands in every consumer, and a
    non-empty default silently moves every existing caller. `check_actions.py`
-   enforces both. Fleet callers opt into `runner_policy: fleet`, which inside
+   enforces both. The one exception is the job that builds (`wac-ci` `checks`,
+   `wac-cd` `build`), which may read
+   `${{ inputs.build_runner || inputs.runner || vars.CI_RUNNER_SMALL }}` when
+   the workflow declares `build_runner` the same way, so a caller can give that
+   job a dind pool without queueing every helper job behind it. Fleet callers opt into `runner_policy: fleet`, which inside
    `wacwini` accepts only the `CI_RUNNER_SMALL`, `CI_RUNNER_STANDARD` and
    `CI_RUNNER_LARGE` variables. This public repository's own CI uses the literal
    `ubuntu-24.04-arm` and smoke-tests ubuntu-latest as its explicit policy

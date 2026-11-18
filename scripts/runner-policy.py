@@ -17,7 +17,7 @@ class Size(str):
     pass
 
 
-INPUT_OR_SIZE = re.compile(r'^inputs\.runner\s*\|\|\s*(vars\.CI_RUNNER_(?:SMALL|STANDARD|LARGE))$')
+INPUT_OR_SIZE = re.compile(r'^(?:inputs\.build_runner\s*\|\|\s*)?inputs\.runner\s*\|\|\s*(vars\.CI_RUNNER_(?:SMALL|STANDARD|LARGE))$')
 
 
 def legacy_scan(path):
@@ -174,8 +174,9 @@ def fleet_scan(path, repository, transitional=(), hosts=()):
                 findings.append((name, 'runs-on', routed))
             elif routed is None:
                 values.append(('runs-on', job['runs-on']))
-        if 'uses' in job and 'runner' in (job.get('with') or {}):
-            values.append(('with.runner', job['with']['runner']))
+        for field in ('runner', 'build_runner'):
+            if 'uses' in job and field in (job.get('with') or {}):
+                values.append((f'with.{field}', job['with'][field]))
         for key, value in values:
             try:
                 labels = labels_for(value, matrix, reusable)

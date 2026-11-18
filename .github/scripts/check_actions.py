@@ -34,6 +34,12 @@ RUNNER_INPUT = "runner"
 DEFAULT_RUNNER = ""
 RUNS_ON_EXPRESSION = "${{ inputs.runner || vars.CI_RUNNER_SMALL }}"
 RUNNER_PASSTHROUGH = "${{ inputs.runner }}"
+#: An optional second input for the one job that builds (wac-ci `checks`,
+#: wac-cd `build`), so a caller can send only that job to a bigger pool and
+#: leave the helpers on small runners. It falls back to `runner`, so a caller
+#: that passes only `runner` keeps every job where it was.
+BUILD_RUNNER_INPUT = "build_runner"
+BUILD_RUNS_ON_EXPRESSION = "${{ inputs.build_runner || inputs.runner || vars.CI_RUNNER_SMALL }}"
 
 #: This repo as a checkout target, the ref a gate must use for it, and the
 #: guard step that proves the ref is a full commit sha before it is trusted.
@@ -220,6 +226,14 @@ def _check_runner_is_a_caller_choice(path: Path, doc: dict) -> list[str]:
                 )
             continue
         runs_on = job.get("runs-on")
+        if runs_on == BUILD_RUNS_ON_EXPRESSION:
+            build = declared.get(BUILD_RUNNER_INPUT)
+            if not isinstance(build, dict) or build.get("type") != "string" or build.get("default") != DEFAULT_RUNNER:
+                problems.append(
+                    f"{path}: job {name!r} reads `{BUILD_RUNNER_INPUT}`, which the workflow "
+                    f"must declare as a string input defaulting to {DEFAULT_RUNNER!r}"
+                )
+            continue
         if runs_on != RUNS_ON_EXPRESSION:
             problems.append(
                 f"{path}: job {name!r} has `runs-on: {runs_on}` instead of "
