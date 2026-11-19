@@ -60,3 +60,30 @@ takes. It never sets `app`, `images` or `global`: `wac-cd` writes `app` from the
 profile and `images` from the build, and the packager refuses a values file
 that tries, because a value it could override is a value two places would
 disagree about.
+
+## The copy hemi stores
+
+Once an app is cut over, its settings live in hemi, and `wac-cd`'s `plan`
+reads them from the gateway's copy rather than from the repository
+([wac-cd](wac-cd.md), **Settings**). The copy is hemi's contract: the same
+settings under other names. `scripts/wacd-profile.py --contract <path>`
+derives the profile it stands for and prints exactly the lines the profile
+file it came from prints, so every later step reads one set of outputs
+whichever the source:
+
+| Profile field | Copy field |
+| --- | --- |
+| `app` | `identity.app` |
+| `chart_version`, `tag_prefix`, `health_url`, `health_expect_db_ok` | `delivery.chartVersion`, `delivery.tagPrefix`, `delivery.healthUrl`, `delivery.healthExpectDbOk` |
+| `values_file` | `delivery.valuesFile`, the path the repository's values file had; the file need not exist |
+| `images[].name`, `dockerfile`, `context`, `sha_build_arg` | `build.images[].name`, `dockerfile`, `context`, `shaBuildArg` |
+| `ci.stack`, `node_version`, `go_version`, `go_version_file`, `apt_packages` | `build.stack`, `nodeVersion`, `goVersion`, `goVersionFile`, `aptPackages` (left out when empty) |
+| `ci.commands` | every gate's `commands`, in order |
+| the values file | `runtime` |
+
+The derived profile is validated exactly like the file. An unknown field
+inside `build` or one of its images fails, naming its dotted path under
+`contract.`, rather than being dropped, so a setting the copy carries never
+silently does nothing. Line equality holds for a profile whose `ci` keys are
+written in the order the table above lists them; the JSON outputs are read
+with `fromJSON`, so key order does not change what a job sees.

@@ -5,12 +5,17 @@ Every scenario runs in a fresh temp directory: an app repo whose only remote,
 network remote or the repository this file lives in.
 """
 
+import contextlib
+import importlib.util
+import io
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).parents[1] / "wacd-tag.py"
 ISOLATED = {
@@ -212,6 +217,62 @@ class PushTagTests(TagCase):
         self.assert_fails(result)
 
 
+def run_bounded(repos, *argv, env=None):
+    """wacd-tag's main in this process with NETWORK_TIMEOUT at 1 second: (code, stderr, seconds)."""
+    spec = importlib.util.spec_from_file_location("wacd_tag", SCRIPT)
+    tag = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tag)
+    err = io.StringIO()
+    cwd = os.getcwd()
+    os.chdir(repos.app)
+    started = time.monotonic()
+    try:
+        with patch.object(tag, "NETWORK_TIMEOUT", 1), \
+                patch.dict(os.environ, {**repos.env, **(env or {})}, clear=True), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = tag.main(["wacd-tag.py", *argv])
+    finally:
+        os.chdir(cwd)
+    return code, err.getvalue(), time.monotonic() - started
+
+
+class NetworkBoundTests(TagCase):
+    """A stalled remote must not hold plan's runner and the cd concurrency group for 40 minutes."""
+
+    def run_in_process(self, *argv, env=None):
+        return run_bounded(self.repos, *argv, env=env)
+
+    def test_a_hanging_ls_remote_fails_within_the_bound(self):
+        r = self.repos
+        ssh = r.root / "hang-ssh"
+        ssh.write_text("#!/bin/sh\nexec sleep 30\n")
+        ssh.chmod(0o755)
+        r.git("remote", "set-url", "origin", "ssh://hang.invalid/origin.git")
+        code, err, elapsed = self.run_in_process(
+            "claim-tag", "--tag", "v1.0.0", "--sha", r.second, env={"GIT_SSH_COMMAND": str(ssh)}
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "wacd tag: git ls-remote did not finish within 1 seconds\n")
+        self.assertLess(elapsed, 10)
+
+    def test_a_hanging_push_fails_within_the_bound_and_is_not_superseded(self):
+        r = self.repos
+        hook = r.origin / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\nexec sleep 30\n")
+        hook.chmod(0o755)
+        code, err, elapsed = self.run_in_process("claim-tag", "--tag", "v1.0.0", "--sha", r.second)
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "wacd tag: git push did not finish within 1 seconds\n")
+        self.assertLess(elapsed, 10)
+        self.assertEqual(r.origin_tags(), {})
+
+    def test_the_bound_is_a_few_minutes_at_most(self):
+        spec = importlib.util.spec_from_file_location("wacd_tag", SCRIPT)
+        tag = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tag)
+        self.assertLessEqual(tag.NETWORK_TIMEOUT, 120)
+
+
 class ClaimTagTests(TagCase):
     def outcome(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -276,6 +337,70 @@ class ClaimTagTests(TagCase):
                 self.assert_fails(r.claim_tag("--tag", "v1.0.0", "--sha", r.second, f"--branch={branch}"))
         self.assertEqual(r.origin_tags(), {})
 
+
+
+class ClaimOnCommitTests(TagCase):
+    """A settings release claims its tag on the running code, an older commit than main's tip."""
+
+    def outcome(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 2, result.stdout)
+        return lines[1]
+
+    def test_the_tag_goes_on_the_named_commit_not_the_head(self):
+        r = self.repos
+        self.assertEqual(r.git("rev-parse", "HEAD"), r.second)
+        self.assertEqual(self.outcome(r.claim_tag("--tag", "v1.4.3", "--commit", r.first)), "claim=pushed")
+        self.assertEqual(r.origin_tags(), {"refs/tags/v1.4.3": r.first})
+        self.assertEqual(self.outcome(r.claim_tag("--tag", "v1.4.3", "--commit", r.first)), "claim=exists")
+
+    def test_a_commit_carrying_its_release_tag_takes_a_second_one(self):
+        r = self.repos
+        r.git("tag", "v1.4.2", r.first)
+        r.git("push", "-q", "origin", "refs/tags/v1.4.2")
+        self.assertEqual(self.outcome(r.claim_tag("--tag", "v1.4.3", "--commit", r.first)), "claim=pushed")
+        self.assertEqual(r.origin_tags(), {"refs/tags/v1.4.2": r.first, "refs/tags/v1.4.3": r.first})
+
+    def test_a_refused_push_fails_and_is_never_superseded(self):
+        r = self.repos
+        r.refuse_tag_pushes()
+        r.advance_origin_main("ci: bump the shared workflows")
+        result = r.claim_tag("--tag", "v1.4.3", "--commit", r.first)
+        self.assert_fails(result, "git push failed", "workflows permission", r.first)
+        self.assertNotIn("superseded", result.stdout + result.stderr)
+        self.assertEqual(r.origin_tags(), {})
+
+    def test_a_tag_on_another_commit_fails(self):
+        r = self.repos
+        r.git("tag", "v1.4.3", r.second)
+        r.git("push", "-q", "origin", "refs/tags/v1.4.3")
+        r.git("tag", "-d", "v1.4.3")
+        self.assert_fails(r.claim_tag("--tag", "v1.4.3", "--commit", r.first), r.first, r.second)
+        self.assertEqual(r.origin_tags(), {"refs/tags/v1.4.3": r.second})
+
+    def test_exactly_one_of_sha_and_commit(self):
+        r = self.repos
+        for args in (
+            ("--tag", "v1.4.3", "--commit", r.first, "--sha", r.second),
+            ("--tag", "v1.4.3"),
+            ("--tag", "v1.4.3", "--commit", "abc"),
+            ("--tag", "v1.4.3", "--commit", "f" * 40),
+        ):
+            with self.subTest(args=args):
+                self.assert_fails(r.claim_tag(*args))
+        self.assertEqual(r.origin_tags(), {})
+
+    def test_a_hanging_push_fails_within_the_bound(self):
+        r = self.repos
+        hook = r.origin / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\nexec sleep 30\n")
+        hook.chmod(0o755)
+        code, err, elapsed = run_bounded(r, "claim-tag", "--tag", "v1.4.3", "--commit", r.first)
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "wacd tag: git push did not finish within 1 seconds\n")
+        self.assertLess(elapsed, 10)
+        self.assertEqual(r.origin_tags(), {})
 
 if __name__ == "__main__":
     unittest.main()

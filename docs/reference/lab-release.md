@@ -46,8 +46,9 @@ nothing else.
 ## The client is shared
 
 `scripts/ci-release.py` is both this action's CLI and a module other code
-loads. `wacd-release.py` imports its transport (`CA_FILE`, `NoRedirect`,
-`ReleaseError`, `request`), and wac.lab's `.github/jobs/ci-deploy-proof.py`
+loads. `wacd-release.py` (and `wacd-contract.py` through it) uses `URL`,
+`CA_FILE`, `NoRedirect`, `ReleaseError` and `oidc_token`, sending its own POST
+so that a 403's refusal code survives, and wac.lab's `.github/jobs/ci-deploy-proof.py`
 loads it from a checkout of this repo at its pinned tag and uses `CA_FILE`,
 `URL`, `fetch`, `oidc_token` and `migrated`. Renaming any of them breaks
 `wac-cd` or wac.lab's denial proof at its next bump;

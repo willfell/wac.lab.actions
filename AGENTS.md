@@ -41,8 +41,10 @@ python3 scripts/tests/wacd-profile.test.py  # the wacd.json validator
 python3 scripts/tests/wacd-version.test.py  # wac-cd version planning, against temp git repos
 WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-chart.test.py  # deploy chart packaging; needs helm
 python3 scripts/tests/wacd-release.test.py  # wac-cd's gateway client, against a stub gateway
+python3 scripts/tests/wacd-contract.test.py  # wac-cd's settings read from the gateway's copy and wac-ci's from hemi, against stub servers and temp git repos
 uv run --with pyyaml python scripts/tests/wacd-parity.test.py  # kustomize and Helm render parity
 python3 scripts/tests/wacd-tag.test.py  # wac-cd's tag push, against a local bare remote
+python3 scripts/tests/wacd-retag.test.py  # wac-cd's settings-release retag, against a stand-in registry
 WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-shadow.test.py  # wac-cd's shadow comparison, against a stub hemi and token endpoint; needs helm 3
 bash scripts/tests/agents-md.test.sh  # the agents-md gate, against fixture repos; needs uv and git
 uv run scripts/agents-md.py check  # this file against the fleet contract

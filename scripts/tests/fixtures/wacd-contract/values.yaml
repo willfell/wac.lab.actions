@@ -1,0 +1,5 @@
+name: travel-app
+image: travel-app
+replicas: 2
+env:
+  LOG_LEVEL: info

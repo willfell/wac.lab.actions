@@ -4,6 +4,13 @@
 The CLI prints key=value lines for $GITHUB_OUTPUT. Any problem exits 1 with a
 message that names the dotted field path of the first offence.
 
+`wacd-profile.py --contract <path>` reads hemi's copy of the settings (the
+`contract.json` wac-cd's plan wrote under `.wacd-contract/`) instead, derives the
+profile it stands for and prints exactly the lines the profile file it came
+from prints, `values_file` included: the path the repository's values file
+had, which the copy carries as `delivery.valuesFile`. The values themselves
+are the copy's `runtime`, so the repository need not hold that file.
+
 `wacd-profile.py node-layout <repo>` instead reports how a node repo installs:
 `root_package=true|false` (whether wac-ci's implicit root `npm ci` applies)
 and a `lockfiles` multi-line block of every package-lock.json for the npm
@@ -43,6 +50,14 @@ IMAGE_REQUIRED = ("name", "dockerfile", "context")
 IMAGE_OPTIONAL = ("sha_build_arg",)
 CI_REQUIRED = ("stack", "commands")
 CI_OPTIONAL = ("node_version", "go_version", "go_version_file", "apt_packages")
+
+CONTRACT_DIR = ".wacd-contract"
+DERIVED_VALUES = f"{CONTRACT_DIR}/values.json"
+CONTRACT_DELIVERY = ("chartVersion", "valuesFile", "tagPrefix", "healthUrl", "healthExpectDbOk")
+CONTRACT_BUILD_REQUIRED = ("images", "stack")
+CONTRACT_BUILD_OPTIONAL = ("nodeVersion", "goVersion", "goVersionFile", "aptPackages")
+CONTRACT_IMAGE_REQUIRED = ("name", "dockerfile", "context")
+CONTRACT_IMAGE_OPTIONAL = ("shaBuildArg",)
 
 
 class ProfileError(Exception):
@@ -166,7 +181,8 @@ def check_apt_packages(packages, path):
         seen.add(package)
 
 
-def validate(data, repo_root):
+def validate(data, repo_root, values_in_repo=True):
+    """Validate a profile; values_in_repo=False when the values come from hemi's copy."""
     if not isinstance(data, dict):
         fail("profile", "must be a JSON object")
     check_keys(data, "", TOP_REQUIRED, TOP_OPTIONAL)
@@ -176,7 +192,7 @@ def validate(data, repo_root):
     check_pattern(data["app"], "app", APP, "a lowercase app name of at most 40 characters")
     check_pattern(data["chart_version"], "chart_version", SEMVER, "X.Y.Z")
     check_relative(data["values_file"], "values_file")
-    if not (repo_root / data["values_file"]).is_file():
+    if values_in_repo and not (repo_root / data["values_file"]).is_file():
         fail("values_file", f"{data['values_file']} does not exist in the repo")
     check_pattern(data["tag_prefix"], "tag_prefix", TAG_PREFIX, "empty or a lowercase prefix such as v")
     check_pattern(
@@ -194,15 +210,113 @@ def validate(data, repo_root):
 def load(path):
     """Return the validated profile at path; the repo root is the parent of .github/."""
     path = Path(path)
-    try:
-        data = json.loads(path.read_text())
-    except OSError as err:
-        fail("profile", f"cannot read {path}: {err.strerror}")
-    except UnicodeDecodeError:
-        fail("profile", f"{path} is not valid UTF-8")
-    except json.JSONDecodeError as err:
-        fail("profile", f"{path} is not valid JSON: {err}")
+    data = read_json(path, "profile")
     validate(data, path.parent.parent)
+    return data
+
+
+def contract_object(value, path):
+    if not isinstance(value, dict):
+        fail(path, "must be an object")
+    return value
+
+
+def contract_field(obj, key, path):
+    if key not in obj:
+        fail(f"{path}.{key}", "required")
+    return obj[key]
+
+
+def from_contract(contract, values_file):
+    """The profile hemi's copy stands for, with values_file set by the caller.
+
+    Field names map one to one, the inverse of hemi's readProfile: delivery's
+    settings to the top level, build to images and ci, and the gates' commands,
+    in order, to ci.commands. Unknown fields inside build and its images are
+    refused rather than dropped, so a setting the copy carries is never
+    silently ignored. An empty aptPackages is left out, as the profile writes it.
+    """
+    contract_object(contract, "contract")
+    version = contract_field(contract, "version", "contract")
+    if type(version) is not int or version != 1:
+        fail("contract.version", "must be the integer 1")
+    identity = contract_object(contract_field(contract, "identity", "contract"), "contract.identity")
+    delivery = contract_object(contract_field(contract, "delivery", "contract"), "contract.delivery")
+    build = contract_object(contract_field(contract, "build", "contract"), "contract.build")
+    gates = contract_field(contract, "gates", "contract")
+    for key in CONTRACT_DELIVERY:
+        contract_field(delivery, key, "contract.delivery")
+    check_keys(build, "contract.build", CONTRACT_BUILD_REQUIRED, CONTRACT_BUILD_OPTIONAL)
+    images = build["images"]
+    if not isinstance(images, list):
+        fail("contract.build.images", "must be a list")
+    derived_images = []
+    for i, image in enumerate(images):
+        here = f"contract.build.images[{i}]"
+        contract_object(image, here)
+        check_keys(image, here, CONTRACT_IMAGE_REQUIRED, CONTRACT_IMAGE_OPTIONAL)
+        derived = {key: image[key] for key in CONTRACT_IMAGE_REQUIRED}
+        if "shaBuildArg" in image:
+            derived["sha_build_arg"] = image["shaBuildArg"]
+        derived_images.append(derived)
+    if not isinstance(gates, list) or not gates:
+        fail("contract.gates", "must be a non-empty list")
+    commands = []
+    for i, gate in enumerate(gates):
+        here = f"contract.gates[{i}]"
+        gate_commands = contract_field(contract_object(gate, here), "commands", here)
+        if not isinstance(gate_commands, list):
+            fail(f"{here}.commands", "must be a list")
+        commands.extend(gate_commands)
+    ci = {"stack": build["stack"]}
+    for source, target in (
+        ("nodeVersion", "node_version"),
+        ("goVersion", "go_version"),
+        ("goVersionFile", "go_version_file"),
+    ):
+        if source in build:
+            ci[target] = build[source]
+    ci["commands"] = commands
+    if build.get("aptPackages"):
+        ci["apt_packages"] = build["aptPackages"]
+    return {
+        "schema_version": 1,
+        "app": contract_field(identity, "app", "contract.identity"),
+        "chart_version": delivery["chartVersion"],
+        "values_file": values_file,
+        "tag_prefix": delivery["tagPrefix"],
+        "health_url": delivery["healthUrl"],
+        "health_expect_db_ok": delivery["healthExpectDbOk"],
+        "images": derived_images,
+        "ci": ci,
+    }
+
+
+def read_json(path, what):
+    path = Path(path)
+    try:
+        return json.loads(path.read_text())
+    except OSError as err:
+        fail(what, f"cannot read {path}: {err.strerror}")
+    except UnicodeDecodeError:
+        fail(what, f"{path} is not valid UTF-8")
+    except json.JSONDecodeError as err:
+        fail(what, f"{path} is not valid JSON: {err}")
+
+
+def load_contract(path):
+    """The validated profile hemi's copy at path stands for.
+
+    Its values_file is the copy's delivery.valuesFile, and that file need not
+    exist; the repository root (for go_version_file) is the parent of
+    .wacd-contract/, as it is the parent of .github/ for a profile file.
+    """
+    path = Path(path)
+    contract = read_json(path, "contract")
+    delivery = contract.get("delivery") if isinstance(contract, dict) else None
+    values_file = delivery.get("valuesFile") if isinstance(delivery, dict) else None
+    data = from_contract(contract, values_file)
+    validate(data, path.parent.parent, values_in_repo=False)
     return data
 
 
@@ -270,14 +384,15 @@ def main(argv):
             return 1
         print("\n".join(lines))
         return 0
-    if len(argv) != 2:
+    contract = len(argv) == 3 and argv[1] == "--contract"
+    if len(argv) != 2 and not contract:
         print(
-            "usage: wacd-profile.py <path to .github/wacd.json> | node-layout <repo>",
+            "usage: wacd-profile.py <path to .github/wacd.json> | --contract <path> | node-layout <repo>",
             file=sys.stderr,
         )
         return 2
     try:
-        data = load(argv[1])
+        data = load_contract(argv[2]) if contract else load(argv[1])
     except ProfileError as err:
         print(f"wacd profile: {err}", file=sys.stderr)
         return 1

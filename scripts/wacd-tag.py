@@ -22,17 +22,32 @@ on the remote:
 claim-tag prints one human line, then claim=pushed, claim=exists or
 claim=superseded.
 
+`claim-tag --tag T --commit C` is the claim of a settings release, whose tag
+goes on C, the running version's source, rather than on the run's own commit.
+It does what push-tag does at C, and a refused push always fails: C is not
+the commit main moved on from, so a newer run does not release it.
+
 A published tag is never moved, deleted or forced. Any problem exits 1 with one
 "wacd tag: ..." stderr line.
+
+Every call that reaches the remote (ls-remote, push) is bounded at
+NETWORK_TIMEOUT seconds: plan holds the repository's cd concurrency group, so
+a stalled remote must fail the run rather than hold it. git runs in its own
+session and the whole group is killed on a timeout, because git's transport
+helpers (ssh, git-remote-https, a hook behind receive-pack) would otherwise
+keep its pipes open. A timed-out push is a failure, never "superseded".
 """
 
 import argparse
+import os
 import re
+import signal
 import subprocess
 import sys
 
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 REMOTE_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+NETWORK_TIMEOUT = 60
 
 
 class TagError(Exception):
@@ -43,16 +58,29 @@ class PushRefused(TagError):
     pass
 
 
-def git(*args, check=True):
+def git(*args, check=True, timeout=None):
+    """Run git; with a timeout, git and everything it starts is killed when it passes."""
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             ["git", *args],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             encoding="utf-8",
             errors="replace",
+            start_new_session=timeout is not None,
         )
     except FileNotFoundError:
         raise TagError("git is not installed") from None
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise TagError(f"git {args[0]} did not finish within {timeout} seconds") from None
+    result = subprocess.CompletedProcess(["git", *args], process.returncode, stdout, stderr)
     if check and result.returncode != 0:
         detail = " ".join((result.stderr or "").split())[:200]
         raise TagError(f"git {args[0]} failed: {detail}")
@@ -62,7 +90,7 @@ def git(*args, check=True):
 def remote_commit(remote, tag):
     """The commit tag names on the remote, peeling an annotated tag; None when absent."""
     ref = f"refs/tags/{tag}"
-    out = git("ls-remote", "--tags", remote, ref, ref + "^{}").stdout
+    out = git("ls-remote", "--tags", remote, ref, ref + "^{}", timeout=NETWORK_TIMEOUT).stdout
     found = {}
     for line in out.splitlines():
         sha, _, name = line.partition("\t")
@@ -105,7 +133,7 @@ def push_tag_outcome(remote, tag, sha):
         raise TagError(f"local tag {tag} is on {local}, not {sha}")
     if local is None:
         git("tag", tag, sha)
-    pushed = git("push", remote, f"refs/tags/{tag}", check=False)
+    pushed = git("push", remote, f"refs/tags/{tag}", check=False, timeout=NETWORK_TIMEOUT)
     if pushed.returncode != 0:
         # A concurrent run may have pushed the same tag first; that is fine
         # only when it names this commit.
@@ -121,12 +149,21 @@ def push_tag_outcome(remote, tag, sha):
 
 def branch_tip(remote, branch):
     ref = f"refs/heads/{branch}"
-    out = git("ls-remote", "--heads", remote, ref).stdout
+    out = git("ls-remote", "--heads", remote, ref, timeout=NETWORK_TIMEOUT).stdout
     for line in out.splitlines():
         sha, _, name = line.partition("\t")
         if name.strip() == ref:
             return sha.strip()
     return None
+
+
+def claim_tag_on(remote, tag, commit):
+    """claim-tag --commit: the tag on commit, and a refused push is a failure."""
+    try:
+        outcome, message = push_tag_outcome(remote, tag, commit)
+    except PushRefused as refused:
+        raise TagError(f"{refused}; the tag {tag} cannot be claimed on {commit}") from None
+    return [message, f"claim={outcome}"]
 
 
 def claim_tag(remote, tag, sha, branch):
@@ -163,7 +200,9 @@ def build_parser():
     push.add_argument("--remote", default="origin")
     claim = commands.add_parser("claim-tag")
     claim.add_argument("--tag", required=True)
-    claim.add_argument("--sha", required=True)
+    on = claim.add_mutually_exclusive_group(required=True)
+    on.add_argument("--sha")
+    on.add_argument("--commit")
     claim.add_argument("--branch", default="main")
     claim.add_argument("--remote", default="origin")
     return parser
@@ -172,7 +211,9 @@ def build_parser():
 def main(argv):
     try:
         args = build_parser().parse_args(argv[1:])
-        if args.command == "claim-tag":
+        if args.command == "claim-tag" and args.commit is not None:
+            lines = claim_tag_on(args.remote, args.tag, args.commit)
+        elif args.command == "claim-tag":
             lines = claim_tag(args.remote, args.tag, args.sha, args.branch)
         else:
             lines = [push_tag(args.remote, args.tag, args.sha)]

@@ -286,6 +286,98 @@ def parse_github_output(text):
     return values
 
 
+FIXTURES = Path(__file__).parent / "fixtures" / "wacd-contract"
+
+
+class ContractTest(unittest.TestCase):
+    """`--contract` reads hemi's copy and emits the outputs the profile it came from emits.
+
+    The fixture contract is the shape hemi's resolveContract builds from the
+    fixture profile and values file, so the two runs must agree line for line.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name) / "repo"
+        (self.root / ".github").mkdir(parents=True)
+        (self.root / "deploy").mkdir()
+        (self.root / ".wacd-contract").mkdir()
+        (self.root / "deploy" / "values.yaml").write_text((FIXTURES / "values.yaml").read_text())
+        self.profile_path = self.root / ".github" / "wacd.json"
+        self.contract_path = self.root / ".wacd-contract" / "contract.json"
+        self.write(json.loads((FIXTURES / "wacd.json").read_text()), json.loads((FIXTURES / "contract.json").read_text()))
+
+    def write(self, data, contract):
+        self.profile_path.write_text(json.dumps(data))
+        self.contract_path.write_text(json.dumps(contract))
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args], capture_output=True, text=True, check=False
+        )
+
+    def assertSameOutputs(self):
+        files = self.run_cli(str(self.profile_path))
+        copy_ = self.run_cli("--contract", str(self.contract_path))
+        self.assertEqual(files.returncode, 0, files.stderr)
+        self.assertEqual(copy_.returncode, 0, copy_.stderr)
+        self.assertEqual(copy_.stdout, files.stdout)
+        return copy_.stdout.splitlines()
+
+    def test_a_contract_emits_the_outputs_of_the_profile_it_came_from(self):
+        lines = self.assertSameOutputs()
+        self.assertIn("values_file=deploy/values.yaml", lines)
+        self.assertIn("health_expect_db_ok=false", lines)
+        self.assertIn("apt_packages=python3 g++", lines)
+
+    def test_defaults_and_the_go_stack_derive_the_same_outputs(self):
+        data = json.loads((FIXTURES / "wacd.json").read_text())
+        contract = json.loads((FIXTURES / "contract.json").read_text())
+        del data["health_expect_db_ok"]
+        contract["delivery"]["healthExpectDbOk"] = True
+        data["ci"] = {"stack": "go", "go_version_file": "go.mod", "commands": ["go vet ./...", "go test ./..."]}
+        contract["build"] = {
+            "images": contract["build"]["images"],
+            "stack": "go",
+            "goVersionFile": "go.mod",
+            "aptPackages": [],
+        }
+        contract["gates"] = [{"name": "checks", "commands": ["go vet ./...", "go test ./..."], "required": True}]
+        (self.root / "go.mod").write_text("module travel\n\ngo 1.24\n")
+        self.write(data, contract)
+        lines = self.assertSameOutputs()
+        self.assertIn("apt_packages=", lines)
+
+    def test_the_copy_needs_no_values_file_in_the_repository(self):
+        (self.root / "deploy" / "values.yaml").unlink()
+        result = self.run_cli("--contract", str(self.contract_path))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("values_file=deploy/values.yaml", result.stdout.splitlines())
+
+    def test_a_contract_that_does_not_fit_names_the_field(self):
+        base = json.loads((FIXTURES / "contract.json").read_text())
+        data = json.loads((FIXTURES / "wacd.json").read_text())
+        cases = (
+            ("version", lambda c: c.update(version=2), "contract.version"),
+            ("missing health url", lambda c: c["delivery"].pop("healthUrl"), "contract.delivery.healthUrl"),
+            ("unknown image field", lambda c: c["build"]["images"][0].update(port=80), "contract.build.images[0].port"),
+            ("unknown build field", lambda c: c["build"].update(rustVersion="1"), "contract.build.rustVersion"),
+            ("no gate commands", lambda c: c.update(gates=[]), "contract.gates"),
+            ("bad image name", lambda c: c["build"]["images"][0].update(name="Travel"), "images[0].name"),
+            ("not an object", lambda c: c.clear(), "contract.version"),
+        )
+        for label, change, field in cases:
+            with self.subTest(case=label):
+                contract = copy.deepcopy(base)
+                change(contract)
+                self.write(data, contract)
+                result = self.run_cli("--contract", str(self.contract_path))
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertTrue(result.stderr.startswith("wacd profile:"), result.stderr)
+                self.assertIn(field, result.stderr)
+
+
 class NodeLayoutTest(unittest.TestCase):
     """wac-ci installs at the root only when there is a root package, and
     caches npm over every lockfile, or not at all when there is none."""

@@ -3,10 +3,11 @@
 
 The CLI runs Lab's warehouse migration, the one operation lab-release sends.
 Two callers load this file by path and depend on its names:
-scripts/wacd-release.py uses URL, CA_FILE, ReleaseError, NoRedirect and
-request(), which mints a fresh OIDC token through oidc_token() for every POST
-through fetch(); wac.lab's .github/jobs/ci-deploy-proof.py uses URL, CA_FILE,
-oidc_token(), fetch() and migrated().
+scripts/wacd-release.py (and scripts/wacd-contract.py through it) uses URL,
+CA_FILE, ReleaseError, NoRedirect and oidc_token(), minting a fresh token for
+every POST it sends with its own post(), which keeps a 403's refusal code that
+fetch() drops; wac.lab's .github/jobs/ci-deploy-proof.py uses URL, CA_FILE,
+oidc_token(), fetch() and migrated(). request() is this CLI's own transport.
 """
 
 from __future__ import annotations
