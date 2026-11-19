@@ -23,6 +23,10 @@ on:
         description: Published version to release again; only on workflow_dispatch
         type: string
         default: ''
+      settings_revision:
+        description: hemi's revision to release on the running code with no build; only on workflow_dispatch
+        type: string
+        default: ''
       deploy:
         description: false publishes the images, chart and tag without releasing them
         type: boolean
@@ -41,7 +45,7 @@ on:
         required: false
     outputs:
       mode:
-        description: release, publish, resume, rollback or none
+        description: release, publish, resume, rollback, settings or none
         value: ${{ jobs.plan.outputs.mode }}
       version:
         description: The released or published version, bare X.Y.Z
@@ -50,8 +54,8 @@ on:
         description: The git tag for the version
         value: ${{ jobs.plan.outputs.tag }}
       images:
-        description: JSON map of built images with digests; empty on resume and rollback
-        value: ${{ jobs.build.outputs.images }}
+        description: JSON map of built or retagged images with digests; empty on resume and rollback
+        value: ${{ jobs.build.outputs.images || jobs.retag.outputs.images }}
 
 permissions:
   contents: read
@@ -82,6 +86,7 @@ jobs:
       source: ${{ steps.contract.outputs.source }}
       revision: ${{ steps.contract.outputs.revision }}
       fleet_commit: ${{ steps.contract.outputs.fleet_commit }}
+      source_images: ${{ steps.settings.outputs.images }}
     steps:
       - name: Require the runner's python3 3.12 or later
         timeout-minutes: 1
@@ -118,6 +123,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           ROLLBACK_VERSION: ${{ inputs.rollback_version }}
+          SETTINGS_REVISION: ${{ inputs.settings_revision }}
           DEPLOY: ${{ inputs.deploy }}
         run: |
           set -euo pipefail
@@ -126,13 +132,24 @@ jobs:
             exit 1
           }
           semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          revision='^[1-9][0-9]{0,9}$'
+          settings="${SETTINGS_REVISION:-}"
           [[ "$GITHUB_REF" == refs/heads/main ]] || fail "runs only on refs/heads/main, not $GITHUB_REF"
           case "$EVENT_NAME" in
             push)
               [[ -z "$ROLLBACK_VERSION" ]] || fail "rollback_version is accepted only on workflow_dispatch"
+              [[ -z "$settings" ]] || fail "settings_revision is accepted only on workflow_dispatch"
               ;;
             workflow_dispatch)
-              [[ "$ROLLBACK_VERSION" =~ $semver ]] || fail "workflow_dispatch needs rollback_version as X.Y.Z"
+              if [[ -n "$ROLLBACK_VERSION" && -n "$settings" ]]; then
+                fail "workflow_dispatch takes rollback_version or settings_revision, not both"
+              elif [[ -n "$settings" ]]; then
+                [[ "$settings" =~ $revision ]] || fail "settings_revision must be a whole number from 1 to 9999999999, not $settings"
+              elif [[ -z "$ROLLBACK_VERSION" ]]; then
+                fail "workflow_dispatch needs exactly one of rollback_version (X.Y.Z) and settings_revision"
+              else
+                [[ "$ROLLBACK_VERSION" =~ $semver ]] || fail "workflow_dispatch needs rollback_version as X.Y.Z"
+              fi
               ;;
             *)
               fail "event $EVENT_NAME is not push or workflow_dispatch"
@@ -140,6 +157,9 @@ jobs:
           esac
           if [[ -n "$ROLLBACK_VERSION" && "$DEPLOY" != true ]]; then
             fail "rollback_version cannot be combined with deploy: false"
+          fi
+          if [[ -n "$settings" && "$DEPLOY" != true ]]; then
+            fail "settings_revision cannot be combined with deploy: false"
           fi
       - name: Check out the app (actions/checkout v4)
         timeout-minutes: 5
@@ -203,6 +223,112 @@ jobs:
           else
             python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
           fi
+      - name: Plan the settings release
+        timeout-minutes: 6
+        id: settings
+        if: inputs.settings_revision != ''
+        shell: bash
+        env:
+          SETTINGS_REVISION: ${{ inputs.settings_revision }}
+          SOURCE: ${{ steps.contract.outputs.source }}
+          COPY_REVISION: ${{ steps.contract.outputs.revision }}
+          APP: ${{ steps.profile.outputs.app }}
+          TAG_PREFIX: ${{ steps.profile.outputs.tag_prefix }}
+          PROFILE_IMAGES: ${{ steps.profile.outputs.images }}
+        run: |
+          set -euo pipefail
+          registry=registry.network.svc.cluster.local:5000
+          fail() {
+            echo "wac-cd: $1" >&2
+            echo "::error::wac-cd: $1"
+            {
+              echo "### wac-cd plan"
+              echo
+              echo "$1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          call() {
+            local name="$1" script="$2" value
+            shift 2
+            if ! value="$(python3 "$WACD_SCRIPTS/$script" "$@" 2> "$RUNNER_TEMP/settings.err")"; then
+              fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/ *$//')"
+            fi
+            printf -v "$name" '%s' "$value"
+          }
+          if [[ "$SOURCE" != hemi ]]; then
+            fail "Settings revision $SETTINGS_REVISION cannot be released on its own: this app's settings come from its files, not from hemi's copy."
+          fi
+          if (( COPY_REVISION > SETTINGS_REVISION )); then
+            {
+              echo "mode=none"
+              echo "summary=a newer revision is live; its own release follows"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if (( COPY_REVISION < SETTINGS_REVISION )); then
+            fail "hemi's copy is at revision $COPY_REVISION, older than the dispatched revision $SETTINGS_REVISION; re-run once the save has reached the fleet copy."
+          fi
+          call line wacd-release.py running --wait-timeout 240
+          running="${line#running=}"
+          call line wacd-chart.py chart-revision --registry "$registry" --app "$APP" --version "$running"
+          commit="${line#revision=}"
+          call line wacd-chart.py chart-images --registry "$registry" --app "$APP" --version "$running"
+          images="${line#images=}"
+          if ! python3 -c 'import json, sys
+          running = sorted(json.loads(sys.argv[1]))
+          wanted = sorted(image["name"] for image in json.loads(sys.argv[2]))
+          sys.exit(running != wanted)' "$images" "$PROFILE_IMAGES"; then
+            fail "hemi's copy names other images than $running runs, so its settings need a build: release code first."
+          fi
+          call planned wacd-version.py --mode settings --prefix "$TAG_PREFIX" --commit "$commit" --running "$running"
+          version="$(sed -n 's/^version=//p' <<< "$planned")"
+          claimed="$(sed -n 's/^claimed=//p' <<< "$planned")"
+          call line wacd-chart.py chart-copy-revision --registry "$registry" --app "$APP" --version "$running"
+          if [[ "${line#copy_revision=}" == "$SETTINGS_REVISION" ]]; then
+            version="$running"
+            summary="settings revision $SETTINGS_REVISION is already released as $running on its code (${commit:0:12}); releasing it again changes nothing"
+          else
+            if [[ -n "$claimed" ]]; then
+              call line wacd-chart.py chart-copy-revision --registry "$registry" --app "$APP" --version "$claimed"
+              case "${line#copy_revision=}" in
+                absent|"$SETTINGS_REVISION") version="$claimed" ;;
+              esac
+            fi
+            summary="settings revision $SETTINGS_REVISION on $running's code (${commit:0:12}), released as $version"
+          fi
+          code=0
+          git diff --quiet "$commit" origin/main -- .github/workflows || code=$?
+          if [[ "$code" -eq 1 ]]; then
+            printf 'workflow_refused=%s\n' "Release code first: $APP's workflow files changed since $running, so its settings cannot be released on ${commit:0:12}." >> "$GITHUB_OUTPUT"
+            echo "wac-cd: settings release refused; the next step reports it"
+            exit 0
+          elif [[ "$code" -ne 0 ]]; then
+            fail "could not compare $commit's workflow files with origin/main"
+          fi
+          {
+            echo "mode=settings"
+            echo "version=$version"
+            echo "tag=$TAG_PREFIX$version"
+            echo "commit=$commit"
+            echo "images=$images"
+            echo "summary=$summary"
+          } | tee -a "$GITHUB_OUTPUT"
+      - name: Refuse a settings release behind a workflow change
+        timeout-minutes: 1
+        if: ${{ steps.settings.outputs.workflow_refused != '' }}
+        shell: bash
+        env:
+          REASON: ${{ steps.settings.outputs.workflow_refused }}
+        run: |
+          echo "wac-cd: $REASON" >&2
+          echo "::error::wac-cd: $REASON"
+          {
+            echo "### wac-cd plan"
+            echo
+            echo "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - name: Plan the version
         timeout-minutes: 6
         id: version
@@ -214,6 +340,12 @@ jobs:
           DEPLOY: ${{ inputs.deploy }}
           APP: ${{ steps.profile.outputs.app }}
           TAG_PREFIX: ${{ steps.profile.outputs.tag_prefix }}
+          SETTINGS_REVISION: ${{ inputs.settings_revision }}
+          SETTINGS_MODE: ${{ steps.settings.outputs.mode }}
+          SETTINGS_VERSION: ${{ steps.settings.outputs.version }}
+          SETTINGS_TAG: ${{ steps.settings.outputs.tag }}
+          SETTINGS_COMMIT: ${{ steps.settings.outputs.commit }}
+          SETTINGS_SUMMARY: ${{ steps.settings.outputs.summary }}
         run: |
           set -euo pipefail
           registry=registry.network.svc.cluster.local:5000
@@ -232,6 +364,15 @@ jobs:
             version="$ROLLBACK_VERSION"
             tag="$TAG_PREFIX$ROLLBACK_VERSION"
             expected_sha="$revision"
+          elif [[ -n "${SETTINGS_REVISION:-}" ]]; then
+            mode="${SETTINGS_MODE:-}"
+            version="${SETTINGS_VERSION:-}"
+            tag="${SETTINGS_TAG:-}"
+            expected_sha="${SETTINGS_COMMIT:-}"
+            if [[ "$mode" != settings && "$mode" != none ]]; then
+              echo "::error::wac-cd: the settings release was not planned"
+              exit 1
+            fi
           else
             plan_version() {
               local planned
@@ -292,6 +433,20 @@ jobs:
               version=""
               tag=""
             fi
+          elif [[ "$mode" == settings ]]; then
+            if ! claimed="$(python3 "$WACD_SCRIPTS"/wacd-tag.py claim-tag --tag "$tag" --commit "$expected_sha" \
+              2> "$RUNNER_TEMP/claim-tag.err")"; then
+              echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/claim-tag.err")"
+              exit 1
+            fi
+            echo "$claimed"
+            case "$(sed -n 's/^claim=//p' <<< "$claimed")" in
+              pushed|exists) ;;
+              *)
+                echo "::error::wac-cd: the settings tag $tag was not claimed on $expected_sha"
+                exit 1
+                ;;
+            esac
           fi
           {
             echo "mode=$mode"
@@ -308,6 +463,15 @@ jobs:
             if [[ -n "$superseded" ]]; then
               echo
               echo "Superseded: $superseded. Nothing was built or published; the newer run releases these commits cumulatively."
+            fi
+            if [[ -n "${SETTINGS_REVISION:-}" && "$mode" == settings ]]; then
+              echo
+              echo "mode: settings"
+              echo
+              echo "${SETTINGS_SUMMARY:-}"
+            elif [[ -n "${SETTINGS_REVISION:-}" ]]; then
+              echo
+              echo "mode: none (${SETTINGS_SUMMARY:-})"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Refuse to replay an old version
@@ -507,9 +671,50 @@ jobs:
           print("images=" + json.dumps(images, separators=(",", ":"), sort_keys=True))' \
             "$RUNNER_TEMP/digests.tsv" >> "$GITHUB_OUTPUT"
 
+  retag:
+    needs: plan
+    if: needs.plan.outputs.mode == 'settings'
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      images: ${{ steps.retag.outputs.images }}
+    steps:
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Retag the running images
+        id: retag
+        shell: bash
+        env:
+          SOURCE_IMAGES: ${{ needs.plan.outputs.source_images }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: python3 "$WACD_SCRIPTS"/wacd-retag.py --images "$SOURCE_IMAGES" --version "$VERSION" >> "$GITHUB_OUTPUT"
+
   publish:
-    needs: [plan, build]
-    if: needs.plan.outputs.mode == 'release' || needs.plan.outputs.mode == 'publish'
+    needs: [plan, build, retag]
+    if: >-
+      !cancelled() && !failure() && (
+      needs.plan.outputs.mode == 'release' ||
+      needs.plan.outputs.mode == 'publish' ||
+      needs.plan.outputs.mode == 'settings')
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 15
     permissions:
@@ -567,7 +772,9 @@ jobs:
           APP: ${{ needs.plan.outputs.app }}
           VERSION: ${{ needs.plan.outputs.version }}
           TAG: ${{ needs.plan.outputs.tag }}
-          IMAGES: ${{ needs.build.outputs.images }}
+          MODE: ${{ needs.plan.outputs.mode }}
+          EXPECTED_SHA: ${{ needs.plan.outputs.expected_sha }}
+          IMAGES: ${{ needs.build.outputs.images || needs.retag.outputs.images }}
           WAC_APP_TGZ: ${{ steps.pull.outputs.tgz }}
           SOURCE: ${{ needs.plan.outputs.source }}
           REVISION: ${{ needs.plan.outputs.revision }}
@@ -575,6 +782,10 @@ jobs:
         run: |
           set -euo pipefail
           registry=registry.network.svc.cluster.local:5000
+          source_sha="$GITHUB_SHA"
+          if [[ "${MODE:-}" == settings ]]; then
+            source_sha="$EXPECTED_SHA"
+          fi
           profile=.github/wacd.json
           copy=()
           if [[ "$SOURCE" == hemi ]]; then
@@ -587,7 +798,7 @@ jobs:
           chart_state() {
             local err="$RUNNER_TEMP/chart-state.err"
             if ! state="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-state --registry "$registry" \
-              --app "$APP" --version "$VERSION" --source-sha "$GITHUB_SHA" 2> "$err")"; then
+              --app "$APP" --version "$VERSION" --source-sha "$source_sha" 2> "$err")"; then
               echo "::error::wac-cd: $(tr '\n' ' ' < "$err")"
               exit 1
             fi
@@ -595,7 +806,7 @@ jobs:
           chart_state
           if [[ "$state" == state=absent ]]; then
             line="$(python3 "$WACD_SCRIPTS"/wacd-chart.py package --profile "$profile" \
-              --version "$VERSION" --source-sha "$GITHUB_SHA" --images "$IMAGES" \
+              --version "$VERSION" --source-sha "$source_sha" --images "$IMAGES" \
               --wac-app-tgz "$WAC_APP_TGZ" --out "$RUNNER_TEMP/deploy-chart" ${copy[@]+"${copy[@]}"})"
             chart_dir="${line#chart_dir=}"
             helm package "$chart_dir" -d "$RUNNER_TEMP/packaged"
@@ -608,12 +819,12 @@ jobs:
               exit 1
             fi
           elif [[ "$state" == state=present ]]; then
-            echo "deploy/$APP:$VERSION is already published from $GITHUB_SHA"
+            echo "deploy/$APP:$VERSION is already published from $source_sha"
           else
             echo "::error::wac-cd: unexpected chart state for deploy/$APP:$VERSION: $state"
             exit 1
           fi
-          python3 "$WACD_SCRIPTS"/wacd-tag.py push-tag --tag "$TAG" --sha "$GITHUB_SHA"
+          python3 "$WACD_SCRIPTS"/wacd-tag.py push-tag --tag "$TAG" --sha "$source_sha"
 
   deploy:
     needs: [plan, build, publish]
@@ -621,7 +832,8 @@ jobs:
       !cancelled() && !failure() && (
       needs.plan.outputs.mode == 'release' ||
       needs.plan.outputs.mode == 'resume' ||
-      needs.plan.outputs.mode == 'rollback')
+      needs.plan.outputs.mode == 'rollback' ||
+      needs.plan.outputs.mode == 'settings')
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 75
     permissions:
@@ -741,7 +953,8 @@ jobs:
       needs.deploy.result == 'success' && (
       needs.plan.outputs.mode == 'release' ||
       needs.plan.outputs.mode == 'resume' ||
-      needs.plan.outputs.mode == 'rollback')
+      needs.plan.outputs.mode == 'rollback' ||
+      needs.plan.outputs.mode == 'settings')
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 5
     permissions:

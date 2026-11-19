@@ -9,6 +9,7 @@ over, it reads the same settings from the copy hemi stores instead (see
 
 ```yaml
 name: cd
+run-name: ${{ inputs.revision && format('settings revision {0}', inputs.revision) || inputs.version && format('rollback to {0}', inputs.version) || github.event.head_commit.message }}
 on:
   push:
     branches: [main]
@@ -17,7 +18,11 @@ on:
       version:
         description: Published version to roll back to, X.Y.Z
         type: string
-        required: true
+        required: false
+      revision:
+        description: hemi's settings revision to release on the running code
+        type: string
+        required: false
 permissions:
   contents: read
 jobs:
@@ -30,6 +35,7 @@ jobs:
     with:
       build_runner: ${{ vars.CI_RUNNER_STANDARD }}
       rollback_version: ${{ inputs.version }}
+      settings_revision: ${{ inputs.revision }}
 ```
 
 **The caller file must be `.github/workflows/cd.yml`.** The gateway admits a
@@ -48,8 +54,12 @@ The calling job grants `contents: write` (the tag and the GitHub Release),
 `id-token: write` (the gateway's OIDC token, which `plan`, `shadow` and
 `deploy` ask for) and `packages: read` (private npm packages during the build), and declares no `environment`: the gateway rejects
 a token that carries that claim. The trigger is a push to `main` plus a
-`workflow_dispatch` whose own `version` input is passed as `rollback_version`;
-on a push that input is empty.
+`workflow_dispatch` whose own `version` input is passed as `rollback_version`
+and whose `revision` input is passed as `settings_revision`; on a push both are
+empty, and a dispatch sets exactly one. hemi dispatches `revision` and reads
+the run by its name, so the `run-name` above is part of the contract: a
+settings run is named exactly `settings revision <n>`. `wac-cd` does not set
+the name; the caller does.
 
 | Input | Meaning | Default |
 | --- | --- | --- |
@@ -58,6 +68,7 @@ on a push that input is empty.
 | `version_source` | `commits` computes the version from conventional commits; `caller` takes it from `version` | `commits` |
 | `version` | the caller-computed bare `X.Y.Z` with `version_source: caller`; empty means no release | empty |
 | `rollback_version` | a published version to release again; only on `workflow_dispatch` | empty |
+| `settings_revision` | hemi's settings revision to release on the running code, with no build (**Settings-only releases** below); only on `workflow_dispatch`, never with `rollback_version` or `deploy: false` | empty |
 | `deploy` | `false` publishes the images, chart and tag without releasing them | `true` |
 | `build_args` | newline-separated `KEY=VALUE` build args passed to every image build | empty |
 | `wait_timeout` | seconds `plan` waits out an unavailable gateway for the settings, and seconds to wait for the gateway's release proof | `2100` |
@@ -68,13 +79,13 @@ on a push that input is empty.
 
 | Output | Meaning |
 | --- | --- |
-| `mode` | `release`, `publish`, `resume`, `rollback` or `none` |
+| `mode` | `release`, `publish`, `resume`, `rollback`, `settings` or `none` |
 | `version` | the released or published version, bare `X.Y.Z` |
 | `tag` | the git tag for that version |
-| `images` | JSON map of the built images with digests; empty on resume and rollback |
+| `images` | JSON map of the built images with digests, or in `settings` mode the retagged ones; empty on resume and rollback |
 
-The jobs are `plan`, `build`, `publish`, `deploy`, `github-release` and the
-observation-only `shadow` (below),
+The jobs are `plan`, `build` (or `retag` in `settings` mode), `publish`,
+`deploy`, `github-release` and the observation-only `shadow` (below),
 serialized per repository by a concurrency group that never cancels a run in
 progress. A cancelled release is worse than a queued one. The group does not
 queue every run, though: GitHub keeps at most one pending run per group, so a
@@ -273,6 +284,8 @@ exists on another commit fails the plan.
 | `publish` | the same, with `deploy: false` | build, publish |
 | `resume` | HEAD already carries a `<tag_prefix>X.Y.Z` tag and its deploy chart is published from this SHA | deploy, github-release |
 | `rollback` | `workflow_dispatch` with `rollback_version` | deploy, github-release |
+| `settings` | `workflow_dispatch` with `settings_revision` | retag, publish, deploy, github-release |
+| `none` | `workflow_dispatch` with `settings_revision` when hemi's copy already holds a newer revision | nothing |
 | `none` | `version_source: caller` with no version, or a tagged HEAD whose chart is published, with `deploy: false` | nothing |
 | `none` | a `release` or `publish` run whose tag push was refused after `main` moved on: superseded | nothing |
 
@@ -477,6 +490,92 @@ exchange with hemi run in a worker thread that is joined against what is left;
 when the deadline passes the summary says `hemi did not answer; nothing was
 compared.` and the script exits 0. `.github/scripts/test_reusable_workflows.py`
 checks that the three parts add up to the job's bound.
+
+## Settings-only releases
+
+A settings change saved in hemi goes live with no pull request and no build:
+hemi dispatches `cd.yml` with `revision`, and `wac-cd` releases the running
+version's images again under a new version, with the chart rendered from
+hemi's copy. The pipeline and the gateway require each image's tag to equal
+the chart version, and the gateway's ledger never publishes a version twice,
+so a settings-only release is a new version whose images are the running
+ones, retagged.
+
+`plan` checks the trigger (exactly one of `rollback_version` and
+`settings_revision` on a dispatch, a revision of one to ten digits, not with
+`deploy: false`; a dispatch with neither fails as it always did), reads the
+copy as for any run, and then, in `Plan the settings release`:
+
+1. Requires the copy's `source` to be `hemi`; a copy whose settings live in
+   the files fails. When the copy's `identity.revision` is newer than
+   `settings_revision`, the run ends as mode `none`, green, with the summary
+   line `mode: none (a newer revision is live; its own release follows)`: that
+   save dispatched its own run. A copy older than the dispatched revision
+   fails, since the save has not reached the fleet copy yet.
+2. Reads the running version V from the gateway's `status`
+   (`wacd-release.py running`, 503 retried for at most 240 seconds). After a
+   rollback V is the rolled-back version, never the newest tag. A running
+   version that is not `X.Y.Z` fails.
+3. Reads V's image digests and source commit C from V's chart annotations at
+   the push address, as `deploy` reads them, and fails when the copy names
+   other images than V runs (that needs a build: release code first).
+4. Takes V' as the next patch above the highest `<tag_prefix>X.Y.Z` tag merged
+   into `origin/main` (`wacd-version.py --mode settings`), with the tag on C,
+   which must be on `main`. The tag goes on C, not on `main`'s head, because a
+   tagged head counts as released: a settings tag there would make the next
+   code release resume onto old images. On C, the next merge versions above V'.
+5. Never spends a second version on one revision: when V's chart already
+   carries `settings_revision`, V' is V (a re-run after the release went
+   live; releasing it again changes nothing), and when `main`'s newest tag
+   already sits on C above V and its chart is absent or carries
+   `settings_revision`, V' is that version (a re-run, or a fresh dispatch,
+   after an earlier attempt claimed it and never went live).
+6. Compares `.github/workflows` at C with `origin/main` (below).
+
+`Plan the version` then claims V' on C with `wacd-tag.py claim-tag --commit`.
+A refused tag push in `settings` mode fails `plan`; it is never `superseded`
+and never mode `none`. The summary says `mode: settings` and
+`settings revision <n> on <V>'s code (<C short>), released as <V'>`.
+
+`build` never runs in this mode. `retag` runs in its place, and only in this
+mode: `scripts/wacd-retag.py` reads each of V's image manifests by digest from
+`registry.network.svc.cluster.local:5000`, accepting the OCI and Docker
+manifest and index media types, checks the bytes against the digest, and PUTs
+the same bytes with the same `Content-Type` under the tag V'. No layer is
+copied. `retag` holds no `id-token`: the registry takes no credential.
+`publish` renders the chart from the copy `plan` read, as for any release from
+hemi's copy, with source commit C, both `wacwini.com/` annotations and image
+references `localhost:30500/<name>:<V'>@<digest>`, and accepts the tag on C.
+`deploy` and `github-release` run as for `release`, and the health check
+expects C.
+
+**The workflow refusal is its own step.** GitHub refuses a `GITHUB_TOKEN` tag
+push at a commit whose `.github/workflows` differ from the default branch's
+(**Why the tag comes first** below), and C is usually behind `main`. So when
+`git diff --quiet <C> origin/main -- .github/workflows` reports a difference,
+`Plan the settings release` records the refusal and succeeds, and the next
+step, named exactly `Refuse a settings release behind a workflow change`,
+writes `Release code first: <app>'s workflow files changed since <V>, so its
+settings cannot be released on <C short>.` to stderr, an annotation and the
+run summary, and exits 1, before any tag is claimed. It runs only in
+`settings` mode and only then, and is skipped in every other run. It sits
+beside `Refuse to replay an old version`; hemi reads both by job `cd / plan`,
+step name and conclusion. Do not rename either.
+
+**How hemi reads the outcome.** A settings run released if and only if its
+`cd / retag` and `cd / deploy` jobs concluded `success`. A run that ended as
+mode `none` is green with `retag` skipped. The run summary says
+`mode: settings` or `mode: none (<reason>)`.
+
+**Re-runs and rollbacks.** "Re-run failed jobs" reuses `plan`, so it releases
+the same V'; the retag PUTs the same bytes again and `publish` finds its chart.
+"Re-run all jobs" plans again and lands on the same V' by rule 5. A settings
+release after a rollback ships the rolled-back version's digests on its code,
+above every published version. A re-run of C's own code-release run then sees
+V' on its HEAD: while V' is the newest it resumes V', a harmless re-release of
+the current settings; once anything newer exists, **No replay of an old
+version** refuses it. When C was `main`'s head, HEAD carries both V and V',
+and counts by V'.
 
 ## Where releases live
 

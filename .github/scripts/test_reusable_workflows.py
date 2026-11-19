@@ -948,6 +948,348 @@ class ReusableWorkflowTests(unittest.TestCase):
         contract_index = next(i for i, s in enumerate(steps) if s.get("id") == "contract")
         self.assertLess(names.index("Check the trigger"), contract_index)
 
+    def test_wac_cd_dispatch_takes_exactly_one_of_a_rollback_and_a_settings_revision(self):
+        import os
+        import subprocess
+
+        step = next(s for s in self.wac_cd()["jobs"]["plan"]["steps"] if s.get("name") == "Check the trigger")
+        self.assertEqual(step["env"]["SETTINGS_REVISION"], "${{ inputs.settings_revision }}")
+        for event, rollback, revision, deploy, code, needle in (
+            ("workflow_dispatch", "", "7", "true", 0, ""),
+            ("workflow_dispatch", "", "9999999999", "true", 0, ""),
+            ("workflow_dispatch", "1.2.3", "", "true", 0, ""),
+            ("workflow_dispatch", "1.2.3", "7", "true", 1, "not both"),
+            ("workflow_dispatch", "", "", "true", 1, "exactly one of rollback_version"),
+            ("workflow_dispatch", "", "07", "true", 1, "settings_revision must be"),
+            ("workflow_dispatch", "", "0", "true", 1, "settings_revision must be"),
+            ("workflow_dispatch", "", "10000000000", "true", 1, "settings_revision must be"),
+            ("workflow_dispatch", "", "7", "false", 1, "deploy: false"),
+            ("push", "", "7", "true", 1, "only on workflow_dispatch"),
+            ("push", "", "", "true", 0, ""),
+        ):
+            with self.subTest(event=event, rollback=rollback, revision=revision, deploy=deploy):
+                env = {**os.environ, "GITHUB_REF": "refs/heads/main", "EVENT_NAME": event,
+                       "ROLLBACK_VERSION": rollback, "SETTINGS_REVISION": revision, "DEPLOY": deploy}
+                result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertIn(needle, result.stdout)
+
+    def test_wac_cd_settings_steps_sit_between_the_profile_and_the_claim(self):
+        plan = self.wac_cd()["jobs"]["plan"]
+        steps = plan["steps"]
+        names = [s.get("name") or s.get("uses") for s in steps]
+        settings = steps[names.index("Plan the settings release")]
+        refusal = steps[names.index("Refuse a settings release behind a workflow change")]
+        self.assertEqual(settings["id"], "settings")
+        self.assertEqual(settings["if"], "inputs.settings_revision != ''")
+        self.assertEqual(refusal["if"], "${{ steps.settings.outputs.workflow_refused != '' }}")
+        self.assertEqual(refusal["env"], {"REASON": "${{ steps.settings.outputs.workflow_refused }}"})
+        self.assertEqual(
+            names.index("Read the wacd profile") + 1, names.index("Plan the settings release"),
+            "the settings plan reads the copy's profile",
+        )
+        self.assertEqual(
+            names.index("Plan the settings release") + 1, names.index("Refuse a settings release behind a workflow change")
+        )
+        self.assertEqual(
+            names.index("Refuse a settings release behind a workflow change") + 1, names.index("Plan the version"),
+            "the refusal fails plan before Plan the version claims a tag",
+        )
+        version = steps[names.index("Plan the version")]
+        for key, output in (("SETTINGS_MODE", "mode"), ("SETTINGS_VERSION", "version"), ("SETTINGS_TAG", "tag"),
+                            ("SETTINGS_COMMIT", "commit"), ("SETTINGS_SUMMARY", "summary")):
+            self.assertEqual(version["env"][key], f"${{{{ steps.settings.outputs.{output} }}}}")
+        self.assertEqual(plan["outputs"]["source_images"], "${{ steps.settings.outputs.images }}")
+        for name in ("Plan the settings release",):
+            self.assertIn("registry=registry.network.svc.cluster.local:5000", steps[names.index(name)]["run"])
+
+    def settings_plan(self, *, running="1.4.2", copy_revision="7", revision="7", source="hemi", charts=None,
+                      workflow_change=False, rollback=False, extra_tags=(), claim="pushed", profile_images=None,
+                      running_copy="6"):
+        """Run plan's settings steps against a temp repo, real wacd-version.py and stub gateway and registry reads."""
+        import os
+        import shutil
+        import subprocess
+
+        root = Path(__file__).resolve().parents[2]
+        steps = self.wac_cd()["jobs"]["plan"]["steps"]
+        by_name = {s.get("name"): s for s in steps}
+        settings_step = by_name["Plan the settings release"]
+        refusal_step = by_name["Refuse a settings release behind a workflow change"]
+        version_step = by_name["Plan the version"]
+
+        def git(repo, *args):
+            return subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                 "-c", "tag.gpgsign=false", *args],
+                cwd=repo, check=True, capture_output=True, text=True,
+            ).stdout.strip()
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        repo, scripts = tmp / "repo", tmp / "scripts"
+        repo.mkdir()
+        scripts.mkdir()
+        shutil.copy(root / "scripts" / "wacd-version.py", scripts / "wacd-version.py")
+        git(repo, "-c", "init.defaultBranch=main", "init", "-q")
+        (repo / ".github" / "workflows").mkdir(parents=True)
+        (repo / ".github" / "workflows" / "cd.yml").write_text("on: push\n")
+        git(repo, "add", ".")
+        git(repo, "commit", "-q", "-m", "feat: first")
+        old = git(repo, "rev-parse", "HEAD")
+        git(repo, "tag", "v1.3.9")
+        git(repo, "commit", "--allow-empty", "-q", "-m", "fix: second")
+        code = git(repo, "rev-parse", "HEAD")
+        git(repo, "tag", "v1.4.2")
+        if workflow_change:
+            (repo / ".github" / "workflows" / "cd.yml").write_text("on: [push, workflow_dispatch]\n")
+            git(repo, "commit", "-q", "-am", "ci: take the revision input")
+        else:
+            git(repo, "commit", "--allow-empty", "-q", "-m", "docs: later")
+        for tag, where in extra_tags:
+            git(repo, "tag", tag, {"code": code, "old": old}[where])
+        head = git(repo, "rev-parse", "HEAD")
+        git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        source_commit = old if rollback else code
+        images = {"web": {"repository": "localhost:30500/web", "tag": running, "digest": "sha256:" + "e" * 64}}
+        charts = {**(charts or {}), running: {"revision": source_commit, "images": images, "copy": running_copy}}
+        log = tmp / "log"
+        log.write_text("")
+        (scripts / "wacd-release.py").write_text(
+            "import os, sys\n"
+            "open(os.environ['STUB_LOG'], 'a').write('wacd-release.py ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+            "print('running=' + os.environ['STUB_RUNNING'])\n"
+        )
+        (scripts / "wacd-chart.py").write_text(
+            "import json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            "open(os.environ['STUB_LOG'], 'a').write('wacd-chart.py ' + ' '.join(args) + '\\n')\n"
+            "assert args[1:3] == ['--registry', 'registry.network.svc.cluster.local:5000'], args\n"
+            "chart = json.loads(os.environ['STUB_CHARTS']).get(args[args.index('--version') + 1])\n"
+            "if args[0] == 'chart-copy-revision':\n"
+            "    print('copy_revision=' + ('absent' if chart is None else chart['copy']))\n"
+            "elif chart is None:\n"
+            "    sys.exit(print('wacd chart: deploy/app is not in the registry', file=sys.stderr) or 1)\n"
+            "elif args[0] == 'chart-revision':\n"
+            "    print('revision=' + chart['revision'])\n"
+            "elif args[0] == 'chart-images':\n"
+            "    print('images=' + json.dumps(chart['images'], separators=(',', ':'), sort_keys=True))\n"
+        )
+        (scripts / "wacd-tag.py").write_text(
+            "import os, sys\n"
+            "open(os.environ['STUB_LOG'], 'a').write('wacd-tag.py ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+            "claim = os.environ['STUB_CLAIM']\n"
+            "if claim == 'fail':\n"
+            "    sys.exit(print('wacd tag: git push failed: refused', file=sys.stderr) or 1)\n"
+            "print('Tag line')\n"
+            "print('claim=' + claim)\n"
+        )
+        out, summary = tmp / "out", tmp / "summary"
+        profile = profile_images if profile_images is not None else [{"name": "web", "dockerfile": "Dockerfile", "context": "."}]
+        env = {**os.environ, "WACD_SCRIPTS": str(scripts), "RUNNER_TEMP": str(tmp), "GITHUB_OUTPUT": str(out),
+               "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_SHA": head, "SETTINGS_REVISION": revision,
+               "SOURCE": source, "COPY_REVISION": copy_revision, "APP": "app", "TAG_PREFIX": "v",
+               "PROFILE_IMAGES": json.dumps(profile), "STUB_LOG": str(log), "STUB_RUNNING": running,
+               "STUB_CHARTS": json.dumps(charts), "STUB_CLAIM": claim}
+        self.assertEqual(set(settings_step["env"]), {"SETTINGS_REVISION", "SOURCE", "COPY_REVISION", "APP",
+                                                     "TAG_PREFIX", "PROFILE_IMAGES"})
+
+        def outputs():
+            return dict(line.split("=", 1) for line in out.read_text().splitlines()) if out.exists() else {}
+
+        result = subprocess.run(["bash", "-c", settings_step["run"]], env=env, cwd=repo, capture_output=True, text=True)
+        plan = {"settings": result, "settings_outputs": outputs(), "code": code, "old": old, "head": head,
+                "log": log, "summary": summary}
+        if result.returncode != 0:
+            return plan
+        settings_outputs = outputs()
+        if settings_outputs.get("workflow_refused"):
+            plan["refusal"] = subprocess.run(
+                ["bash", "-c", refusal_step["run"]], env={**env, "REASON": settings_outputs["workflow_refused"]},
+                capture_output=True, text=True,
+            )
+            return plan
+        out.write_text("")
+        version_env = {**env, "ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "",
+                       "DEPLOY": "true",
+                       "SETTINGS_MODE": settings_outputs.get("mode", ""), "SETTINGS_VERSION": settings_outputs.get("version", ""),
+                       "SETTINGS_TAG": settings_outputs.get("tag", ""), "SETTINGS_COMMIT": settings_outputs.get("commit", ""),
+                       "SETTINGS_SUMMARY": settings_outputs.get("summary", "")}
+        plan["version"] = subprocess.run(["bash", "-c", version_step["run"]], env=version_env, cwd=repo,
+                                         capture_output=True, text=True)
+        plan["version_outputs"] = outputs()
+        return plan
+
+    def test_wac_cd_settings_release_retags_the_running_version_above_main_s_newest(self):
+        plan = self.settings_plan()
+        self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+        code = plan["code"]
+        self.assertEqual(
+            {k: plan["version_outputs"][k] for k in ("mode", "version", "tag", "expected_sha")},
+            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "expected_sha": code},
+            "the running code is what the health check must serve",
+        )
+        self.assertEqual(json.loads(plan["settings_outputs"]["images"])["web"]["digest"], "sha256:" + "e" * 64)
+        calls = plan["log"].read_text().splitlines()
+        self.assertEqual(calls[0], "wacd-release.py running --wait-timeout 240", "the running version comes from the gateway")
+        self.assertIn(f"wacd-tag.py claim-tag --tag v1.4.3 --commit {code}", calls)
+        summary = plan["summary"].read_text()
+        self.assertIn("mode: settings", summary)
+        self.assertIn(f"settings revision 7 on 1.4.2's code ({code[:12]}), released as 1.4.3", summary)
+
+    def test_wac_cd_settings_release_after_a_rollback_ships_the_rolled_back_code(self):
+        plan = self.settings_plan(running="1.3.9", rollback=True)
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+        old = plan["old"]
+        outputs = plan["version_outputs"]
+        self.assertEqual((outputs["mode"], outputs["version"], outputs["expected_sha"]), ("settings", "1.4.3", old))
+        self.assertIn(f"wacd-tag.py claim-tag --tag v1.4.3 --commit {old}", plan["log"].read_text())
+        self.assertIn("wacd-chart.py chart-images --registry registry.network.svc.cluster.local:5000 --app app --version 1.3.9",
+                      plan["log"].read_text())
+        self.assertIn(f"settings revision 7 on 1.3.9's code ({old[:12]}), released as 1.4.3", plan["summary"].read_text())
+
+    def test_wac_cd_settings_release_ends_as_none_when_a_newer_revision_is_live(self):
+        plan = self.settings_plan(copy_revision="8", revision="7")
+        self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stderr)
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stderr)
+        self.assertEqual(plan["version_outputs"]["mode"], "none")
+        self.assertEqual((plan["version_outputs"]["version"], plan["version_outputs"]["tag"]), ("", ""))
+        self.assertIn("mode: none (a newer revision is live; its own release follows)", plan["summary"].read_text())
+        self.assertEqual(plan["log"].read_text(), "", "no gateway status, registry read or tag push")
+
+    def test_wac_cd_settings_release_refuses_a_copy_it_cannot_release_on_its_own(self):
+        for kw, needle in (
+            ({"source": "files"}, "come from its files"),
+            ({"copy_revision": "6", "revision": "7"}, "older than the dispatched revision 7"),
+            ({"profile_images": [{"name": "api", "dockerfile": "Dockerfile", "context": "."}]}, "release code first"),
+        ):
+            with self.subTest(case=kw):
+                plan = self.settings_plan(**kw)
+                self.assertEqual(plan["settings"].returncode, 1, plan["settings"].stdout)
+                self.assertIn(f"::error::wac-cd: ", plan["settings"].stdout)
+                self.assertIn(needle, plan["summary"].read_text())
+                self.assertNotIn("wacd-tag.py", plan["log"].read_text())
+
+    def test_wac_cd_settings_release_behind_a_workflow_change_is_refused_by_its_own_step(self):
+        plan = self.settings_plan(workflow_change=True)
+        self.assertEqual(plan["settings"].returncode, 0, "the planning step records the refusal and succeeds")
+        self.assertEqual(set(plan["settings_outputs"]), {"workflow_refused"}, "no mode, version or tag is left")
+        refusal = plan["refusal"]
+        sentence = (f"Release code first: app's workflow files changed since 1.4.2, so its settings cannot be "
+                    f"released on {plan['code'][:12]}.")
+        self.assertEqual(refusal.returncode, 1)
+        self.assertIn(sentence, refusal.stderr)
+        self.assertIn(f"::error::wac-cd: {sentence}", refusal.stdout)
+        self.assertIn(sentence, plan["summary"].read_text())
+        self.assertNotIn("wacd-tag.py", plan["log"].read_text())
+
+    def test_wac_cd_settings_rerun_never_spends_a_second_version_on_one_revision(self):
+        live = self.settings_plan(running="1.4.3", running_copy="7", extra_tags=(("v1.4.3", "code"),))
+        self.assertEqual(live["settings"].returncode, 0, live["settings"].stdout + live["settings"].stderr)
+        self.assertEqual(live["version"].returncode, 0, live["version"].stdout + live["version"].stderr)
+        self.assertEqual(live["version_outputs"]["version"], "1.4.3", "already live: the same version again")
+        self.assertIn("already released as 1.4.3", live["summary"].read_text())
+        for copy, expected in (("absent", "1.4.3"), ("7", "1.4.3"), ("6", "1.4.4"), ("none", "1.4.4")):
+            with self.subTest(claimed_chart=copy):
+                charts = {} if copy == "absent" else {"1.4.3": {"revision": None, "images": None, "copy": copy}}
+                plan = self.settings_plan(extra_tags=(("v1.4.3", "code"),), charts=charts)
+                self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+                self.assertEqual(plan["version_outputs"]["version"], expected)
+                self.assertEqual(plan["version_outputs"]["expected_sha"], plan["code"])
+
+    def test_wac_cd_settings_release_fails_on_any_tag_claim_but_pushed_or_exists(self):
+        plan = self.settings_plan(claim="exists")
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stderr)
+        self.assertEqual(plan["version_outputs"]["mode"], "settings")
+        for claim in ("superseded", "fail"):
+            with self.subTest(claim=claim):
+                plan = self.settings_plan(claim=claim)
+                self.assertEqual(plan["version"].returncode, 1, plan["version"].stdout)
+                self.assertIn("::error::wac-cd: ", plan["version"].stdout)
+                self.assertNotIn("mode", plan["version_outputs"], "never mode none: a refused settings tag fails")
+
+    def test_wac_cd_retag_replaces_build_only_in_settings_mode(self):
+        jobs = self.wac_cd()["jobs"]
+        retag = jobs["retag"]
+        self.assertEqual(retag["needs"], "plan")
+        self.assertEqual(retag["if"], "needs.plan.outputs.mode == 'settings'")
+        self.assertEqual(retag["permissions"], {"contents": "read"}, "the registry takes no token")
+        self.assertEqual(jobs["build"]["if"], "needs.plan.outputs.mode == 'release' || needs.plan.outputs.mode == 'publish'",
+                         "build never runs in settings mode")
+        runs = [s for s in retag["steps"] if "wacd-retag.py" in s.get("run", "")]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["env"], {"SOURCE_IMAGES": "${{ needs.plan.outputs.source_images }}",
+                                          "VERSION": "${{ needs.plan.outputs.version }}"})
+        self.assertEqual(retag["outputs"], {"images": "${{ steps.retag.outputs.images }}"})
+        publish = jobs["publish"]
+        self.assertEqual(publish["needs"], ["plan", "build", "retag"])
+        self.assertEqual(
+            " ".join(publish["if"].split()),
+            "!cancelled() && !failure() && ( needs.plan.outputs.mode == 'release' || "
+            "needs.plan.outputs.mode == 'publish' || needs.plan.outputs.mode == 'settings')",
+        )
+        step = next(s for s in publish["steps"] if s.get("name") == "Publish the deploy chart and the tag")
+        self.assertEqual(step["env"]["IMAGES"], "${{ needs.build.outputs.images || needs.retag.outputs.images }}")
+        for name in ("deploy", "github-release"):
+            with self.subTest(job=name):
+                self.assertIn("needs.plan.outputs.mode == 'settings'", jobs[name]["if"])
+        for name, job in jobs.items():
+            with self.subTest(job=name):
+                self.assertEqual("wacd-retag.py" in json.dumps(job), name == "retag")
+
+    def test_wac_cd_publish_renders_a_settings_release_from_the_running_code(self):
+        import os
+        import subprocess
+
+        step = next(s for s in self.wac_cd()["jobs"]["publish"]["steps"]
+                    if s.get("name") == "Publish the deploy chart and the tag")
+        self.assertEqual(step["env"]["MODE"], "${{ needs.plan.outputs.mode }}")
+        self.assertEqual(step["env"]["EXPECTED_SHA"], "${{ needs.plan.outputs.expected_sha }}")
+        head, code, fleet = "a" * 40, "c" * 40, "f" * 40
+        for mode, source_sha in (("settings", code), ("release", head)):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                log = root / "log"
+                (root / "wacd-chart.py").write_text(
+                    "import os, sys\n"
+                    "open(os.environ['STUB_LOG'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                    "if sys.argv[1] == 'chart-state':\n"
+                    "    seen = os.path.join(os.environ['RUNNER_TEMP'], 'seen')\n"
+                    "    print('state=present' if os.path.exists(seen) else 'state=absent')\n"
+                    "    open(seen, 'w').close()\n"
+                    "else:\n"
+                    "    os.makedirs(os.path.join(os.environ['RUNNER_TEMP'], 'packaged'), exist_ok=True)\n"
+                    "    open(os.path.join(os.environ['RUNNER_TEMP'], 'packaged', 'app-1.4.3.tgz'), 'w').close()\n"
+                    "    print('chart_dir=' + os.environ['RUNNER_TEMP'])\n"
+                )
+                (root / "wacd-tag.py").write_text(
+                    "import os, sys\nopen(os.environ['STUB_LOG'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                )
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                (bin_dir / "helm").write_text("#!/bin/sh\nexit 0\n")
+                (bin_dir / "helm").chmod(0o755)
+                env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "WACD_SCRIPTS": str(root),
+                       "RUNNER_TEMP": str(root), "STUB_LOG": str(log), "GITHUB_SHA": head, "MODE": mode,
+                       "EXPECTED_SHA": source_sha, "APP": "app", "VERSION": "1.4.3", "TAG": "v1.4.3",
+                       "IMAGES": "{}", "WAC_APP_TGZ": "w.tgz", "SOURCE": "hemi", "REVISION": "7",
+                       "FLEET_COMMIT": fleet}
+                result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = log.read_text().splitlines()
+                self.assertEqual(
+                    calls,
+                    [
+                        f"chart-state --registry registry.network.svc.cluster.local:5000 --app app --version 1.4.3 --source-sha {source_sha}",
+                        f"package --profile .wacd-contract/profile.json --version 1.4.3 --source-sha {source_sha} --images {{}} "
+                        f"--wac-app-tgz w.tgz --out {root}/deploy-chart --values-json .wacd-contract/values.json "
+                        f"--annotation wacwini.com/revision=7 --annotation wacwini.com/fleet-commit={fleet}",
+                        f"chart-state --registry registry.network.svc.cluster.local:5000 --app app --version 1.4.3 --source-sha {source_sha}",
+                        f"push-tag --tag v1.4.3 --sha {source_sha}",
+                    ],
+                )
+
     def test_wac_ci_setup_go_takes_the_version_or_the_version_file_from_the_profile(self):
         import yaml
 
