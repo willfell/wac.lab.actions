@@ -252,10 +252,18 @@ class RegistryReadTests(RegistryCase):
         _, _, manifest = self.registry.routes["/v2/deploy/travel/manifests/0.1.0"]
         self.assertEqual(
             chart.chart_release(self.address, "travel", "0.1.0"),
-            {"digest": digest_of(manifest), "revision": SHA, "images": IMAGES, "copy": "none"},
+            {"digest": digest_of(manifest), "revision": SHA, "images": IMAGES, "copy": "none", "fleet_commit": "none"},
         )
-        self.registry.put_chart("travel", "0.4.0", images=refs, extra={"wacwini.com/revision": "7"})
-        self.assertEqual(chart.chart_release(self.address, "travel", "0.4.0")["copy"], "7")
+        fleet = "f" * 40
+        self.registry.put_chart("travel", "0.4.0", images=refs,
+                                extra={"wacwini.com/revision": "7", "wacwini.com/fleet-commit": fleet})
+        found = chart.chart_release(self.address, "travel", "0.4.0")
+        self.assertEqual((found["copy"], found["fleet_commit"]), ("7", fleet))
+        self.registry.put_chart("travel", "0.5.0", images=refs,
+                                extra={"wacwini.com/revision": "7", "wacwini.com/fleet-commit": "abc"})
+        with self.assertRaises(chart.ChartError) as ctx:
+            chart.chart_release(self.address, "travel", "0.5.0")
+        self.assertIn("wacwini.com/fleet-commit", str(ctx.exception))
         self.assertIsNone(chart.chart_release(self.address, "travel", "0.2.0"))
         self.registry.put_chart("travel", "0.3.0")
         with self.assertRaises(chart.ChartError) as ctx:

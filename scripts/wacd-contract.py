@@ -17,8 +17,10 @@ Then, as the design numbers the rules:
 3. The gateway holds no copy and the repository has its files: the files,
    exactly as before.
 4. Anything else fails before anything is built: a copy that cannot be read
-   or names another repository than the job token's, no copy and no files, a
-   refusal, or a gateway that stays unavailable.
+   (its runtime setting a key wacd-chart.py's package owns included, which
+   publish would refuse only after the tag) or names another repository than
+   the job token's, no copy and no files, a refusal, or a gateway that stays
+   unavailable.
 
 On success it prints `source=hemi|files`, `revision=<n>|`,
 `fleet_commit=<sha>|` and `reason=<sentence>` for $GITHUB_OUTPUT. On failure
@@ -71,16 +73,17 @@ dropping `id-token` from its own ci.yml:
 
 | hemi | files on main | files in the merge commit | result |
 | --- | --- | --- | --- |
-| 200 `hemi` | absent | present | fails: `<path> was added back` |
-| 200 `hemi` | present | present | hemi's settings, and a line per file still on main |
+| 200 `hemi` | absent | present | fails: `<path> was added back`, or, when the merge commit's first parent is not main's head, the merge commit predates the clean-up |
+| 200 `hemi` | present | present | hemi's settings, and a line per file still on main; fails when the pull request changes either file's blob |
 | 200 `hemi` | absent | absent | hemi's settings |
 | 200 `files` | absent | present | the files: the restore pull request, or a new app's first one |
 | 200 `files` | absent | absent | fails: wait for the restore pull request (or, for a new app, nothing to check) |
 | 200 `files` | present | any | the files, as before |
-| anything else | present | any | the files, as before; the summary names hemi's status |
+| anything else | present | present | the files, as before; the summary names hemi's status |
+| anything else | present | removes one | fails: hemi did not answer and the pull request removes the files |
 | 401 or 403 | absent | any | fails: hemi refused the token (or the event, outside `pull_request`); register a new app first |
 | no answer, a timeout or 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
-| an address that does not resolve | absent | any | fails: the job must run on a Lab runner |
+| an address that does not resolve, three times | absent | any | fails: the job must run on a Lab runner |
 | no token minted | absent | any | fails: GitHub would not mint a job token |
 | any other status | absent | any | fails, naming the status |
 
@@ -94,7 +97,7 @@ required, and `identity.repositoryId`, when present, must be the token's. A
 `hemi` answer is read in full. A 200 that cannot be read, names another
 repository than the token's or does not derive a profile is treated as an
 answer but a 200, and so is a job with no `id-token` grant.
-No answer and a 5xx are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
+No answer, a 5xx and an address that does not resolve are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
 apart; each attempt, token mint included, is bounded at PR_ATTEMPT_SECONDS by
 a worker thread, so a reply that trickles in counts as silence. On success it prints
 `source=hemi|files` and `revision=<n>|`, and with source `hemi` leaves
@@ -181,6 +184,9 @@ UNREACHABLE = (
 
 PR_SENTENCES = {
     "added_back": "{path} was added back; {app}'s settings live in hemi.",
+    "changed": "{path} was changed; {app}'s settings live in hemi, so change them there.",
+    "stale": "This run's merge commit is older than {app}'s clean-up; update the branch and re-run.",
+    "removed": "hemi did not answer, and this pull request removes {app}'s files; re-run when hemi answers.",
     "still_on_main": (
         "{path} is still on main until hemi's clean-up pull request merges; hemi's settings were used."
     ),
@@ -454,6 +460,10 @@ def fetch(out, wait_text):
         profile.validate(derived, Path.cwd(), values_in_repo=False)
     except profile.ProfileError as err:
         raise unreadable(str(err)) from None
+    try:
+        chart.deploy_values(copy["runtime"], derived["app"], {})
+    except chart.ChartError as err:
+        raise unreadable(f"its runtime is the values file, and {err}") from None
     write(out, {"contract.json": copy, "profile.json": derived, "values.json": copy["runtime"]})
     reason = (
         f"Settings come from hemi's copy, revision {revision}, read at wac.fleet "
@@ -463,19 +473,37 @@ def fetch(out, wait_text):
 
 
 def tree_entries(checkout, paths, which):
-    """The paths among these that are files in the tree at checkout's HEAD.
+    """{path: blob id} for the paths among these that are files in the tree at checkout's HEAD.
 
     Only trees are read, so a checkout fetched with no blobs answers; the
-    names are compared exactly, never as patterns.
+    names are compared exactly, never as patterns, and two files are the same
+    exactly when their blob ids are.
     """
     wanted = sorted(set(paths))
     output = git(checkout, ["ls-tree", "-z", "HEAD", "--", *wanted], which)
-    found = set()
+    found = {}
     for entry in output.split(b"\0"):
         meta, tab, name = entry.partition(b"\t")
-        if tab and meta.split(b" ")[1:2] == [b"blob"]:
-            found.add(name.decode("utf-8", "replace"))
-    return {path for path in wanted if path in found}
+        fields = meta.split(b" ")
+        if tab and len(fields) == 3 and fields[1] == b"blob":
+            found[name.decode("utf-8", "replace")] = fields[2].decode("ascii", "replace")
+    return {path: found[path] for path in wanted if path in found}
+
+
+def first_parent(checkout, which):
+    """The first parent named in the raw commit at checkout's HEAD, or None.
+
+    The raw object is read, so a depth-1 checkout, whose parents are cut off,
+    still names it. A pull request's merge commit has the base branch's head
+    there, as it was when GitHub made it.
+    """
+    raw = git(checkout, ["cat-file", "commit", "HEAD"], which)
+    for line in raw.split(b"\n"):
+        if not line:
+            break
+        if line.startswith(b"parent "):
+            return line[len(b"parent "):].decode("ascii", "replace")
+    return None
 
 
 def git(checkout, args, which):
@@ -551,8 +579,9 @@ def bounded_attempt():
 def ask_hemi():
     """("ok", copy), ("status", code) or (silent | no_mint | unreachable | no_grant | unreadable, None).
 
-    Silence, a 5xx and a token GitHub would not mint are asked again; an
-    address that does not resolve is not, since only another runner helps.
+    Silence, a 5xx, a token GitHub would not mint and an address that does
+    not resolve are asked again: a lookup can fail once on a Lab runner, and
+    only on a runner outside the cluster does it keep failing.
     """
     if not granted():
         return "no_grant", None
@@ -562,7 +591,8 @@ def ask_hemi():
             time.sleep(PR_BACKOFF[min(attempt, len(PR_BACKOFF)) - 1])
         status, raw, token = bounded_attempt()
         if status == "unreachable":
-            return "unreachable", None
+            last = "unreachable"
+            continue
         if status == "no_mint":
             last = "no_mint"
             continue
@@ -668,6 +698,8 @@ def pull_request(out, main, head):
     files_on_main = profile_path in on_main
     if outcome != "ok":
         if files_on_main:
+            if set(paths) - set(tree_entries(head, paths, "pull request's tree")):
+                raise Refusal(PR_SENTENCES["removed"].format(app=repository_name()))
             return "files", "", [PR_SENTENCES[f"{outcome}_files"].format(status=answer, runner=runner_name())]
         app, event = repository_name(), event_name()
         if outcome == "status":
@@ -693,10 +725,17 @@ def pull_request(out, main, head):
     ordered = list(dict.fromkeys(paths))
     added = [path for path in ordered if path in in_head and path not in on_main]
     if added:
+        main_head = git(main, ["rev-parse", "HEAD"], "default branch's tree").decode("ascii", "replace").strip()
+        if not files_on_main and first_parent(head, "pull request's tree") != main_head:
+            raise Refusal(PR_SENTENCES["stale"].format(app=app))
         raise Refusal(" ".join(PR_SENTENCES["added_back"].format(path=path, app=app) for path in added))
+    kept = [path for path in ordered if path in on_main and path in in_head]
+    changed = [path for path in kept if in_head[path] != on_main[path]]
+    if changed:
+        raise Refusal(" ".join(PR_SENTENCES["changed"].format(path=path, app=app) for path in changed))
     derived = profile.from_contract(copy, profile.DERIVED_VALUES)
     write(out, {"contract.json": copy, "profile.json": derived, "values.json": copy["runtime"]})
-    notes = [PR_SENTENCES["still_on_main"].format(path=path) for path in ordered if path in on_main and path in in_head]
+    notes = [PR_SENTENCES["still_on_main"].format(path=path) for path in kept]
     return "hemi", revision, [PR_SENTENCES["hemi"].format(revision=revision), *notes]
 
 

@@ -95,7 +95,11 @@ queue every run, though: GitHub keeps at most one pending run per group, so a
 newer pending run replaces an older one that has not started. For pushes that
 is harmless, because the later push's version covers the earlier commits. A
 replaced rollback dispatch never runs, so check that a rollback started before
-walking away from it.
+walking away from it. A dispatch can also replace a pending push run: a
+rollback or settings dispatch that arrives while a push waits behind a running
+release takes the push's place, and that push's commits stay unreleased until
+the next push. hemi's guard is to dispatch only when no `cd.yml` run is queued
+or running.
 
 Only `build` runs `docker build`, so only `build` needs a dind runner; the
 others push a chart with helm, call the gateway or the GitHub API, and run on
@@ -139,7 +143,9 @@ published before the registration; that order no longer works.
 | no copy, and the repository has `.github/wacd.json` | `.github/wacd.json` and its values file, exactly as before | nothing new |
 | anything else | nothing: `plan` fails before anything is built | |
 
-Anything else is a copy that cannot be read, a copy whose
+Anything else is a copy that cannot be read (a `hemi` copy whose `runtime`
+sets `app`, `images` or `global`, which `wacd-chart.py package` owns and would
+refuse in `publish`, after the tag, included), a copy whose
 `identity.repositoryId` is not the job token's `repository_id`, a copy whose
 source is `files` (or no copy) in a repository with no `.github/wacd.json`, a
 denial, any other status, or a gateway still answering 503 after the bound.
@@ -150,8 +156,10 @@ stale files.
 When the copy is acted on, `.wacd-contract/` holds `contract.json` (the copy as
 received), `profile.json` (the profile it stands for, in `.github/wacd.json`'s
 shape, its `values_file` pointing at `.wacd-contract/values.json`) and
-`values.json` (the copy's `runtime`). Whenever a copy exists, `plan` uploads
-the directory as the artifact `wac-cd-contract`. `plan` reads its profile
+`values.json` (the copy's `runtime`). When the source is `hemi`, `plan` uploads
+the directory as the artifact `wac-cd-contract`; a `files` copy uploads
+nothing, since only `publish` reads the artifact and only for `hemi`, and the
+chart takes that copy's revision and fleet commit from `plan`'s outputs. `plan` reads its profile
 outputs from the copy; `build`, `deploy` and `github-release` take every
 setting from those outputs and read no settings file; `publish` downloads the
 artifact and packages the chart from `profile.json` with
@@ -284,12 +292,17 @@ gateway's codes gets this sentence in the run summary:
 | `fleet_commit_older_than_last_release` | The settings this release was planned with are older than the settings already released. |
 | `revision_annotation_missing` | This chart does not carry both of the settings annotations, and the gateway requires them for this app. |
 | `revision_mismatch` | This chart's settings revision is not the one the fleet copy holds now; plan again to release the current settings. |
+| `fleet_repository_unreachable` | The gateway's GitHub App can no longer read wac.fleet; the owner must restore its access, so re-running will not help. |
+| `fleet_repository_mismatch` | The gateway's pinned wac.fleet no longer names wacwini/wac.fleet; the gateway needs a change, so re-running will not help. |
 
 `fleet_commit_not_on_default_branch`, `fleet_commit_older_than_last_release`,
 `revision_annotation_missing` and `revision_mismatch` come only from the
 gateway's release check, which answers a `release` in `deploy`; that check can
 also return the three `fleet_copy_*` codes, for the copy at the chart's own
-fleet commit, while the `contract` request returns only those three. `scripts/wacd-release.py` holds the map, and both
+fleet commit, while the `contract` request returns only those three and the
+two `fleet_repository_*` codes. Those two (wacwini/wac.lab#575) can come from
+either and name a fault on the gateway's side that a re-run cannot clear;
+like every coded refusal, they are never asked again. `scripts/wacd-release.py` holds the map, and both
 scripts use it: `deploy` fails with
 `release request refused (HTTP 403): <sentence>` and adds
 `The gateway refused the release: <sentence>` to the job summary. Its POST
@@ -356,7 +369,12 @@ or rollback leaves the original Release as it was.
 registry for that version's deploy chart. When the chart is there, recorded
 from this push's SHA, the run skips build and publish and releases that
 version. That is how a run whose rollout failed after the tag is finished:
-re-run it. A chart recorded from another SHA fails the plan.
+re-run it. A chart recorded from another SHA fails the plan. The resumed chart
+ships the settings it was published with, not the copy as it is now, so the
+`wac-cd plan` summary adds `Resuming <V>, whose chart was published with
+settings revision <n>.` (or `from the repository's files.`), read from the
+chart's `wacwini.com/revision` annotation; a read that fails says so and does
+not fail the run.
 
 When the chart is absent, the run builds and publishes that same version
 (`release`, or `publish` with `deploy: false`), with this push's SHA as the
@@ -380,9 +398,20 @@ running version (the bootstrap tag before the first release) proceeds.
 `origin/main` carries a `<tag_prefix>X.Y.Z` tag that HEAD does not contain, tagged
 HEAD or not (a re-run of a run whose first attempt failed before it tagged, for
 instance), or when HEAD's highest tag is lower than the highest tag on
-`origin/main`. The same tags and the same version order that pick the next
-version are used. A tagged HEAD gets `This run is for <tag>, but <newest> is
+`origin/main`. The next version is picked from the tags merged into HEAD;
+this rule counts the tags merged into `origin/main`, in the same version
+order. A tagged HEAD gets `This run is for <tag>, but <newest> is
 already published. Roll back or release anew; an old build is never replayed.`
+when the newer tag's commit contains HEAD, which is a real replay. When it does
+not, HEAD's version was overtaken rather than replayed, and the run gets
+`<tag> was taken by a later release (<newest>) that does not contain this
+commit, which has not been released; push a new commit to release it.` That is
+this sequence: commit c2's run claims `v1.0.1` and fails in build while `v1.0.0`
+(c1) keeps running; a settings release then tags `v1.0.2` on c1, the running
+code; "Re-run all jobs" on c2 is refused with that sentence, and only a new
+commit releases c2's changes, as `v1.0.3`. Git ancestry alone tells the two
+apart, so when c2 had been released and then rolled back before the settings
+release, the sentence still says it was never released.
 An untagged HEAD, or a tagged one that lacks a tag on main, gets `This commit is
 older than <tag>, which is already published and contains or replaces it. Roll
 back or release anew; an old build is never replayed.` The sentence goes to the
@@ -567,7 +596,10 @@ copy as for any run, and then, in `Plan the settings release`:
    network reads, this one and rule 5's. The status wait ends 15 seconds
    before the deadline, starts no request with under 2 seconds of the wait
    left, and bounds each read by the time left, so an app that never settles
-   always reaches the rollout refusal with its sentence. At the deadline
+   reaches the rollout refusal with its sentence, unless GitHub's token
+   endpoint is slow on the last status pass (each mint has its own fixed 20
+   seconds): then the backstop below ends the read and the run fails as a fault
+   with the deadline sentence, never with a wrong decision. At the deadline
    itself a `SIGALRM` backstop stops a read that trickles past every socket
    timeout and fails the step with a sentence; each read disarms it and
    restores the previous handler as soon as it decides, so it cannot fire
@@ -586,8 +618,9 @@ copy as for any run, and then, in `Plan the settings release`:
    `chart_digest` must be its manifest digest. An unsteady answer is read
    again; one that never settles is refused (below). A `version` that is not
    a bare `X.Y.Z` (an unknown digest or a lost ledger), a `chart_digest` the
-   registry does not hold, or a 403 without a reason (the app is not
-   onboarded) fails `plan` at once; a 503 (the gateway cannot read Kubernetes)
+   registry does not hold, or a 403 without a reason (the gateway refused the
+   status read: an app it does not know, or a token it could not check) fails
+   `plan` at once; a 503 (the gateway cannot read Kubernetes)
    is retried within the bound. After a rollback V is the rolled-back version,
    never the newest tag. C, V's source commit, and V's digests come from the
    same chart.
@@ -601,7 +634,14 @@ copy as for any run, and then, in `Plan the settings release`:
 5. Never spends a second version on one revision, and never undoes a
    rollback:
    - when V's chart already carries `settings_revision`, V' is V (a re-run
-     after the release went live; releasing it again changes nothing);
+     after the release went live; releasing it again changes nothing), as
+     long as V's chart was published from the fleet commit the copy is read at
+     now (`wacwini.com/fleet-commit`). When the two differ, the copy was
+     changed without a new revision (a hand edit of `active.json` in
+     wac.fleet; hemi never reuses a number), and `plan` fails with `revision
+     <n> runs from fleet commit <a>, but the copy is at <b>; a changed copy
+     needs a new revision number.` rather than re-prove V green without the
+     change;
    - otherwise `wacd-release.py earlier-release` judges the versions on
      `main` above V, newest first. A version counts as released only with
      evidence that it was proved running: its GitHub Release, which `github-release` creates
@@ -641,7 +681,10 @@ and never mode `none`. The summary says `mode: settings` and
 when V' is V.
 
 `build` never runs in this mode. `retag` runs in its place, and only in this
-mode: `scripts/wacd-retag.py` reads each of V's image manifests by digest from
+mode: `scripts/wacd-retag.py` first reads the tag V' itself: when it already
+serves V's digest (a re-run) nothing is written, and when it serves another
+digest the retag fails, since a version is never moved. Otherwise it reads each
+of V's image manifests by digest from
 `registry.network.svc.cluster.local:5000`, accepting the OCI and Docker
 manifest and index media types, checks the bytes against the digest, and PUTs
 the same bytes with the same `Content-Type` under the tag V'. No layer is
@@ -659,7 +702,12 @@ no mode, version or tag, and the named step writes the sentence to stderr, an
 anything is tagged or retagged. Both run only in `settings` mode and only
 then, and are skipped in every other run. They sit beside `Refuse to replay an
 old version`; hemi reads all three by job `cd / plan`, step name and
-conclusion. Do not rename any of them.
+conclusion. Do not rename any of them. A refusal whose sentence comes out empty
+(the script printed none) never records an empty output, which would skip its
+step and leave a green run that released nothing: the planning step fails
+itself with a fixed sentence instead, such as `The settings release was refused
+while the app rolls out, and the refusal gave no reason.` or `This run was
+refused as a replay of an old version, and the refusal gave no reason.`
 
 - `Refuse a settings release while the app is rolling out`: the status never
   became steady within the status wait, which ends 15 seconds before the
@@ -706,7 +754,7 @@ the same `release evidence deadline exceeded`), which is why the "Failed at
 the release" row reads the app's target instead.
 
 **Re-runs and rollbacks.** "Re-run failed jobs" reuses `plan`, so it releases
-the same V'; the retag PUTs the same bytes again and `publish` finds its chart.
+the same V'; the retag finds V' already on the digests and writes nothing, and `publish` finds its chart.
 "Re-run all jobs" plans again and lands on the same V' by rule 5, or refuses
 by it after a rollback. A settings release after a rollback ships the
 rolled-back version's digests on its code, above every published version. A
@@ -714,6 +762,16 @@ re-run of C's own code-release run then sees V' on its HEAD: while V' is the
 newest it resumes V', a harmless re-release of the current settings; once
 anything newer exists, **No replay of an old version** refuses it. When C was
 `main`'s head, HEAD carries both V and V', and counts by V'.
+
+**Known limit: a settings release over an unfinished code release.** A
+settings release plans V' above every tag on `main`, so when a code release's
+run claimed its version and failed before releasing it (the c2 sequence under
+**No replay of an old version**), V' overtakes that claim: "Re-run all jobs" on
+the code release is refused, and "Re-run failed jobs" builds and publishes the
+old version and then fails at `deploy`'s downgrade check. Only a new commit
+releases that code. The `v1.36` follow-up is to refuse the settings release
+while a tag above V has no published chart, so a re-run of the code release
+stays the way out.
 
 **Known limit: a repository id that changes.** When a repository's id changes
 (a delete and re-create under the same name), hemi starts its revisions at 1

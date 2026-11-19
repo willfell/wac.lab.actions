@@ -170,20 +170,35 @@ class RetagTests(unittest.TestCase):
         code, _, err = self.cli("--images", running({"web": digest}), "--version", "1.4.3")
         self.assertEqual(code, 0, err)
         gets = [(path, headers) for method, path, headers, _ in self.registry.requests if method == "GET"]
-        self.assertEqual([path for path, _ in gets], [f"/v2/web/manifests/{digest}"])
-        accepted = {part.strip() for part in gets[0][1]["Accept"].split(",")}
-        self.assertEqual(accepted, {OCI_MANIFEST, OCI_INDEX, DOCKER_MANIFEST, DOCKER_LIST})
+        self.assertEqual([path for path, _ in gets], ["/v2/web/manifests/1.4.3", f"/v2/web/manifests/{digest}"],
+                         "the new tag is read first, then the manifest by digest")
+        for path, headers in gets:
+            with self.subTest(path=path):
+                accepted = {part.strip() for part in headers["Accept"].split(",")}
+                self.assertEqual(accepted, {OCI_MANIFEST, OCI_INDEX, DOCKER_MANIFEST, DOCKER_LIST})
         self.assertEqual(
-            [method for method, *_ in self.registry.requests], ["GET", "PUT"],
-            "one manifest read and one manifest write: no blob is read or uploaded",
+            [method for method, *_ in self.registry.requests], ["GET", "GET", "PUT"],
+            "two manifest reads and one manifest write: no blob is read or uploaded",
         )
 
-    def test_retagging_again_is_the_same_put(self):
+    def test_a_tag_already_on_the_same_digest_is_left_as_it_is(self):
         digest, body = self.registry.hold("web", OCI_MANIFEST, "web")
         for _ in range(2):
             code, out, err = self.cli("--images", running({"web": digest}), "--version", "1.4.3")
             self.assertEqual(code, 0, err)
-        self.assertEqual([sent for _, _, sent in self.registry.puts()], [body, body])
+            self.assertIn('"tag":"1.4.3"', out)
+        self.assertEqual([sent for _, _, sent in self.registry.puts()], [body], "the re-run writes nothing")
+
+    def test_a_tag_already_on_another_digest_fails_and_is_never_overwritten(self):
+        digest, _ = self.registry.hold("web", OCI_MANIFEST, "web")
+        other = manifest(OCI_MANIFEST, "a build that already took 1.4.3")
+        self.registry.manifests[("web", "1.4.3")] = (OCI_MANIFEST, other)
+        code, out, err = self.cli("--images", running({"web": digest}), "--version", "1.4.3")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, f"wacd retag: web:1.4.3 already names {digest_of(other)}, not {digest}; "
+                              "a version is never retagged\n")
+        self.assertEqual(self.registry.puts(), [])
+        self.assertEqual(self.registry.manifests[("web", "1.4.3")], (OCI_MANIFEST, other))
 
     def test_failures_put_nothing_and_say_why_in_one_line(self):
         digest, _ = self.registry.hold("web", OCI_MANIFEST, "web")

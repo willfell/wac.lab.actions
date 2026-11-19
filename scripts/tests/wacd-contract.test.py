@@ -45,6 +45,8 @@ CODES = (
     "fleet_commit_older_than_last_release",
     "revision_annotation_missing",
     "revision_mismatch",
+    "fleet_repository_unreachable",
+    "fleet_repository_mismatch",
 )
 
 
@@ -295,6 +297,20 @@ class RuleTests(FetchCase):
             with self.subTest(case=label):
                 self.summary.unlink(missing_ok=True)
                 self.assertRefused(self.fetch(response), "cannot be read")
+
+    def test_rule_4_a_runtime_that_sets_what_wac_cd_owns_is_refused_before_anything_is_tagged(self):
+        """publish's package refuses these keys; plan refuses them first, so no tag is claimed for a doomed release."""
+        for key in ("app", "images", "global"):
+            with self.subTest(key=key):
+                self.summary.unlink(missing_ok=True)
+                copy_value = fixture_copy("hemi")
+                copy_value["runtime"][key] = "anything"
+                self.assertRefused(self.fetch(answer(copy_value)), "cannot be read")
+                self.assertIn(repr(key), self.stderr)
+        files_copy = fixture_copy("files")
+        files_copy["runtime"]["app"] = "anything"
+        self.summary.unlink()
+        self.assertEqual(self.fetch(answer(files_copy)), 0, "a files copy's runtime is never rendered")
 
     def test_a_token_that_names_no_repository_is_refused_when_a_copy_is_present(self):
         self.repository_id = None
@@ -698,8 +714,8 @@ class PullRequestCase(unittest.TestCase):
         self.repository_id = REPOSITORY_ID
         self.grant = True
 
-    def branch(self, name, files):
-        """Push a branch whose tree is a README plus exactly these files."""
+    def branch(self, name, files, parents=()):
+        """Push a branch whose tree is a README plus exactly these files, on these parent commits."""
         self.commits = getattr(self, "commits", 0) + 1
         git("checkout", "-q", "--orphan", f"commit-{self.commits}", cwd=self.work)
         git("rm", "-rq", "--cached", "--ignore-unmatch", ".", cwd=self.work)
@@ -713,7 +729,13 @@ class PullRequestCase(unittest.TestCase):
             target.write_text(text)
         git("add", "-A", cwd=self.work)
         git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", name, cwd=self.work)
-        git("push", "-q", "--force", str(self.remote), f"HEAD:refs/heads/{name}", cwd=self.work)
+        commit = git("rev-parse", "HEAD", cwd=self.work).strip()
+        if parents:
+            linked = [arg for parent in parents for arg in ("-p", parent)]
+            commit = git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit-tree", *linked,
+                         "-m", name, "HEAD^{tree}", cwd=self.work).strip()
+        git("push", "-q", "--force", str(self.remote), f"{commit}:refs/heads/{name}", cwd=self.work)
+        return commit
 
     def checkout(self, name, path):
         """actions/checkout with fetch-depth 1, filter blob:none and a sparse .github/wacd.json.
@@ -736,9 +758,10 @@ class PullRequestCase(unittest.TestCase):
         self.minted.append(value)
         return value
 
-    def run_pr(self, *responses, main=None, head=None):
-        self.branch("main", FILES if main is None else main)
-        self.branch("pr", FILES if head is None else head)
+    def run_pr(self, *responses, main=None, head=None, base=None):
+        """The pull request's tree is checked out as GitHub's merge commit: main's head as its first parent."""
+        on_main = self.branch("main", FILES if main is None else main)
+        self.branch("pr", FILES if head is None else head, parents=(base or on_main,))
         self.checkout("main", ".wacd-main")
         self.checkout("pr", ".wacd-head")
         return self.invoke(*responses)
@@ -832,6 +855,16 @@ class PullRequestDecisionTests(PullRequestCase):
         self.assertEqual(json.loads((self.out / "values.json").read_text()), fixture_copy("hemi")["runtime"])
         self.assertEqual(json.loads((self.out / "profile.json").read_text())["values_file"], ".wacd-contract/values.json")
 
+    def test_hemi_with_the_files_still_on_main_fails_a_pull_request_that_changes_them(self):
+        changed = {PROFILE: FILES[PROFILE], VALUES: FILES[VALUES] + "extra: true\n"}
+        code = self.run_pr(self.hemi_answer(), main=FILES, head=changed)
+        self.assertFails(code, f"{VALUES} was changed; travel's settings live in hemi, so change them there.")
+        self.summary.unlink()
+        both = {PROFILE: FILES[PROFILE].replace("{", "{ ", 1), VALUES: changed[VALUES]}
+        self.assertFails(self.run_pr(self.hemi_answer(), main=FILES, head=both),
+                         " ".join(f"{path} was changed; travel's settings live in hemi, so change them there."
+                                  for path in (PROFILE, VALUES)))
+
     def test_hemi_with_no_files_uses_hemi_with_nothing_to_say(self):
         for label, main in (("cut over", {}), ("the clean-up pull request itself", FILES)):
             with self.subTest(case=label):
@@ -846,6 +879,8 @@ class PullRequestDecisionTests(PullRequestCase):
     def test_files_copy_and_a_restore_pull_request_runs_on_its_own_files(self):
         code = self.run_pr(self.hemi_answer("files"), main={}, head=FILES)
         self.assertSource(code, "files")
+        self.assertIn("hemi's copy (revision 7) says travel is returning to its files and this pull request puts "
+                      "them back, so its own files were used.", self.summary_text)
         self.assertNotIn("added back", self.summary_text)
 
     def test_a_new_apps_first_pull_request_runs_on_the_files_it_adds(self):
@@ -909,11 +944,21 @@ class PullRequestDecisionTests(PullRequestCase):
             ("no answer", "drop", "hemi did not answer; using the repository's files"),
             ("timeout", (200, fixture_copy("hemi"), 1), "hemi did not answer; using the repository's files"),
         ):
-            for head_label, head in (("present", FILES), ("absent", {})):
-                with self.subTest(answer=label, head=head_label):
+            with self.subTest(answer=label):
+                self.summary.unlink(missing_ok=True)
+                self.assertSource(self.run_pr(response, main=FILES, head=FILES), "files")
+                self.assertIn(said, self.summary_text)
+
+    def test_hemis_clean_up_pull_request_during_a_hemi_outage_fails_saying_so(self):
+        """It deletes the files from main; run on its own files, checks and render would fail reading them."""
+        sentence = (f"hemi did not answer, and this pull request removes {REPOSITORY}'s files; re-run when hemi "
+                    "answers.")
+        for label, response in (("503", (503, {})), ("401", (401, {})), ("no answer", "drop")):
+            for head_label, head in (("both", {}), ("the values file", {PROFILE: FILES[PROFILE]}),
+                                     ("the profile", {VALUES: FILES[VALUES]})):
+                with self.subTest(answer=label, removes=head_label):
                     self.summary.unlink(missing_ok=True)
-                    self.assertSource(self.run_pr(response, main=FILES, head=head), "files")
-                    self.assertIn(said, self.summary_text)
+                    self.assertFails(self.run_pr(response, main=FILES, head=head), sentence)
 
     def test_a_refused_token_with_no_files_on_main_fails(self):
         for status in (401, 403):
@@ -991,11 +1036,42 @@ class PullRequestTests(PullRequestCase):
         unreachable = ("the contract job must run on a Lab runner: ci-light-abc12 cannot reach hemi's "
                        "in-cluster address. Pass a Lab pool as `runner`.")
         self.assertFails(self.run_pr((200, fixture_copy("hemi")), main={}, head={}), unreachable)
-        self.assertEqual(len(self.minted), 1, "an address that does not resolve is not asked again")
-        self.assertEqual(self.sleeps, [])
+        self.assertEqual(len(self.minted), contract.PR_ATTEMPTS, "a lookup that fails is asked twice more")
+        self.assertEqual(self.sleeps, list(contract.PR_BACKOFF))
         self.summary.unlink(missing_ok=True)
         self.assertSource(self.run_pr((200, fixture_copy("hemi")), main=FILES, head=FILES), "files")
         self.assertIn(unreachable, self.summary_text)
+
+    def test_a_lookup_that_fails_once_on_a_lab_runner_is_asked_again(self):
+        real = socket.getaddrinfo
+        failures = []
+
+        def flaky(*args, **kwargs):
+            if not failures:
+                failures.append(args[0])
+                raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+            return real(*args, **kwargs)
+
+        with patch.object(socket, "getaddrinfo", flaky):
+            code = self.run_pr((200, fixture_copy("hemi")), main={}, head={})
+        self.assertSource(code, "hemi")
+        self.assertEqual((len(failures), len(self.hemi.seen), self.sleeps), (1, 1, [contract.PR_BACKOFF[0]]))
+
+    def test_a_rerun_whose_merge_commit_is_older_than_the_clean_up_says_to_update_the_branch(self):
+        """The pull request's merge commit was made on main before hemi's clean-up merged."""
+        before = self.branch("main", FILES)
+        self.branch("main", {}, parents=(before,))
+        after = self.branch("main", {}, parents=(git("rev-parse", "HEAD", cwd=self.work).strip(),))
+        self.branch("pr", FILES, parents=(before,))
+        self.checkout("main", ".wacd-main")
+        self.checkout("pr", ".wacd-head")
+        self.assertFails(self.invoke((200, fixture_copy("hemi"))),
+                         "This run's merge commit is older than travel's clean-up; update the branch and re-run.")
+        self.branch("pr", FILES, parents=(after,))
+        self.checkout("pr", ".wacd-head")
+        self.summary.unlink()
+        self.assertFails(self.invoke((200, fixture_copy("hemi"))),
+                         " ".join(f"{path} was added back; travel's settings live in hemi." for path in (PROFILE, VALUES)))
 
     def test_a_token_github_would_not_mint_is_not_hemis_silence(self):
         refusals = []

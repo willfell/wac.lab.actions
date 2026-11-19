@@ -205,7 +205,7 @@ jobs:
       - name: Upload the settings copy (actions/upload-artifact v4)
         timeout-minutes: 3
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: steps.contract.outputs.revision != ''
+        if: steps.contract.outputs.source == 'hemi'
         with:
           name: wac-cd-contract
           path: .wacd-contract/
@@ -237,6 +237,7 @@ jobs:
           APP: ${{ steps.profile.outputs.app }}
           TAG_PREFIX: ${{ steps.profile.outputs.tag_prefix }}
           PROFILE_IMAGES: ${{ steps.profile.outputs.images }}
+          FLEET_COMMIT: ${{ steps.contract.outputs.fleet_commit }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -277,6 +278,7 @@ jobs:
             --deadline "$deadline" 2> "$RUNNER_TEMP/settings.err")" || code=$?
           if [[ "$code" -eq 3 ]]; then
             reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
+            [[ -n "$reason" ]] || fail "The settings release was refused while the app rolls out, and the refusal gave no reason."
             printf 'rollout_refused=%s\n' "$reason" >> "$GITHUB_OUTPUT"
             echo "wac-cd: settings release refused while the app rolls out; the next step reports it"
             exit 0
@@ -287,6 +289,7 @@ jobs:
           commit="$(sed -n 's/^commit=//p' <<< "$status")"
           images="$(sed -n 's/^images=//p' <<< "$status")"
           live="$(sed -n 's/^copy_revision=//p' <<< "$status")"
+          live_fleet="$(sed -n 's/^fleet_commit=//p' <<< "$status")"
           if ! python3 -I -c 'import json, sys
           running = sorted(json.loads(sys.argv[1]))
           wanted = sorted(image["name"] for image in json.loads(sys.argv[2]))
@@ -298,6 +301,9 @@ jobs:
           claimed="$(sed -n 's/^claimed=//p' <<< "$planned")"
           above="$(sed -n 's/^above=//p' <<< "$planned")"
           if [[ "$live" == "$SETTINGS_REVISION" ]]; then
+            if [[ "$live_fleet" != "$FLEET_COMMIT" ]]; then
+              fail "revision $SETTINGS_REVISION runs from fleet commit $live_fleet, but the copy is at $FLEET_COMMIT; a changed copy needs a new revision number."
+            fi
             version="$running"
           else
             code=0
@@ -305,7 +311,8 @@ jobs:
               --revision "$SETTINGS_REVISION" --running "$running" --versions "$above" --claimed "$claimed" \
               --deadline "$deadline" 2> "$RUNNER_TEMP/settings.err")" || code=$?
             if [[ "$code" -eq 4 ]]; then
-              fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
+              reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
+              fail "${reason:-The settings release was refused because the revision was already released, and the refusal gave no reason.}"
             elif [[ "$code" -ne 0 ]]; then
               fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/ *$//')"
             fi
@@ -416,6 +423,10 @@ jobs:
                 --published "$1" 2> "$RUNNER_TEMP/version.err")" || code=$?
               if [[ "$code" -ne 0 ]]; then
                 reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/version.err" | sed 's/^wacd version: //; s/ *$//')"
+                if [[ "$code" -eq 3 && -z "$reason" ]]; then
+                  code=1
+                  reason="This run was refused as a replay of an old version, and the refusal gave no reason."
+                fi
                 if [[ "$code" -eq 3 ]]; then
                   printf 'replay_refused=%s\n' "$reason" >> "$GITHUB_OUTPUT"
                   echo "wac-cd: replay refused; the next step reports it"
@@ -451,6 +462,20 @@ jobs:
               esac
             fi
             expected_sha="$GITHUB_SHA"
+          fi
+          resumed=""
+          if [[ "$mode" == resume ]]; then
+            published="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-copy-revision --registry "$registry" \
+              --app "$APP" --version "$version" 2> /dev/null || true)"
+            case "${published#copy_revision=}" in
+              none) resumed="Resuming $version, whose chart was published from the repository's files." ;;
+              [1-9]*)
+                if [[ "${published#copy_revision=}" =~ ^[1-9][0-9]{0,9}$ ]]; then
+                  resumed="Resuming $version, whose chart was published with settings revision ${published#copy_revision=}."
+                fi
+                ;;
+            esac
+            resumed="${resumed:-Resuming $version; the settings revision its chart was published with could not be read.}"
           fi
           superseded=""
           if [[ "$mode" == release || "$mode" == publish ]]; then
@@ -496,6 +521,10 @@ jobs:
             if [[ -n "$superseded" ]]; then
               echo
               echo "Superseded: $superseded. Nothing was built or published; the newer run releases these commits cumulatively."
+            fi
+            if [[ -n "$resumed" ]]; then
+              echo
+              echo "$resumed"
             fi
             if [[ -n "${SETTINGS_REVISION:-}" && "$mode" == settings ]]; then
               echo

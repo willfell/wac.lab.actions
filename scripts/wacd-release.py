@@ -31,9 +31,11 @@ until N seconds pass, then the read exits ROLLING_OUT_EXIT (3) so plan can
 report the rollout from its own step. A version that is not a bare X.Y.Z, a
 chart_digest that is not the registry's, or a chart the registry lacks is a
 fault and exits 1 at once. A 503 (the gateway cannot read Kubernetes) is
-retried within N; a 403 without a reason means the app is not onboarded. It
-prints running=, commit= (the chart's source), images= (its images) and
-copy_revision= (the copy revision it ships).
+retried within N; a 403 without a reason is a refused status read, which an
+app the gateway does not know and a token it could not check both give. It
+prints running=, commit= (the chart's source), images= (its images),
+copy_revision= (the copy revision it ships) and fleet_commit= (the wac.fleet
+commit that copy was read at, or none).
 
 `earlier-release --app A --prefix P --revision N --running V --versions L
 --claimed X` is the settings plan's rule B over L, the versions on main above
@@ -53,8 +55,11 @@ candidates' Releases are read, never V's.
 Both settings reads take `--deadline <epoch seconds>`, the plan step's one
 wall-clock deadline. The status wait ends DEADLINE_MARGIN seconds before it,
 starts no request with under MIN_READ_SECONDS of that wait left, and bounds
-each read by the time left, so an app that never settles always reaches the
-rollout refusal (exit 3) with its sentence. A hard backstop (SIGALRM) at the
+each read by the time left, so an app that never settles reaches the rollout
+refusal (exit 3) with its sentence, unless GitHub's token endpoint is slow on
+the last status pass (ci.oidc_token() has its own fixed 20 s): then the
+backstop ends the read and the run fails as a fault with the deadline
+sentence, never with a wrong decision. A hard backstop (SIGALRM) at the
 deadline itself stops a read that trickles past every socket timeout; each
 command disarms it and restores the previous handler in a finally, so it
 cannot fire once the command has decided.
@@ -117,17 +122,20 @@ ALREADY_RELEASED = (
     "Revision {revision} was released as {earlier}, and {running} runs now after a rollback. To put those "
     "settings on the running code, make them live again in hemi; they are released as a new revision."
 )
-NOT_ONBOARDED = (
-    "The gateway does not know this app (its status was refused without a reason), so it is not "
-    "onboarded and there is no running version to release settings on."
+STATUS_REFUSED = (
+    "The gateway refused the status read (HTTP 403 with no reason), so the running version is unknown "
+    "and no settings were released."
 )
 
 # The gateway's closed list of refusal codes, each with the sentence a run
-# summary shows. The contract operation can return only the three fleet_copy_*
-# codes; the release check can return all seven, those three included (a copy
-# missing, unreadable or naming another repository at the chart's own fleet
-# commit). One map serves wacd-contract.py and the release below, so every
-# sentence holds for each place its code can come from.
+# summary shows. The contract operation can return the three fleet_copy_*
+# codes and the two fleet_repository_* codes; the release check can return all
+# nine (the fleet_copy_* ones for a copy missing, unreadable or naming another
+# repository at the chart's own fleet commit). The two fleet_repository_* codes
+# (wacwini/wac.lab#575) are faults on the gateway's side that a re-run cannot
+# clear. One map serves wacd-contract.py and the release below, so every
+# sentence holds for each place its code can come from; a coded refusal is
+# never asked again.
 REFUSALS = {
     "fleet_copy_missing": (
         "The gateway found no copy of this app's settings where one is required, so the "
@@ -152,6 +160,14 @@ REFUSALS = {
     "revision_mismatch": (
         "This chart's settings revision is not the one the fleet copy holds now; plan again to "
         "release the current settings."
+    ),
+    "fleet_repository_unreachable": (
+        "The gateway's GitHub App can no longer read wac.fleet; the owner must restore its access, "
+        "so re-running will not help."
+    ),
+    "fleet_repository_mismatch": (
+        "The gateway's pinned wac.fleet no longer names wacwini/wac.fleet; the gateway needs a change, "
+        "so re-running will not help."
     ),
 }
 UNKNOWN_REFUSAL = "The gateway refused this request for a reason this wac-cd does not know"
@@ -634,7 +650,7 @@ def running_release(app, wait_timeout, request=None):
                 return version, release
             seen = version
         elif code == 403 and value.get("reason") is None:
-            raise ReleaseError(NOT_ONBOARDED)
+            raise ReleaseError(STATUS_REFUSED)
         elif code != 503:
             raise rejected("status request", code, value)
         time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
@@ -845,7 +861,7 @@ def run(args):
         images = json.dumps(release["images"], separators=(",", ":"), sort_keys=True)
         return (
             f"running={version}\ncommit={release['revision']}\nimages={images}\n"
-            f"copy_revision={release['copy']}"
+            f"copy_revision={release['copy']}\nfleet_commit={release['fleet_commit']}"
         )
     if args.command == "health":
         if not SHA_PATTERN.fullmatch(args.sha):

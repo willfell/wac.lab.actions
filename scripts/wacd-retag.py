@@ -9,12 +9,14 @@ image reference in the chart to carry the chart's version as its tag
 publishes a version twice, so the digests have to be reachable under V'.
 
 `--images` is V's image map as `wacd-chart.py chart-images` prints it. For each
-image, the manifest is read by digest from the push address with an Accept
+image, the tag V' is read first: when it already serves the digest (a re-run)
+nothing is written, and when it serves another digest the retag fails, since a
+version is never moved, as `build` refuses an image tag from other source.
+Otherwise the manifest is read by digest from the push address with an Accept
 header naming the OCI and Docker manifest and index media types, its bytes are
 checked against the digest, and the same bytes are PUT under the tag V' with
 the Content-Type the registry served. Layers and an index's child manifests
-are already in the repository, so nothing else moves. A PUT of the same bytes
-under the same tag changes nothing, so a re-run is harmless.
+are already in the repository, so nothing else moves.
 
 On success it prints `images=<json>` for $GITHUB_OUTPUT: the same map with
 the tag V'. Any problem exits 1 with one "wacd retag: ..." line on stderr.
@@ -101,8 +103,23 @@ def parse_images(text):
     return images
 
 
+def tagged_digest(base, name, version):
+    """The digest the tag version already serves, or None when the registry has no such tag."""
+    status, _, body = send(urllib.request.Request(f"{base}/{version}", headers={"Accept": ", ".join(MANIFEST_TYPES)}))
+    if status == 404:
+        return None
+    if status != 200:
+        raise RetagError(f"the registry answered HTTP {status} for {name}:{version}")
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
 def retag_one(registry, name, digest, version):
     base = f"http://{registry}/v2/{name}/manifests"
+    existing = tagged_digest(base, name, version)
+    if existing == digest:
+        return
+    if existing is not None:
+        raise RetagError(f"{name}:{version} already names {existing}, not {digest}; a version is never retagged")
     status, headers, body = send(
         urllib.request.Request(f"{base}/{digest}", headers={"Accept": ", ".join(MANIFEST_TYPES)})
     )

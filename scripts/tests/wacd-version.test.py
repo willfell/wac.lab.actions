@@ -173,6 +173,26 @@ class RepoTest(unittest.TestCase):
             with self.subTest(published=published):
                 self.assertEqual(self.refusal(published=published), sentence)
 
+    def test_a_claim_overtaken_by_a_settings_release_on_older_code_says_the_commit_was_never_released(self):
+        """c2's run claims v1.0.1 and fails in build; a settings release then tags v1.0.2 on c1, the running code.
+
+        Re-running c2's run is not a replay: v1.0.2 does not contain c2, which has never been released.
+        """
+        c1 = self.commit("feat: running")
+        self.tag("v1.0.0")
+        self.commit("fix: claimed, build failed")
+        self.tag("v1.0.1")
+        self.tag("v1.0.2", c1)
+        self.assertEqual(
+            self.refusal(),
+            "v1.0.1 was taken by a later release (v1.0.2) that does not contain this commit, which has not "
+            "been released; push a new commit to release it.",
+        )
+        with self.assertRaises(version.ReplayRefused):
+            self.plan()
+        self.commit("fix: next")
+        self.assertEqual(self.plan(), {"mode": "release", "version": "1.0.3", "tag": "v1.0.3"})
+
     def test_a_higher_tag_off_main_does_not_make_main_s_newest_old(self):
         self.two_releases()
         git(self.repo, "checkout", "-q", "-b", "stray", "HEAD~1")

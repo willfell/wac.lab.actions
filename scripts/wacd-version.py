@@ -17,7 +17,10 @@ tagged by an older pipeline gets its first chart. `true` and `unknown` resume.
 A deploying run fails when origin/main carries a tag with the prefix that HEAD
 does not contain, or when HEAD's highest tag is lower than the highest tag with
 the prefix on origin/main: what is running changes by a rollback or a new
-release, never by replaying an old build.
+release, never by replaying an old build. When that higher tag does not contain
+HEAD (a settings release tagged it on older running code after HEAD's run
+claimed its version and failed before releasing), the refusal says HEAD was
+never released and a new commit releases it, instead of calling it a replay.
 
 `--mode settings --commit C --running V` plans a settings-only release: the
 running version V's images, built from C, released again under a new version
@@ -132,6 +135,17 @@ def commit_of_ref(repo, ref):
     return out.strip()
 
 
+def contains(repo, tag, commit):
+    """Whether the commit tag names has commit in its history (an old build) or not (overtaken)."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, f"refs/tags/{tag}^{{commit}}"],
+        capture_output=True,
+    )
+    if result.returncode not in (0, 1):
+        raise VersionError(f"git merge-base failed for {tag}")
+    return result.returncode == 0
+
+
 def tag_lines(repo, *args):
     return [line for line in git(repo, "tag", *args).splitlines() if line]
 
@@ -181,6 +195,11 @@ def plan(
         if deploy:
             newest, unmerged = published_tags(repo, prefix, main_ref)
             if newest is not None and parsed < newest[0]:
+                if not contains(repo, newest[1], head):
+                    raise ReplayRefused(
+                        f"{tag} was taken by a later release ({newest[1]}) that does not contain this "
+                        "commit, which has not been released; push a new commit to release it."
+                    )
                 raise ReplayRefused(
                     f"This run is for {tag}, but {newest[1]} is already published. "
                     "Roll back or release anew; an old build is never replayed."

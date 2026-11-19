@@ -548,7 +548,7 @@ class SettingsModeTests(unittest.TestCase):
             self.assertEqual(json.loads(Path(receipt).read_text())["wac_cd"], plan)
 
 
-RELEASE = {"digest": CHART_DIGEST, "revision": SOURCE, "images": IMAGES, "copy": "6"}
+RELEASE = {"digest": CHART_DIGEST, "revision": SOURCE, "images": IMAGES, "copy": "6", "fleet_commit": "f" * 40}
 
 
 def unsteady(change):
@@ -603,7 +603,8 @@ class RunningTests(unittest.TestCase):
         self.assertEqual(
             out.splitlines(),
             [f"running={VERSION}", f"commit={SOURCE}",
-             "images=" + json.dumps(IMAGES, separators=(",", ":"), sort_keys=True), "copy_revision=6"],
+             "images=" + json.dumps(IMAGES, separators=(",", ":"), sort_keys=True), "copy_revision=6",
+             "fleet_commit=" + "f" * 40],
         )
         self.assertEqual(script.bodies, [wacd.STATUS_BODY()], "one status read; nothing is released")
         self.assertEqual(reads, [("travel", VERSION)])
@@ -674,7 +675,8 @@ class RunningTests(unittest.TestCase):
     def test_refusals(self):
         _, _, _, (code, out, err, summary) = self.run_cli((403, {}))
         self.assertEqual((code, out), (1, ""))
-        self.assertIn("not onboarded", err)
+        self.assertEqual(err, "wacd release: The gateway refused the status read (HTTP 403 with no reason), so the "
+                              "running version is unknown and no settings were released.\n")
         _, _, _, (code, out, err, summary) = self.run_cli((403, {"reason": "fleet_copy_missing"}))
         self.assertEqual((code, out), (1, ""))
         self.assertIn(wacd.REFUSALS["fleet_copy_missing"], err)
@@ -1178,6 +1180,8 @@ class RefusalTests(unittest.TestCase):
         "fleet_commit_older_than_last_release",
         "revision_annotation_missing",
         "revision_mismatch",
+        "fleet_repository_unreachable",
+        "fleet_repository_mismatch",
     )
 
     def release(self, *responses):
@@ -1223,6 +1227,20 @@ class RefusalTests(unittest.TestCase):
                 self.assertIn(wacd.REFUSALS[reason], err)
                 self.assertIn(wacd.REFUSALS[reason], summary)
                 self.assertEqual([body for _, body in gateway.seen], [wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION)])
+
+    def test_a_fault_the_gateway_names_as_final_says_re_running_will_not_help(self):
+        for reason, sentence in (
+            ("fleet_repository_unreachable", "The gateway's GitHub App can no longer read wac.fleet; the owner must "
+                                             "restore its access, so re-running will not help."),
+            ("fleet_repository_mismatch", "The gateway's pinned wac.fleet no longer names wacwini/wac.fleet; the "
+                                          "gateway needs a change, so re-running will not help."),
+        ):
+            with self.subTest(reason=reason):
+                code, err, summary, gateway = self.release((200, running(VERSION)), self.refused(reason))
+                self.assertEqual(code, 1)
+                self.assertIn(sentence, err)
+                self.assertIn(sentence, summary)
+                self.assertEqual(len(gateway.seen), 2, "a coded refusal is never asked again")
 
     def test_a_coded_pre_check_refusal_is_named_too(self):
         code, err, summary, _ = self.release(self.refused("revision_annotation_missing"))
