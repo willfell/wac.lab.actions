@@ -94,6 +94,7 @@ is what hemi reads.
 | Secret | Meaning |
 | --- | --- |
 | `npm_token` | optional token for private npm packages; empty uses the job's GitHub token |
+| `build_secrets` | optional newline-separated `KEY=VALUE` build-time values, mounted into every image build as BuildKit secrets with id the lower-cased `KEY` (**Build secrets** below); empty mounts none |
 
 | Output | Meaning |
 | --- | --- |
@@ -984,6 +985,69 @@ is also passed as the image's `sha_build_arg` when it has one.
 Image builds need BuildKit, because the npm token reaches the build as a
 `--secret` (`id=node_auth_token`), never as a build arg that would be baked
 into a layer.
+
+## Build secrets
+
+`build_secrets` carries values an image build needs that must not show in the
+run's log, such as the key Next.js encrypts server actions with or a token a
+build uses to upload source maps. It is a secret, never an input: GitHub masks
+only values that arrive through `secrets:`, and `build_args` reaches the build
+step through its `env:` block, which the log prints with its values. A caller
+passes it in the `cd` job:
+
+```yaml
+    secrets:
+      build_secrets: |
+        NEXT_SERVER_ACTIONS_ENCRYPTION_KEY=${{ secrets.NEXT_SERVER_ACTIONS_ENCRYPTION_KEY }}
+```
+
+Each non-blank line is `KEY=VALUE`, with `KEY` matching `^[A-Z][A-Z0-9_]*$`
+and the value everything after the first `=`, unchanged (it may be empty); a
+trailing carriage return is dropped. Each line becomes
+`--secret id=<key>,src=<file>` on every image build, after the npm token's
+mount, where `<key>` is the `KEY` lower-cased:
+`NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` is mounted as
+`next_server_actions_encryption_key`. A Dockerfile reads a mount only in the
+`RUN` that names it, as an environment variable with Dockerfile syntax 1.10 or
+later:
+
+```dockerfile
+# syntax=docker/dockerfile:1.10
+RUN --mount=type=secret,id=next_server_actions_encryption_key,env=NEXT_SERVER_ACTIONS_ENCRYPTION_KEY npm run build
+```
+
+or, without `env=`, as the file `/run/secrets/<key>`.
+
+The build step fails before any image is built on a line with no `=`, an empty
+`KEY`, a `KEY` that does not match the pattern, `NODE_AUTH_TOKEN` (already
+mounted as `node_auth_token` from `npm_token`), or a `KEY` given twice. Each
+refusal names the line number, and the `KEY` once it is a valid name, and
+never prints a value.
+
+How the values are kept out of the log: the runner masks a multi-line secret
+as a whole and line by line, so each `KEY=VALUE` line is masked, but a value
+printed on its own would not be. `wacd-chart.py build-secrets` therefore reads
+the lines from the step's environment, never from its arguments, and issues
+an `::add-mask::` for each non-blank value before any image is built. It
+writes each value to a file of mode 0600 in a fresh directory under
+`$RUNNER_TEMP`. The step then removes `BUILD_SECRETS` from its environment, so
+docker, crane and the helper scripts never inherit it, and deletes the
+directory when it ends, whether or not the build succeeded; the runner also
+empties `$RUNNER_TEMP` after every job. The values travel as files rather than
+through `env=` so that a caller's `KEY` never becomes a variable of the build
+step, where a name such as `PATH`, `VERSION` or `DOCKER_HOST` would change what
+the step does. A value of only a character or two, once masked, hides every
+occurrence of those characters in the rest of the log.
+
+What a mount does not do: it keeps a value out of the log and out of the
+image's layer history, and nothing more. When the build itself writes the
+value into an output, the value is in the image. Next.js writes the server
+actions encryption key into its server-reference manifest under
+`.next/server`, so an image built with that key holds it whether the key came
+through a mount or a build arg, and anyone who can pull the image can read it.
+
+With `build_secrets` empty or not passed, the build is exactly as before: the
+same `docker build` arguments, no directory and no masks.
 
 ## The registry split
 

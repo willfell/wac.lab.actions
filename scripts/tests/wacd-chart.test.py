@@ -849,5 +849,73 @@ class BuildArgsTests(unittest.TestCase):
         self.assertTrue(bad.stderr.startswith("wacd chart: "), bad.stderr)
         self.assertEqual(len(bad.stderr.strip().splitlines()), 1)
 
+
+PLANTED = "planted-value-7f3a"
+
+
+class BuildSecretsTests(unittest.TestCase):
+    """`build-secrets` reads BUILD_SECRETS from its environment, never from its arguments."""
+
+    def run_secrets(self, text):
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "build-secrets", "--dir", str(out)],
+            env={**os.environ, "BUILD_SECRETS": text}, capture_output=True, text=True, check=False,
+        )
+        return result, out
+
+    def test_each_line_becomes_a_0600_file_named_by_the_lowercased_key_and_a_mask(self):
+        result, out = self.run_secrets(
+            "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY=abc=def%25 x\r\n\n  \nSENTRY_AUTH_TOKEN=tok\nBLANK=   \nEMPTY=\nIN_CR=a\rb\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["::add-mask::abc=def%2525 x", "::add-mask::tok", "::add-mask::a%0Db"],
+        )
+        files = {path.name: path for path in out.iterdir()}
+        self.assertEqual(
+            {name: path.read_bytes() for name, path in files.items()},
+            {
+                "next_server_actions_encryption_key": b"abc=def%25 x",
+                "sentry_auth_token": b"tok",
+                "blank": b"   ",
+                "empty": b"",
+                "in_cr": b"a\rb",
+            },
+        )
+        for name, path in files.items():
+            with self.subTest(file=name):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_refusals_name_the_line_or_the_key_and_never_the_value(self):
+        cases = (
+            ("no equals sign", f"GOOD={PLANTED}\n{PLANTED}", "build_secrets line 2 is not KEY=VALUE"),
+            ("an empty KEY", f"={PLANTED}", "build_secrets line 1 has an empty KEY"),
+            ("a lower-case KEY", f"lower={PLANTED}", "build_secrets line 1 has a KEY that does not match ^[A-Z][A-Z0-9_]*$"),
+            ("a leading digit", f"1ABC={PLANTED}", "line 1 has a KEY that does not match"),
+            ("a leading underscore", f"_KEY={PLANTED}", "line 1 has a KEY that does not match"),
+            ("a leading space", f" KEY={PLANTED}", "line 1 has a KEY that does not match"),
+            ("a hyphen", f"KEY-NAME={PLANTED}", "line 1 has a KEY that does not match"),
+            ("the value before an equals sign", f"A=1\n{PLANTED.upper().replace('-', '_')}x-y=z",
+             "line 2 has a KEY that does not match"),
+            ("the npm token", f"NODE_AUTH_TOKEN={PLANTED}",
+             "build_secrets line 1 names NODE_AUTH_TOKEN, which wac-cd already mounts as node_auth_token"),
+            ("a repeated KEY", f"A={PLANTED}\nB=x\nA={PLANTED}2", "build_secrets line 3 repeats A from line 1"),
+        )
+        for label, text, expected in cases:
+            with self.subTest(case=label):
+                result, out = self.run_secrets(text)
+                self.assertEqual((result.returncode, result.stdout), (1, ""))
+                self.assertTrue(result.stderr.startswith("wacd chart: "), result.stderr)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn(PLANTED, result.stderr)
+                self.assertNotIn(PLANTED.upper().replace("-", "_"), result.stderr)
+                self.assertEqual(list(out.iterdir()), [], "a refused set writes no file")
+
+
 if __name__ == "__main__":
     unittest.main()

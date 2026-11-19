@@ -2,7 +2,9 @@
 
 The pull-request half of wacd: it runs the profile's checks, renders and
 validates the deploy chart, and runs the fleet gates. It builds no image and
-pushes nothing. The profile it reads is in [The wacd profile](wacd-profile.md).
+pushes nothing, so it takes no `build_secrets` (`wac-cd`'s build-time secret
+mounts) and a pull request's `ci.commands` run without them. The profile it
+reads is in [The wacd profile](wacd-profile.md).
 
 ```yaml
 name: ci

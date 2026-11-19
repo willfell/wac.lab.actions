@@ -1328,6 +1328,160 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertNotIn("values_file", text)
                 self.assertNotIn(".wacd-contract", text)
 
+    def run_build_step(self, build_secrets):
+        """Run the build step's script against stand-in docker and crane, with the real wacd-chart.py parsers.
+
+        image-state answers absent until docker has built the image, then present.
+        docker logs its argv and env, and reads every --secret src= file it is
+        given; every python3 the step starts logs its argv. Returns what each saw.
+        """
+        import os
+        import subprocess
+
+        root = Path(__file__).resolve().parents[2]
+        step = next(s for s in self.wac_cd()["jobs"]["build"]["steps"] if s.get("name") == "Build and push the images")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp)
+        bin_dir, scripts, runner_temp, app = tmp / "bin", tmp / "scripts", tmp / "runner-temp", tmp / "app"
+        for directory in (bin_dir, scripts, runner_temp, app):
+            directory.mkdir()
+        (scripts / "wacd-chart.py").write_text(
+            "import os, runpy, sys\n"
+            "if sys.argv[1] == 'image-state':\n"
+            "    name = sys.argv[sys.argv.index('--name') + 1]\n"
+            "    built = os.path.exists(os.path.join(os.environ['STUB_DIR'], 'built-' + name))\n"
+            "    print('state=present' if built else 'state=absent')\n"
+            "else:\n"
+            f"    sys.argv[0] = {str(root / 'scripts' / 'wacd-chart.py')!r}\n"
+            "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+        )
+        (bin_dir / "python3").write_text(
+            f'#!/bin/sh\nprintf "%s\\n" "$*" >> "$STUB_DIR/python3.log"\nexec {sys.executable} "$@"\n'
+        )
+        (bin_dir / "docker").write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, stat, sys\n"
+            "args = sys.argv[1:]\n"
+            "record = {'argv': args, 'env': dict(os.environ), 'files': {}}\n"
+            "for index, arg in enumerate(args[:-1]):\n"
+            "    if arg == '--secret':\n"
+            "        spec = dict(part.split('=', 1) for part in args[index + 1].split(','))\n"
+            "        if 'src' in spec:\n"
+            "            record['files'][spec['id']] = [open(spec['src']).read(), stat.S_IMODE(os.stat(spec['src']).st_mode)]\n"
+            "if args[0] == 'build':\n"
+            "    print('docker build ran')\n"
+            "    name = args[args.index('-t') + 1].split(':')[0]\n"
+            "    open(os.path.join(os.environ['STUB_DIR'], 'built-' + name), 'w').close()\n"
+            "elif args[0] == 'save':\n"
+            "    open(args[args.index('-o') + 1], 'w').close()\n"
+            "open(os.path.join(os.environ['STUB_DIR'], 'docker.log'), 'a').write(json.dumps(record) + '\\n')\n"
+        )
+        (bin_dir / "crane").write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$STUB_DIR/crane.log"\n'
+            f'if [ "$1" = digest ]; then echo sha256:{"e" * 64}; fi\n'
+        )
+        for stub in ("python3", "docker", "crane"):
+            (bin_dir / stub).chmod(0o755)
+        output = tmp / "github-output"
+        sha = "a" * 40
+        images = [{"name": "web", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "GIT_SHA"},
+                  {"name": "api", "dockerfile": "api/Dockerfile", "context": "api"}]
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(tmp), "LANG": "C.UTF-8", "STUB_DIR": str(tmp),
+               "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output), "GITHUB_SHA": sha,
+               "WACD_SCRIPTS": str(scripts), "PROFILE_IMAGES": json.dumps(images), "VERSION": "1.4.3",
+               "BUILD_ARGS": "A=1", "NODE_AUTH_TOKEN": "npm-token", "BUILD_SECRETS": build_secrets}
+        result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]], cwd=app,
+                                env=env, capture_output=True, text=True)
+
+        def lines(name):
+            path = tmp / name
+            return path.read_text().splitlines() if path.exists() else []
+
+        return {
+            "result": result,
+            "docker": [json.loads(line) for line in lines("docker.log")],
+            "python3": lines("python3.log"),
+            "crane": lines("crane.log"),
+            "output": output.read_text() if output.exists() else "",
+            "runner_temp": runner_temp,
+            "sha": sha,
+        }
+
+    def expected_builds(self, sha, *mounts):
+        return [
+            ["build", "-f", "Dockerfile", "--label", f"org.opencontainers.image.revision={sha}",
+             "--build-arg", f"GIT_SHA={sha}", "--build-arg", "A=1",
+             "--secret", "id=node_auth_token,env=NODE_AUTH_TOKEN", *mounts, "-t", "web:1.4.3", "."],
+            ["build", "-f", "api/Dockerfile", "--label", f"org.opencontainers.image.revision={sha}",
+             "--build-arg", "A=1", "--secret", "id=node_auth_token,env=NODE_AUTH_TOKEN", *mounts,
+             "-t", "api:1.4.3", "api"],
+        ]
+
+    def test_wac_cd_build_without_build_secrets_runs_docker_exactly_as_before(self):
+        run = self.run_build_step("")
+        self.assertEqual(run["result"].returncode, 0, run["result"].stdout + run["result"].stderr)
+        builds = [call["argv"] for call in run["docker"] if call["argv"][0] == "build"]
+        self.assertEqual(builds, self.expected_builds(run["sha"]))
+        self.assertNotIn("::add-mask::", run["result"].stdout)
+        self.assertFalse([line for line in run["python3"] if "build-secrets" in line])
+        self.assertFalse(list(run["runner_temp"].glob("build-secrets*")))
+
+    def test_wac_cd_build_mounts_each_build_secret_and_shows_its_value_nowhere(self):
+        values = {"NEXT_SERVER_ACTIONS_ENCRYPTION_KEY": "planted-key-7f3a=+/%41 x", "SENTRY_AUTH_TOKEN": "planted-token-9d1c"}
+        run = self.run_build_step("".join(f"{key}={value}\n" for key, value in values.items()))
+        result = run["result"]
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        builds = [call for call in run["docker"] if call["argv"][0] == "build"]
+        self.assertEqual(len(builds), 2)
+        first = builds[0]["argv"]
+        secrets_dir = Path(first[first.index("id=node_auth_token,env=NODE_AUTH_TOKEN") + 2].split(",src=")[1]).parent
+        self.assertEqual(secrets_dir.parent, run["runner_temp"])
+        mounts = []
+        for key in sorted(values):
+            mounts += ["--secret", f"id={key.lower()},src={secrets_dir / key.lower()}"]
+        self.assertEqual([build["argv"] for build in builds], self.expected_builds(run["sha"], *mounts))
+        for build in builds:
+            self.assertEqual(build["files"], {key.lower(): [value, 0o600] for key, value in values.items()})
+        self.assertFalse(secrets_dir.exists(), "the secret files outlive the step")
+        masks = [line for line in result.stdout.splitlines() if line.startswith("::add-mask::")]
+        self.assertEqual(masks, ["::add-mask::" + value.replace("%", "%25") for value in values.values()])
+        self.assertLess(result.stdout.index(masks[-1]), result.stdout.index("docker build ran"))
+        unmasked = "\n".join(line for line in (result.stdout + result.stderr).splitlines() if line not in masks)
+        for value in values.values():
+            with self.subTest(value=value):
+                self.assertNotIn(value, unmasked)
+                self.assertNotIn(value, run["output"])
+                self.assertNotIn(value, "\n".join(run["python3"] + run["crane"]))
+                for call in run["docker"]:
+                    self.assertNotIn(value, json.dumps(call["argv"]))
+                    self.assertFalse("BUILD_SECRETS" in call["env"], "docker inherits BUILD_SECRETS")
+                    self.assertFalse(value in json.dumps(call["env"]), "docker's environment holds the value")
+                for path in run["runner_temp"].rglob("*"):
+                    if path.is_file():
+                        self.assertNotIn(value, path.read_text())
+
+    def test_wac_cd_build_refuses_a_bad_build_secret_before_docker_runs(self):
+        run = self.run_build_step("A=planted-ok\nNODE_AUTH_TOKEN=planted-npm-6b2e\n")
+        result = run["result"]
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("build_secrets line 2 names NODE_AUTH_TOKEN", result.stderr)
+        self.assertEqual(run["docker"], [])
+        for value in ("planted-ok", "planted-npm-6b2e"):
+            self.assertNotIn(value, result.stdout + result.stderr)
+        self.assertFalse(list(run["runner_temp"].glob("build-secrets*")))
+
+    def test_wac_cd_build_secrets_is_a_secret_that_reaches_only_the_build_step_env(self):
+        """GitHub masks a value only when it comes from secrets:, never an input, and a run: expression is printed."""
+        doc = self.wac_cd()
+        call = doc[True]["workflow_call"]
+        self.assertNotIn("build_secrets", call["inputs"])
+        self.assertIs(call["secrets"]["build_secrets"]["required"], False)
+        step = next(s for s in doc["jobs"]["build"]["steps"] if s.get("name") == "Build and push the images")
+        self.assertEqual(step["env"]["BUILD_SECRETS"], "${{ secrets.build_secrets }}")
+        self.assertNotIn("${{", step["run"])
+        text = (Path(__file__).resolve().parents[1] / "workflows" / "wac-cd.yml").read_text()
+        self.assertEqual(text.count("secrets.build_secrets"), 1)
+
     def test_wac_cd_only_shadow_may_read_the_repositorys_values_path(self):
         """In hemi mode values_file names a repository path; reading it would fall back to the files."""
         jobs = self.wac_cd()["jobs"]

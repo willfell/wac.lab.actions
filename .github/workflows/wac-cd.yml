@@ -43,6 +43,9 @@ on:
       npm_token:
         description: Token for private npm packages; empty uses the job's GitHub token
         required: false
+      build_secrets:
+        description: Newline-separated KEY=VALUE build-time values mounted into every image build as docker build secrets with id the lower-cased KEY; empty mounts none
+        required: false
     outputs:
       mode:
         description: release, publish, resume, rollback, settings or none
@@ -718,6 +721,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           BUILD_ARGS: ${{ inputs.build_args }}
           NODE_AUTH_TOKEN: ${{ secrets.npm_token || github.token }}
+          BUILD_SECRETS: ${{ secrets.build_secrets }}
         run: |
           set -euo pipefail
           registry=registry.network.svc.cluster.local:5000
@@ -728,6 +732,18 @@ jobs:
               extra+=(--build-arg "$line")
             done <<< "$validated"
           fi
+          secret_args=()
+          if [[ -n "${BUILD_SECRETS:-}" ]]; then
+            secrets_dir="$(mktemp -d "$RUNNER_TEMP/build-secrets.XXXXXX")"
+            trap 'rm -rf "$secrets_dir"' EXIT
+            python3 -I "$WACD_SCRIPTS"/wacd-chart.py build-secrets --dir "$secrets_dir"
+            for file in "$secrets_dir"/*; do
+              if [[ -f "$file" ]]; then
+                secret_args+=(--secret "id=${file##*/},src=$file")
+              fi
+            done
+          fi
+          unset BUILD_SECRETS
           python3 -c 'import json, os
           for image in json.loads(os.environ["PROFILE_IMAGES"]):
               print("\t".join([image["name"], image["dockerfile"], image["context"], image.get("sha_build_arg", "")]))' \
@@ -750,7 +766,8 @@ jobs:
                 args+=(--build-arg "$sha_arg=$GITHUB_SHA")
               fi
               args+=("${extra[@]}")
-              args+=(--secret "id=node_auth_token,env=NODE_AUTH_TOKEN" -t "$name:$VERSION" "$context")
+              args+=(--secret "id=node_auth_token,env=NODE_AUTH_TOKEN" ${secret_args[@]+"${secret_args[@]}"})
+              args+=(-t "$name:$VERSION" "$context")
               docker build "${args[@]}"
               docker save "$name:$VERSION" -o "$RUNNER_TEMP/image.tar"
               crane push --insecure "$RUNNER_TEMP/image.tar" "$ref"
