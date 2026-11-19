@@ -499,7 +499,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(len(asks), 1, "plan asks the gateway exactly once")
         ask = asks[0]
         self.assertEqual(ask["id"], "contract")
-        self.assertIn("fetch --out .wacd-contract", ask["run"])
+        self.assertIn('fetch --out .wacd-contract --wait-timeout "$WAIT_TIMEOUT"', ask["run"])
+        self.assertEqual(ask["env"], {"WAIT_TIMEOUT": "${{ inputs.wait_timeout }}"})
         self.assertLess(names.index(ask["name"]), names.index("Read the wacd profile"))
         upload = next(s for s in steps if str(s.get("uses", "")).startswith("actions/upload-artifact@"))
         self.assertEqual(upload["if"], "steps.contract.outputs.revision != ''")
@@ -507,6 +508,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(upload["with"]["path"], ".wacd-contract/")
         self.assertIs(upload["with"]["include-hidden-files"], True, "upload-artifact skips dot directories")
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        self.assertEqual(upload["with"]["retention-days"], 1, "settings and Secret names outlive the run otherwise")
         self.assertLess(names.index(ask["name"]), names.index(upload["name"]))
         for key in ("source", "revision", "fleet_commit"):
             self.assertEqual(plan["outputs"][key], f"${{{{ steps.contract.outputs.{key} }}}}")
@@ -641,7 +643,8 @@ class ReusableWorkflowTests(unittest.TestCase):
                 )
                 out = root / "out"
                 out.write_text("")
-                env = {**os.environ, "WACD_SCRIPTS": str(root), "GITHUB_OUTPUT": str(out), "RUNNER_TEMP": tmp}
+                env = {**os.environ, "WACD_SCRIPTS": str(root), "GITHUB_OUTPUT": str(out), "RUNNER_TEMP": tmp,
+                       "WAIT_TIMEOUT": "2100"}
                 result = subprocess.run(["bash", "-c", ask["run"]], env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
                 self.assertEqual(out.read_text(), stdout)
@@ -725,6 +728,27 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertNotIn(".github/wacd.json", text)
                 self.assertNotIn("values_file", text)
                 self.assertNotIn(".wacd-contract", text)
+
+    def test_wac_cd_only_shadow_may_read_the_repositorys_values_path(self):
+        """In hemi mode values_file names a repository path; reading it would fall back to the files."""
+        jobs = self.wac_cd()["jobs"]
+        readers = [name for name, job in jobs.items() if name != "plan" and "values_file" in json.dumps(job)]
+        self.assertLessEqual(set(readers), {"shadow"})
+        publish = json.dumps(jobs["publish"])
+        self.assertNotIn("values_file", publish)
+        self.assertNotIn("deploy/values", publish)
+        package = next(s for s in jobs["publish"]["steps"] if s.get("name") == "Publish the deploy chart and the tag")
+        self.assertIn("--values-json .wacd-contract/values.json", package["run"])
+
+    def test_wac_cd_plan_has_time_to_wait_out_the_gateway_for_wait_timeout(self):
+        import math
+
+        doc = self.wac_cd()
+        trigger = doc.get("on", doc.get(True))
+        default = int(trigger["workflow_call"]["inputs"]["wait_timeout"]["default"])
+        plan = doc["jobs"]["plan"]
+        self.assertIsInstance(plan["timeout-minutes"], int, "GitHub expressions have no arithmetic to size it from the input")
+        self.assertGreaterEqual(plan["timeout-minutes"], math.ceil(default / 60) + 5)
 
     def test_wac_ci_setup_go_takes_the_version_or_the_version_file_from_the_profile(self):
         import yaml

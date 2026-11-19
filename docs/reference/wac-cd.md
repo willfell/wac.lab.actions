@@ -60,7 +60,7 @@ on a push that input is empty.
 | `rollback_version` | a published version to release again; only on `workflow_dispatch` | empty |
 | `deploy` | `false` publishes the images, chart and tag without releasing them | `true` |
 | `build_args` | newline-separated `KEY=VALUE` build args passed to every image build | empty |
-| `wait_timeout` | seconds to wait for the gateway's release proof | `2100` |
+| `wait_timeout` | seconds `plan` waits out an unavailable gateway for the settings, and seconds to wait for the gateway's release proof | `2100` |
 
 | Secret | Meaning |
 | --- | --- |
@@ -100,6 +100,13 @@ gateway answers with hemi's copy, `active.json` in wac.fleet, and the wac.fleet
 commit it read it at, or with `{"copy": null, "fleet_commit": null}` for a
 repository never cut over. Then:
 
+**Pin this only after Lab's gateway serves `contract`** (wacwini/wac.lab#570
+deployed). A gateway older than that admits only `release`, `status` and
+`migrate`, and answers `contract` with the same uncoded 403 as a caller it
+does not verify, so every run of every repository, cut over or not, fails at
+`plan` with the sentence for an uncoded denial below. `plan` does not guess
+that such a gateway means "no copy": it fails closed.
+
 | The gateway answers | Settings come from | The chart also carries |
 | --- | --- | --- |
 | a copy whose `flags.source` is `hemi` | the copy: its profile is derived by `wacd-profile.py --contract`, its `runtime` is the values | `wacwini.com/revision`, `wacwini.com/fleet-commit` |
@@ -130,15 +137,17 @@ the repository is deleted before `plan` writes and before `publish` downloads,
 so it is never acted on.
 
 **Every mode waits on that answer.** `plan` asks before it knows the mode, so
-while the gateway refuses, or still answers 503 after the 120 seconds below,
+while the gateway refuses, or still answers 503 after `wait_timeout` (below),
 `plan` fails in every mode, `publish` and `none` included, and nothing is
 built, published or tagged. Re-run the run once the gateway answers.
 
 **A re-run of failed jobs reuses the copy.** "Re-run failed jobs" skips a
 `plan` that succeeded, so a re-run `publish` downloads the `wac-cd-contract`
 artifact the earlier attempt's `plan` uploaded in the same run, and never
-reads the copy again. "Re-run all jobs" runs `plan` again, which reads the copy
-afresh and replaces the artifact.
+reads the copy again. The artifact holds settings and Secret names, so it is
+kept for one day (`retention-days: 1`): a re-run of failed jobs must start
+within a day of the run, or its `publish` finds no copy and fails. "Re-run all
+jobs" runs `plan` again, which reads the copy afresh and replaces the artifact.
 
 **What runs beside the token.** `plan` holds `id-token: write`, and a GitHub
 OIDC token does not say which step minted it, so `plan` runs nothing fetched
@@ -155,8 +164,23 @@ known exceptions, still on tag-pinned actions and `setup-python`; that list
 only shrinks.
 
 A 503 (`release dependency unavailable`: GitHub slow, rate-limited or down
-behind the gateway) is retried every 5 seconds within 120 seconds, each
-request bounded at 30 seconds, like a `release`. A 403 is not retried. A
+behind the gateway) is retried with a fresh token within `wait_timeout`
+seconds (default `2100`), the bound `deploy` gives a `release`, passed to the
+script as `--wait-timeout`. The interval starts at 5
+seconds and doubles up to 30, so a long outage costs about two
+requests a minute. Each request may wait the whole time left for its answer,
+as `deploy`'s requests do, because the gateway checks the caller against
+`main` with several GitHub calls before it reads wac.fleet and can be slow. A
+refused or reset connection or a TLS failure fails at once, as for a
+`release`, and so does a request still unanswered at the deadline; both read
+`could not be reached`. `plan` has `timeout-minutes: 40`, the default
+`wait_timeout` plus five minutes for its other steps; GitHub expressions have
+no arithmetic, so it cannot be sized from the input, and a `wait_timeout`
+above 2100 is cut short by that limit. While `plan` waits out an outage it
+holds the repository's `cd` concurrency group for up to `wait_timeout`, about
+35 to 40 minutes, and since a group keeps one pending run, a newer push then
+replaces an older pending one. That is the wait `deploy` already had before
+`v1.35.0`, moved earlier, not a new delay. A 403 is not retried. A
 denial is told apart from a 503 by its status, never by its body, and the body
 is never printed: a 403 without a
 `reason` means the gateway did not verify the caller, and a 403 with one of the
@@ -164,18 +188,19 @@ gateway's codes gets this sentence in the run summary:
 
 | Code | Sentence |
 | --- | --- |
-| `fleet_copy_missing` | This app has released from hemi's settings before, and the gateway found no copy of them, so nothing was built. |
-| `fleet_copy_unreadable` | The gateway could not read hemi's copy of this app's settings, so nothing was built. |
-| `fleet_copy_mismatch` | hemi's copy of this app's settings names another app, so nothing was built. |
+| `fleet_copy_missing` | The gateway found no copy of this app's settings where one is required, so the run stopped. |
+| `fleet_copy_unreadable` | The gateway could not read hemi's copy of this app's settings, so the run stopped. |
+| `fleet_copy_mismatch` | hemi's copy of this app's settings names another app, so the run stopped. |
 | `fleet_commit_not_on_default_branch` | The settings this release was planned with are no longer on the fleet copy's main line. |
 | `fleet_commit_older_than_last_release` | The settings this release was planned with are older than the settings already released. |
-| `revision_annotation_missing` | This app releases from hemi's settings, and this chart does not say which revision of them it was built from. |
-| `revision_mismatch` | This chart names a different revision of the settings from the copy it points to. |
+| `revision_annotation_missing` | This chart does not carry both of the settings annotations, and the gateway requires them for this app. |
+| `revision_mismatch` | This chart's settings revision is not the one the fleet copy holds now; plan again to release the current settings. |
 
 `fleet_commit_not_on_default_branch`, `fleet_commit_older_than_last_release`,
-`revision_annotation_missing` and `revision_mismatch` are the gateway's release
-checks, so they answer a `release` (or its `status` pre-check) in `deploy`
-rather than this request. `scripts/wacd-release.py` holds the map, and both
+`revision_annotation_missing` and `revision_mismatch` come only from the
+gateway's release check, which answers a `release` in `deploy`; that check can
+also return the three `fleet_copy_*` codes, for the copy at the chart's own
+fleet commit, while the `contract` request returns only those three. `scripts/wacd-release.py` holds the map, and both
 scripts use it: `deploy` fails with
 `release request refused (HTTP 403): <sentence>` and adds
 `The gateway refused the release: <sentence>` to the job summary. Its POST
@@ -186,11 +211,14 @@ A code not in that list gets
 (without the parenthesis when the code is not a plain lowercase word), so a
 code added to the gateway later cannot break a release summary. A denial
 without a code reads
-`The gateway did not accept this run as a release of a registered app.` The run summary's
+`The gateway did not accept this run as a release of a registered app.` From `plan` it adds
+`A gateway that does not yet serve the contract operation (wacwini/wac.lab#570 not deployed) answers this way too.`
+The run summary's
 `wac-cd settings` section names the source, the revision and the fleet commit,
 with one sentence saying which rule applied or why the run stopped. The
-revision is a JSON number in the copy and a decimal string in the annotation;
-`wacd-chart.py` converts between the two in one place.
+revision is a JSON number in the copy and a decimal string in the annotation,
+of at most ten digits as the gateway reads it; `wacd-chart.py` converts between
+the two in one place.
 
 **Versions.** `plan` finds the latest tag `<tag_prefix>X.Y.Z` reachable from
 HEAD and reads the commits since it: any breaking change (`type!:` or a

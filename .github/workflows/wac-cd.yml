@@ -32,7 +32,7 @@ on:
         type: string
         default: ''
       wait_timeout:
-        description: Seconds to wait for the gateway release proof; the health check has its own fixed 300 seconds
+        description: Seconds to wait out an unavailable gateway in plan, and for the gateway release proof; the health check has its own fixed 300 seconds
         type: string
         default: '2100'
     secrets:
@@ -63,7 +63,7 @@ concurrency:
 jobs:
   plan:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
-    timeout-minutes: 10
+    timeout-minutes: 40
     permissions:
       contents: write
       id-token: write
@@ -126,9 +126,11 @@ jobs:
       - name: Read the settings from the gateway
         id: contract
         shell: bash
+        env:
+          WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
         run: |
           set -euo pipefail
-          if ! python3 "$WACD_SCRIPTS"/wacd-contract.py fetch --out .wacd-contract \
+          if ! python3 "$WACD_SCRIPTS"/wacd-contract.py fetch --out .wacd-contract --wait-timeout "$WAIT_TIMEOUT" \
             > "$RUNNER_TEMP/contract.out" 2> "$RUNNER_TEMP/contract.err"; then
             echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/contract.err")"
             exit 1
@@ -143,6 +145,7 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           overwrite: true
+          retention-days: 1
       - name: Read the wacd profile
         id: profile
         shell: bash

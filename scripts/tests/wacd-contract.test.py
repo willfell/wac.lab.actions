@@ -31,6 +31,7 @@ SPEC.loader.exec_module(contract)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "wacd-contract"
 REPOSITORY_ID = "987654321"
+WAIT = 2100
 FLEET_COMMIT = "c" * 40
 BODY_MARKER = "raw-gateway-body-never-printed"
 CODES = (
@@ -70,14 +71,20 @@ class Gateway:
                 size = int(self.headers["Content-Length"])
                 outer.seen.append((self.headers["Authorization"], json.loads(self.rfile.read(size))))
                 if len(outer.responses) > 1:
-                    status, body = outer.responses.pop(0)
+                    response = outer.responses.pop(0)
                 else:
-                    status, body = outer.responses[0]
+                    response = outer.responses[0]
+                status, body, *delay = response
+                if delay:
+                    threading.Event().wait(delay[0])
                 raw = json.dumps(body).encode()
-                self.send_response(status)
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except OSError:
+                    pass
 
             def log_message(self, *args):
                 pass
@@ -131,7 +138,7 @@ class FetchCase(unittest.TestCase):
         self.minted.append(value)
         return value
 
-    def fetch(self, *responses):
+    def fetch(self, *responses, wait=WAIT):
         gateway = Gateway(*responses)
         self.addCleanup(gateway.close)
         self.gateway = gateway
@@ -142,7 +149,7 @@ class FetchCase(unittest.TestCase):
         os.chdir(self.repo)
         try:
             with contextlib.ExitStack() as stack:
-                stack.enter_context(patch.object(contract.ci, "URL", gateway.url))
+                stack.enter_context(patch.object(contract.ci, "URL", getattr(self, "dead_url", gateway.url)))
                 stack.enter_context(patch.object(contract.ci, "oidc_token", self.mint))
                 stack.enter_context(patch.object(contract, "trust_context", lambda: None))
                 stack.enter_context(patch.object(contract.time, "monotonic", clock.monotonic))
@@ -150,7 +157,9 @@ class FetchCase(unittest.TestCase):
                 stack.enter_context(patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(self.summary)}))
                 stack.enter_context(contextlib.redirect_stdout(stdout))
                 stack.enter_context(contextlib.redirect_stderr(stderr))
-                code = contract.main(["wacd-contract.py", "fetch", "--out", ".wacd-contract"])
+                code = contract.main(
+                    ["wacd-contract.py", "fetch", "--out", ".wacd-contract", "--wait-timeout", str(wait)]
+                )
         finally:
             os.chdir(cwd)
         self.stdout, self.stderr = stdout.getvalue(), stderr.getvalue()
@@ -267,6 +276,8 @@ class RuleTests(FetchCase):
             ("copy without a commit", (200, {"copy": fixture_copy(), "fleet_commit": None})),
             ("commit without a copy", (200, {"copy": None, "fleet_commit": FLEET_COMMIT})),
             ("short commit", (200, {"copy": fixture_copy(), "fleet_commit": "abc"})),
+            ("eleven-digit revision", answer({**fixture_copy(), "identity": {**fixture_copy()["identity"],
+                                                                             "revision": 10 ** 10}})),
             ("not an object", (200, [BODY_MARKER])),
         )
         for label, response in cases:
@@ -286,13 +297,32 @@ class AnswerTests(FetchCase):
         self.assertEqual(code, 0, self.stderr)
         self.assertEqual(len(self.gateway.seen), 3)
         self.assertEqual(len(set(auth for auth, _ in self.gateway.seen)), 3, "each attempt mints its own token")
-        self.assertEqual(self.clock.sleeps, [contract.POLL_SECONDS] * 2)
+        self.assertEqual(self.clock.sleeps, [5, 10])
 
-    def test_a_gateway_that_stays_unavailable_fails_within_the_bound(self):
-        code = self.fetch((503, {"error": "release dependency unavailable"}))
-        self.assertRefused(code, f"{contract.CONTRACT_WAIT} seconds")
-        self.assertLessEqual(self.clock.now - 1000.0, contract.CONTRACT_WAIT + contract.POLL_SECONDS)
-        self.assertGreater(len(self.gateway.seen), 1)
+    def test_a_gateway_that_stays_unavailable_is_waited_out_for_wait_timeout_with_a_growing_interval(self):
+        """A release used to ride out gateway 503s for wait_timeout in deploy; plan now waits as long."""
+        code = self.fetch((503, {"error": "release dependency unavailable"}), wait=WAIT)
+        self.assertRefused(code, f"{WAIT} seconds")
+        waited = self.clock.now - 1000.0
+        self.assertGreaterEqual(waited, WAIT)
+        self.assertLessEqual(waited, WAIT + contract.MAX_POLL_SECONDS)
+        self.assertEqual(self.clock.sleeps[:4], [5, 10, 20, 30])
+        self.assertEqual(max(self.clock.sleeps), contract.MAX_POLL_SECONDS)
+        self.assertLessEqual(len(self.gateway.seen), WAIT // contract.MAX_POLL_SECONDS + 5, "the gateway is not hammered")
+        self.assertEqual(len(set(auth for auth, _ in self.gateway.seen)), len(self.gateway.seen))
+
+    def test_a_short_wait_timeout_is_honoured(self):
+        code = self.fetch((503, {}), wait=12)
+        self.assertRefused(code, "12 seconds")
+        self.assertLessEqual(self.clock.now - 1000.0, 12)
+
+    def test_the_wait_timeout_must_be_a_bounded_whole_number(self):
+        for bad in ("0", "-5", "3601", "2.5", "soon", ""):
+            with self.subTest(wait=bad):
+                self.summary.unlink(missing_ok=True)
+                code = self.fetch(answer(None), wait=bad)
+                self.assertRefused(code, "--wait-timeout")
+                self.assertEqual(self.gateway.seen, [], "nothing is asked with a bad bound")
 
     def test_each_coded_denial_has_its_own_sentence(self):
         self.assertEqual(sorted(contract.REFUSALS), sorted(CODES))
@@ -313,9 +343,11 @@ class AnswerTests(FetchCase):
                 code = self.fetch((403, {"error": "release request denied", "reason": reason}))
                 self.assertRefused(code, contract.SENTENCES["unknown_refusal"])
 
-    def test_an_unverified_caller_gets_the_generic_sentence(self):
+    def test_an_unverified_caller_gets_the_generic_sentence_naming_an_old_gateway(self):
         code = self.fetch((403, {"error": "release request denied"}))
         self.assertRefused(code, contract.SENTENCES["unverified"])
+        self.assertIn("does not yet serve the contract operation", self.stderr)
+        self.assertIn("wacwini/wac.lab#570", self.summary_text)
 
     def test_a_coded_body_on_another_status_is_not_a_denial(self):
         for status in (400, 404, 500):
@@ -326,23 +358,35 @@ class AnswerTests(FetchCase):
                 self.assertNotIn(contract.REFUSALS["fleet_copy_missing"], self.stderr)
                 self.assertEqual(len(self.gateway.seen), 1)
 
-    def test_an_unreachable_gateway_fails_without_a_token_in_the_message(self):
+    def test_a_refused_connection_fails_at_once(self):
         dead = Gateway((200, {}))
         dead.close()
-        stdout, stderr = io.StringIO(), io.StringIO()
-        cwd = os.getcwd()
-        os.chdir(self.repo)
-        try:
-            with patch.object(contract.ci, "URL", dead.url), patch.object(contract.ci, "oidc_token", self.mint), \
-                    patch.object(contract, "trust_context", lambda: None), \
-                    patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(self.summary)}), \
-                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                code = contract.main(["wacd-contract.py", "fetch", "--out", ".wacd-contract"])
-        finally:
-            os.chdir(cwd)
-        self.assertEqual(code, 1)
-        self.assertIn("could not be reached", stderr.getvalue())
-        self.assertNotIn(self.minted[0], stdout.getvalue() + stderr.getvalue() + self.summary.read_text())
+        self.dead_url = dead.url
+        code = self.fetch((200, {}), wait=WAIT)
+        self.assertRefused(code, "could not be reached")
+        self.assertEqual(len(self.minted), 1, "a refused connection is not retried, as for a release")
+        self.assertEqual(self.clock.sleeps, [])
+
+    def test_a_slow_answer_is_waited_for_with_the_whole_time_left(self):
+        """The gateway checks the caller against main before it reads wac.fleet, and can be slow."""
+        timeouts = []
+        real_post = contract.release.post
+
+        def spy(body, trust, timeout):
+            timeouts.append(timeout)
+            return real_post(body, trust, timeout)
+
+        with patch.object(contract.release, "post", spy):
+            code = self.fetch((200, {"copy": None, "fleet_commit": None}, 1.5), wait=WAIT)
+        self.assertEqual(code, 0, self.stderr)
+        self.assertEqual(self.outputs()["source"], "files")
+        self.assertEqual(len(self.minted), 1)
+        self.assertEqual(timeouts, [WAIT], "an attempt may wait the whole deadline, as deploy's requests do")
+
+    def test_an_answer_slower_than_the_deadline_could_not_be_reached(self):
+        code = self.fetch((200, {"copy": None, "fleet_commit": None}, 2.5), wait=1)
+        self.assertRefused(code, "could not be reached")
+        self.assertEqual(len(self.minted), 1)
 
 
 class CliTests(unittest.TestCase):
@@ -359,7 +403,7 @@ class CliTests(unittest.TestCase):
             try:
                 with patch.dict(os.environ, env), patch.object(contract, "trust_context", lambda: None), \
                         contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                    code = contract.main(["wacd-contract.py", "fetch", "--out", ".wacd-contract"])
+                    code = contract.main(["wacd-contract.py", "fetch", "--out", ".wacd-contract", "--wait-timeout", "60"])
             finally:
                 os.chdir(cwd)
             self.assertEqual(code, 1, stdout.getvalue())
@@ -372,7 +416,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(usage.returncode, 0, usage.stderr)
         self.assertEqual(
-            {word for word in usage.stdout.split() if word.startswith("--")}, {"--help", "--out"}
+            {word for word in usage.stdout.split() if word.startswith("--")}, {"--help", "--out", "--wait-timeout"}
         )
 
 

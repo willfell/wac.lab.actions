@@ -27,8 +27,18 @@ nothing is left under `<out>` for a later job to act on. Either way the job
 summary names the source, revision and fleet commit with the sentence.
 
 A 503 is the gateway's "release dependency unavailable" (GitHub slow,
-rate-limited or down behind it) and is retried every POLL_SECONDS within
-CONTRACT_WAIT seconds, as a `release` retries it. A 403 is a denial, told
+rate-limited or down behind it) and is retried within `--wait-timeout`
+seconds, the workflow's `wait_timeout`, the same bound `deploy` gives a
+`release`: before the contract operation existed, a release rode out such a
+window in `deploy`, and moving the first gateway call into `plan` must not
+make it fail sooner. Each attempt waits the whole time left for its answer,
+as `deploy`'s requests do: the gateway first checks the caller's revision
+against main with several GitHub calls and can be slow under a slow GitHub,
+and a slow answer is still an answer. A refused or reset connection or a TLS
+failure fails at once, as it does for a `release`, and so does a timeout at
+the deadline. The interval between 503s starts at FIRST_POLL_SECONDS and
+doubles up to MAX_POLL_SECONDS, so a long outage costs about two requests a
+minute. A 403 is a denial, told
 apart from a 503 by its status, never its body: a coded one carries one of
 REFUSALS' codes, an unverified caller none. The response body is never
 printed; only a sentence is. The request is wacd-release.py's post(), and the
@@ -64,9 +74,9 @@ profile = _load("wacd_contract_profile", "wacd-profile.py")
 chart = _load("wacd_contract_chart", "wacd-chart.py")
 
 CONTRACT_BODY = {"operation": "contract"}
-CONTRACT_WAIT = 120
-POLL_SECONDS = 5
-REQUEST_TIMEOUT = 30
+FIRST_POLL_SECONDS = 5
+MAX_POLL_SECONDS = 30
+MAX_WAIT = release.MAX_WAIT
 FILES_PROFILE = Path(".github") / "wacd.json"
 SOURCES = ("files", "hemi")
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -75,7 +85,10 @@ REPOSITORY_ID = re.compile(r"[0-9]{1,20}")
 REFUSALS = release.REFUSALS
 
 SENTENCES = {
-    "unverified": release.UNVERIFIED,
+    "unverified": (
+        release.UNVERIFIED + " A gateway that does not yet serve the contract operation "
+        "(wacwini/wac.lab#570 not deployed) answers this way too."
+    ),
     "unknown_refusal": release.UNKNOWN_REFUSAL,
     "another_repository": (
         "The settings copy the gateway handed over belongs to another repository, so nothing "
@@ -95,13 +108,14 @@ SENTENCES = {
         ".github/wacd.json, so there is nothing to release from."
     ),
     "unavailable": (
-        f"The gateway could not read the fleet copy within {CONTRACT_WAIT} seconds; re-run "
+        "The gateway could not read the fleet copy within {wait} seconds; re-run "
         "when GitHub is answering."
     ),
+    "wait": f"--wait-timeout must be a whole number of seconds from 1 to {MAX_WAIT}.",
     "status": "The gateway answered HTTP {status} when asked for this app's settings.",
     "unreachable": (
-        "The gateway could not be reached for this app's settings; check the runner's TLS "
-        "trust and the gateway's readiness."
+        "The gateway could not be reached for this app's settings, or did not answer within "
+        "the wait; check the runner's TLS trust and the gateway's readiness."
     ),
     "no_trust": (
         "The runner's TLS trust for the gateway is missing or invalid, so the settings were "
@@ -136,20 +150,34 @@ def post(trust, timeout):
         raise Refusal(SENTENCES["no_token"]) from None
 
 
-def ask(trust):
-    """The gateway's 200 answer and the token that got it; 503 is retried within CONTRACT_WAIT."""
-    deadline = time.monotonic() + CONTRACT_WAIT
+def ask(trust, wait):
+    """The gateway's 200 answer and the token that got it; 503 is retried within wait seconds."""
+    deadline = time.monotonic() + wait
+    interval = FIRST_POLL_SECONDS
     while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        status, value, token = post(trust, max(1, min(REQUEST_TIMEOUT, remaining)))
+        status, value, token = post(trust, max(1, deadline - time.monotonic()))
         if status == 200:
             return value, token
         if status == 403:
-            raise Refusal(release.refusal_sentence(value))
+            sentence = release.refusal_sentence(value)
+            # A gateway older than the contract operation answers it with the
+            # same uncoded 403 as an unverified caller, so that sentence says so.
+            raise Refusal(SENTENCES["unverified"] if sentence == release.UNVERIFIED else sentence)
         if status != 503:
             raise Refusal(SENTENCES["status"].format(status=status))
-        time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
-    raise Refusal(SENTENCES["unavailable"])
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+        interval = min(interval * 2, MAX_POLL_SECONDS)
+    raise Refusal(SENTENCES["unavailable"].format(wait=wait))
+
+
+def wait_bound(text):
+    """The --wait-timeout argument as seconds, within wacd-release's own bound."""
+    if not isinstance(text, str) or not text.isascii() or not text.isdigit():
+        raise Refusal(SENTENCES["wait"])
+    seconds = int(text)
+    if not 1 <= seconds <= MAX_WAIT:
+        raise Refusal(SENTENCES["wait"])
+    return seconds
 
 
 def token_repository_id(token):
@@ -188,7 +216,7 @@ def read_copy(value, token):
         or not isinstance(identity, dict)
         or not isinstance(identity.get("repositoryId"), str)
         or type(identity.get("revision")) is not int
-        or identity["revision"] < 1
+        or not 1 <= identity["revision"] <= chart.MAX_REVISION
         or not isinstance(flags, dict)
         or flags.get("source") not in SOURCES
         or not isinstance(copy.get("runtime"), dict)
@@ -218,10 +246,11 @@ def write(out, documents):
         raise Refusal(SENTENCES["unwritable"]) from None
 
 
-def fetch(out):
+def fetch(out, wait_text):
     """Ask once (retrying 503) and leave the copy under out; returns the step outputs."""
+    wait = wait_bound(wait_text)
     clear(out)
-    value, token = ask(trust_context())
+    value, token = ask(trust_context(), wait)
     copy, commit = read_copy(value, token)
     files = FILES_PROFILE.is_file()
     if copy is None:
@@ -280,6 +309,7 @@ def build_parser():
     commands = parser.add_subparsers(dest="command", required=True)
     fetch_parser = commands.add_parser("fetch", help="ask the gateway for the copy (wac-cd plan)")
     fetch_parser.add_argument("--out", required=True)
+    fetch_parser.add_argument("--wait-timeout", required=True)
     return parser
 
 
@@ -287,7 +317,7 @@ def main(argv):
     args = build_parser().parse_args(argv[1:])
     out = Path(args.out)
     try:
-        source, revision, commit, reason = fetch(out)
+        source, revision, commit, reason = fetch(out, args.wait_timeout)
     except Exception as error:
         sentence = str(error) if isinstance(error, Refusal) else SENTENCES["unexpected"]
         try:
