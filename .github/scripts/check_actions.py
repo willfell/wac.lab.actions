@@ -93,11 +93,24 @@ def _workflow_files() -> list[Path]:
     return sorted((REPO_ROOT / ".github/workflows").glob("*.yml"))
 
 
-def _is_reusable(doc: dict) -> bool:
-    # PyYAML resolves an unquoted `on:` key to True, so triggers live under
-    # doc[True] rather than doc["on"].
+def _triggers(doc: dict) -> dict:
+    """The workflow's triggers as a mapping, whichever form `on:` was written in.
+
+    PyYAML resolves an unquoted `on:` key to True, so triggers live under
+    doc[True] rather than doc["on"]. GitHub also accepts a single event as a
+    string (`on: workflow_call`) or a list of events, neither of which carries
+    configuration.
+    """
     triggers = doc.get("on") or doc.get(True) or {}
-    return isinstance(triggers, dict) and "workflow_call" in triggers
+    if isinstance(triggers, str):
+        return {triggers: None}
+    if isinstance(triggers, list):
+        return {event: None for event in triggers if isinstance(event, str)}
+    return triggers if isinstance(triggers, dict) else {}
+
+
+def _is_reusable(doc: dict) -> bool:
+    return "workflow_call" in _triggers(doc)
 
 
 def _check_reusable_workflow(path: Path, doc: dict) -> list[str]:
@@ -191,8 +204,7 @@ def _check_runner_is_a_caller_choice(path: Path, doc: dict) -> list[str]:
     defaults to an empty string, so a caller with neither fails at once
     instead of silently landing on a hosted runner.
     """
-    triggers = doc.get("on") or doc.get(True) or {}
-    call = triggers.get("workflow_call") or {}
+    call = _triggers(doc).get("workflow_call") or {}
     declared = (call.get("inputs") or {}) if isinstance(call, dict) else {}
 
     problems = []

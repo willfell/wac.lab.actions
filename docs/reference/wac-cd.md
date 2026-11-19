@@ -221,7 +221,8 @@ call.
 workflow here, and every job anywhere that holds `id-token: write`, to an
 allowlist of actions pinned by full commit SHA, one commit per action, each
 recorded with the release tag it was resolved from and named with that tag in
-its step. A job of `wac-cd` or `wac-ci` that holds `id-token: write` may use
+its step; a job that calls a reusable workflow names a local file or another
+repository's workflow at a full commit SHA. A job of `wac-cd` or `wac-ci` that holds `id-token: write` may use
 only the checkout and artifact actions on that list, exempts none, and is refused a step that runs
 `install-tools.sh`, `pip`, `npm`, `npx`, `uvx`, `curl` piped to a shell, or
 `get-helm`. `install-helm.sh` is allowed: it checks a committed digest before

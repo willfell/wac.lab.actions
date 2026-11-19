@@ -36,6 +36,7 @@ PINNED_ACTIONS = {
 # only these of the pinned actions, and may not run a fetched installer.
 # install-helm.sh is allowed: it checks a committed digest before it runs
 # anything.
+CALLED_WORKFLOW = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@[0-9a-f]{40}")
 ID_TOKEN_ACTIONS = ("actions/checkout", "actions/upload-artifact", "actions/download-artifact")
 FETCHED_INSTALLERS = (
     ("install-tools.sh", re.compile(r"install-tools\.sh")),
@@ -98,8 +99,16 @@ def holds_write(doc, job):
 
 
 def pinned_action_problems(job_name, job, allowed=None):
-    """Each step's action must be on the allowlist (and in `allowed`, when given) and named with its tag."""
+    """Each step's action must be on the allowlist (and in `allowed`, when given) and named with its tag.
+
+    A job that calls a reusable workflow must name a local file, itself held to
+    this rule, or another repository's workflow at a full commit SHA.
+    """
     problems = []
+    called = job.get("uses")
+    if called is not None and not (str(called).startswith("./.github/workflows/")
+                                   or CALLED_WORKFLOW.fullmatch(str(called))):
+        problems.append(f"{job_name}: calls {called}, which is neither a local workflow nor pinned by commit")
     for index, step in enumerate(job.get("steps") or []):
         uses = step.get("uses")
         if uses is None:
@@ -772,6 +781,27 @@ class ReusableWorkflowTests(unittest.TestCase):
             self.assertIn(expected, writers)
         self.assertIn(("nextjs-site-deploy.yml", "build-and-deploy"), id_token)
 
+    def test_reusable_workflows_are_found_whichever_form_on_takes(self):
+        jobs = {"gate": {"runs-on": "${{ inputs.runner || vars.CI_RUNNER_SMALL }}", "steps": [{"run": "true"}]}}
+        for label, on, reusable in (
+            ("a mapping", {"workflow_call": {"inputs": {"runner": {"type": "string", "default": ""}}}}, True),
+            ("a mapping with no configuration", {"workflow_call": None}, True),
+            ("a string", "workflow_call", True),
+            ("a list", ["push", "workflow_call"], True),
+            ("unquoted on", None, True),
+            ("another event as a string", "push", False),
+            ("another event in a list", ["push", "pull_request"], False),
+        ):
+            doc = {"name": "wf", "jobs": jobs}
+            if label == "unquoted on":
+                doc[True] = "workflow_call"
+            else:
+                doc["on"] = on
+            with self.subTest(on=label):
+                self.assertIs(module._is_reusable(doc), reusable)
+        problems = module._check_runner_is_a_caller_choice(Path("wf.yml"), {"name": "wf", "on": "workflow_call", "jobs": jobs})
+        self.assertTrue(any("declares no `runner` input" in p for p in problems), problems)
+
     def test_the_pinned_action_rule_names_each_way_in(self):
         self.assertEqual(len({uses.split("@")[0] for uses in PINNED_ACTIONS}), len(PINNED_ACTIONS),
                          "one commit per action")
@@ -795,6 +825,22 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(problems), 1, problems)
                 self.assertIn(expected, problems[0])
         self.assertEqual(pinned_action_problems("job", {"steps": [good, {"run": "true"}]}), [])
+        sha = "a" * 40
+        for label, called, expected in (
+            ("a local workflow", "./.github/workflows/actionlint.yml", None),
+            ("another repository's workflow at a commit", f"someone/else/.github/workflows/x.yml@{sha}", None),
+            ("another repository's workflow at a branch", "someone/else/.github/workflows/x.yml@main", "pinned by commit"),
+            ("another repository's workflow at a tag", "someone/else/.github/workflows/x.yml@v1", "pinned by commit"),
+            ("a short SHA", "someone/else/.github/workflows/x.yml@aaaaaaa", "pinned by commit"),
+            ("a local path outside the workflows", "./lab-tools", "pinned by commit"),
+        ):
+            with self.subTest(call=label):
+                problems = pinned_action_problems("job", {"uses": called})
+                if expected is None:
+                    self.assertEqual(problems, [])
+                else:
+                    self.assertEqual(len(problems), 1, problems)
+                    self.assertIn(expected, problems[0])
         for label, doc, job, expected in (
             ("contents write", {}, {"permissions": {"contents": "write"}}, True),
             ("packages write", {}, {"permissions": {"contents": "read", "packages": "write"}}, True),
