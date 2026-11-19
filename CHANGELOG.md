@@ -25,7 +25,7 @@ Reading the table:
   | `scripts/lab-route.py` | `lab-route` |
   | `scripts/wacd-profile.py`, `scripts/wacd-chart.py` | `wac-ci`, `wac-cd` |
   | `scripts/wacd-parity.py` | `wac-ci` |
-  | `scripts/wacd-version.py`, `scripts/wacd-release.py`, `scripts/wacd-tag.py`, `scripts/wacd-shadow.py`, `scripts/wacd-contract.py`, `scripts/fixtures/values-probe/`, `scripts/install-helm.sh` | `wac-cd` |
+  | `scripts/wacd-version.py`, `scripts/wacd-release.py`, `scripts/wacd-tag.py`, `scripts/wacd-shadow.py`, `scripts/wacd-contract.py`, `scripts/wacd-retag.py`, `scripts/fixtures/values-probe/`, `scripts/install-helm.sh` | `wac-cd` |
   | `scripts/ci-release.py` | `lab-release`, `wac-cd` |
   | `scripts/tests/` | none; CI only |
 
