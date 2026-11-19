@@ -15,16 +15,26 @@ spec.loader.exec_module(module)
 
 GUARD_RUN = '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
 
+# Every action wac-ci and wac-cd use, pinned by commit with the release tag the
+# commit was resolved from; the step that uses one says "<action> <tag>" in its
+# name. A tag can be moved, so a job holding a write token (or able to mint one)
+# would otherwise run whatever the tag points at today. One commit per action,
+# so every job of a run, upload and download alike, runs the same release.
+PINNED_ACTIONS = {
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1": "v7.0.1",
+    "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9": "v7.0.2",
+    "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333": "v8.0.2",
+    "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0": "v7.1.0",
+    "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1": "v7.1.0",
+    "actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5": "v7.1.0",
+    "astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2": "v10.3.3",
+}
 # A GitHub OIDC token does not say which step minted it, so any code that runs
 # in a job holding id-token: write can mint a gateway token. Such a job may use
-# only these actions, pinned by commit (the tag goes in the step's name), and
-# may not run a fetched installer. install-helm.sh is allowed: it checks a
-# committed digest before it runs anything.
-PINNED_ACTIONS = {
-    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262": "v4",
-    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02": "v4",
-    "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093": "v4",
-}
+# only these of the pinned actions, and may not run a fetched installer.
+# install-helm.sh is allowed: it checks a committed digest before it runs
+# anything.
+ID_TOKEN_ACTIONS = ("actions/checkout", "actions/upload-artifact", "actions/download-artifact")
 FETCHED_INSTALLERS = (
     ("install-tools.sh", re.compile(r"install-tools\.sh")),
     ("pip", re.compile(r"\bpip3?\b")),
@@ -76,23 +86,47 @@ def holds_id_token(doc, job):
     return isinstance(permissions, dict) and permissions.get("id-token") == "write"
 
 
+def holds_write(doc, job, inherited=None):
+    """Whether a job holds any write permission: its own, else its workflow's, else its caller's."""
+    job = job or {}
+    if "permissions" in job:
+        permissions = job["permissions"]
+    elif "permissions" in doc:
+        permissions = doc["permissions"]
+    else:
+        permissions = inherited
+    if permissions == "write-all":
+        return True
+    return isinstance(permissions, dict) and "write" in permissions.values()
+
+
+def pinned_action_problems(job_name, job, allowed=None):
+    """Each step's action must be on the allowlist (and in `allowed`, when given) and named with its tag."""
+    problems = []
+    for index, step in enumerate(job.get("steps") or []):
+        uses = step.get("uses")
+        if uses is None:
+            continue
+        where = f"{job_name} steps[{index}]"
+        action = uses.split("@")[0]
+        tag = PINNED_ACTIONS.get(uses)
+        if tag is None or (allowed is not None and action not in allowed):
+            problems.append(f"{where}: {uses} is not a commit-pinned action on the allowlist")
+        elif f"{action} {tag}" not in str(step.get("name", "")):
+            problems.append(f"{where}: the step name does not say {action} {tag}")
+    return problems
+
+
 def id_token_problems(doc, job_name, job):
     """What lets code other than wac-cd's own run in a job that can mint a gateway token."""
     problems = []
     if "uses" in job:
         problems.append(f"{job_name}: calls {job['uses']} while holding id-token: write")
+    problems.extend(pinned_action_problems(job_name, job, ID_TOKEN_ACTIONS))
     for index, step in enumerate(job.get("steps") or []):
-        where = f"{job_name} steps[{index}]"
-        uses = step.get("uses")
-        if uses is not None:
-            tag = PINNED_ACTIONS.get(uses)
-            if tag is None:
-                problems.append(f"{where}: {uses} is not a commit-pinned action on the allowlist")
-            elif f"{uses.split('@')[0]} {tag}" not in str(step.get("name", "")):
-                problems.append(f"{where}: the step name does not say {uses.split('@')[0]} {tag}")
         for label, pattern in FETCHED_INSTALLERS:
             if pattern.search(str(step.get("run", ""))):
-                problems.append(f"{where}: runs {label}")
+                problems.append(f"{job_name} steps[{index}]: runs {label}")
     return problems
 
 
@@ -300,7 +334,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(step["env"], {"APT_PACKAGES": "${{ steps.profile.outputs.apt_packages }}"})
         self.assertNotIn("${{", step["run"])
         self.assertLess(names.index("Read the wacd profile"), apt)
-        for later in ("actions/setup-node@v4", "Install root node dependencies", "Run the profile's CI commands"):
+        setup_node = next(s["name"] for s in steps if str(s.get("uses", "")).startswith("actions/setup-node@"))
+        for later in (setup_node, "Install root node dependencies", "Run the profile's CI commands"):
             with self.subTest(step=later):
                 self.assertLess(apt, names.index(later))
 
@@ -545,7 +580,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             needs = other.get("needs") or []
             with self.subTest(job=name):
                 self.assertNotIn("shadow", [needs] if isinstance(needs, str) else needs)
-        app = next(st for st in job["steps"] if st.get("name") == "Check out the app (actions/checkout v4)")
+        app = next(st for st in job["steps"] if str(st.get("name", "")).startswith("Check out the app ("))
         self.assertTrue(app["uses"].startswith("actions/checkout@"))
         self.assertNotIn("repository", app.get("with") or {})
         self.assertIs((app.get("with") or {}).get("persist-credentials"), False)
@@ -678,12 +713,15 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(id_token_problems(doc, name, doc["jobs"][name]), [])
 
     def test_the_id_token_rule_names_each_way_in(self):
-        pinned = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-        good = {"name": "Check out (actions/checkout v4)", "uses": pinned}
+        pinned = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        good = {"name": "Check out (actions/checkout v7.0.1)", "uses": pinned}
         cases = (
             ("tag-pinned action", {"name": "x (actions/checkout v4)", "uses": "actions/checkout@v4"}, "allowlist"),
             ("setup-python", {"name": "x", "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"},
              "allowlist"),
+            ("setup-python pinned on the allowlist",
+             {"name": "x (actions/setup-python v7.1.0)",
+              "uses": "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"}, "allowlist"),
             ("unnamed pin", {"uses": pinned}, "step name"),
             ("install-tools", {"run": 'bash "$WACD_SCRIPTS"/install-tools.sh helm'}, "install-tools.sh"),
             ("pip", {"run": "pip install requests"}, "pip"),
@@ -708,6 +746,77 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertTrue(holds_id_token(inherited, {"steps": []}))
         self.assertFalse(holds_id_token(inherited, {"permissions": {"contents": "read"}}))
         self.assertTrue(holds_id_token({}, {"permissions": "write-all"}))
+
+    def test_jobs_run_only_commit_pinned_allowlisted_actions(self):
+        """Every job of wac-ci and wac-cd, and every job holding a write permission in a workflow they call."""
+        import yaml
+
+        root = Path(__file__).resolve().parents[1] / "workflows"
+        writers, nested = [], []
+        for name in ("wac-cd.yml", "wac-ci.yml"):
+            doc = yaml.safe_load((root / name).read_text())
+            for job_name, job in doc["jobs"].items():
+                if holds_write(doc, job):
+                    writers.append((name, job_name))
+                if "uses" not in job:
+                    with self.subTest(workflow=name, job=job_name):
+                        self.assertEqual(pinned_action_problems(job_name, job), [])
+                    continue
+                called = job["uses"]
+                self.assertTrue(called.startswith("./.github/workflows/"), called)
+                callee = yaml.safe_load((root / Path(called).name).read_text())
+                inherited = job.get("permissions", doc.get("permissions"))
+                nested.append(Path(called).name)
+                for inner_name, inner in callee["jobs"].items():
+                    if not holds_write(callee, inner, inherited):
+                        continue
+                    writers.append((Path(called).name, inner_name))
+                    with self.subTest(workflow=called, job=inner_name):
+                        self.assertNotIn("uses", inner)
+                        self.assertEqual(pinned_action_problems(inner_name, inner), [])
+        self.assertTrue(nested, "wac-ci calls its gates as nested workflows")
+        for expected in (("wac-cd.yml", "publish"), ("wac-cd.yml", "github-release"), ("wac-cd.yml", "plan"),
+                         ("wac-ci.yml", "contract")):
+            self.assertIn(expected, writers)
+
+    def test_the_pinned_action_rule_names_each_way_in(self):
+        self.assertEqual(len({uses.split("@")[0] for uses in PINNED_ACTIONS}), len(PINNED_ACTIONS),
+                         "one commit per action")
+        for uses, tag in PINNED_ACTIONS.items():
+            with self.subTest(uses=uses):
+                self.assertRegex(uses, r"^[a-z0-9-]+/[a-z0-9-]+@[0-9a-f]{40}$")
+                self.assertRegex(tag, r"^v\d+\.\d+\.\d+$")
+        node = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+        good = {"name": "Set up Node (actions/setup-node v7.1.0)", "uses": node}
+        cases = (
+            ("tag-pinned", {"name": "x (actions/setup-node v4)", "uses": "actions/setup-node@v4"}, "allowlist"),
+            ("a commit off the allowlist",
+             {"name": "x (actions/setup-node v4.4.0)", "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"},
+             "allowlist"),
+            ("unnamed", {"uses": node}, "step name"),
+            ("named with another tag", {"name": "x (actions/setup-node v4)", "uses": node}, "step name"),
+        )
+        for label, step, expected in cases:
+            with self.subTest(case=label):
+                problems = pinned_action_problems("job", {"steps": [good, {"run": "true"}, step]})
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(expected, problems[0])
+        self.assertEqual(pinned_action_problems("job", {"steps": [good, {"run": "true"}]}), [])
+        for label, doc, job, inherited, expected in (
+            ("contents write", {}, {"permissions": {"contents": "write"}}, None, True),
+            ("packages write", {}, {"permissions": {"contents": "read", "packages": "write"}}, None, True),
+            ("id-token write", {}, {"permissions": {"id-token": "write"}}, None, True),
+            ("write-all", {}, {"permissions": "write-all"}, None, True),
+            ("read only", {}, {"permissions": {"contents": "read", "packages": "read"}}, None, False),
+            ("the workflow's", {"permissions": {"contents": "write"}}, {"steps": []}, None, True),
+            ("the job's over the workflow's", {"permissions": {"contents": "write"}},
+             {"permissions": {"contents": "read"}}, None, False),
+            ("the caller's", {}, {"steps": []}, {"pull-requests": "write"}, True),
+            ("the callee's over the caller's", {"permissions": {"contents": "read"}}, {"steps": []},
+             {"contents": "write"}, False),
+        ):
+            with self.subTest(permissions=label):
+                self.assertIs(holds_write(doc, job, inherited), expected)
 
     def token_step_env(self, head):
         """The env each run step of a token job gets in the planted-repository run, keyed by job and step."""
@@ -1889,7 +1998,8 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(clear["run"], "rm -rf .wacd-contract")
                 self.assertEqual(download["if"], "needs.contract.outputs.source == 'hemi'")
                 self.assertEqual(download["with"], {"name": "wac-ci-contract", "path": ".wacd-contract"})
-                app = names.index("actions/checkout@v4")
+                app = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout@")
+                           and "repository" not in s["with"])
                 self.assertLess(app, names.index(clear["name"]))
                 self.assertLess(names.index(clear["name"]), names.index(download["name"]))
                 self.assertLess(names.index(download["name"]), names.index("Read the wacd profile"))

@@ -163,9 +163,9 @@ jobs:
           if [[ -n "$settings" && "$DEPLOY" != true ]]; then
             fail "settings_revision cannot be combined with deploy: false"
           fi
-      - name: Check out the app (actions/checkout v4)
+      - name: Check out the app (actions/checkout v7.0.1)
         timeout-minutes: 5
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -174,9 +174,9 @@ jobs:
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - name: Check out the shared scripts (actions/checkout v4)
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
         timeout-minutes: 3
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -202,9 +202,9 @@ jobs:
             exit 1
           fi
           cat "$RUNNER_TEMP/contract.out" >> "$GITHUB_OUTPUT"
-      - name: Upload the settings copy (actions/upload-artifact v4)
+      - name: Upload the settings copy (actions/upload-artifact v7.0.2)
         timeout-minutes: 3
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: steps.contract.outputs.source == 'hemi'
         with:
           name: wac-cd-contract
@@ -591,16 +591,16 @@ jobs:
           fi
           echo "::error::wac-cd: shadow needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
           exit 1
-      - name: Check out the app (actions/checkout v4)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - name: Check out the shared scripts (actions/checkout v4)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -632,14 +632,16 @@ jobs:
     outputs:
       images: ${{ steps.images.outputs.images }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -651,7 +653,8 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Install crane
@@ -744,7 +747,8 @@ jobs:
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -756,7 +760,8 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Retag the running images
@@ -779,14 +784,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -798,7 +805,8 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Install helm
@@ -819,8 +827,8 @@ jobs:
       - name: Clear any copy in the checkout
         shell: bash
         run: rm -rf .wacd-contract
-      - name: Download the settings copy plan read (actions/download-artifact v4)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - name: Download the settings copy plan read (actions/download-artifact v8.0.2)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         if: needs.plan.outputs.source == 'hemi'
         with:
           name: wac-cd-contract
@@ -934,8 +942,8 @@ jobs:
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - name: Check out the shared scripts (actions/checkout v4)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -987,8 +995,8 @@ jobs:
             --images "$IMAGES" --wait-timeout "$WAIT_TIMEOUT" \
             --mode "$MODE" --tag "$TAG" --expected-sha "$EXPECTED_SHA" \
             --receipt "$RUNNER_TEMP/wac-cd-release.json"
-      - name: Upload the release receipt (actions/upload-artifact v4)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - name: Upload the release receipt (actions/upload-artifact v7.0.2)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: wac-cd-release-${{ needs.plan.outputs.version }}
           path: ${{ runner.temp }}/wac-cd-release.json
@@ -1021,14 +1029,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}

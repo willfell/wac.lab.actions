@@ -69,9 +69,9 @@ jobs:
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - name: Check out the shared scripts (actions/checkout v4)
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
         timeout-minutes: 3
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -84,9 +84,9 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - name: Read the default branch's tree (actions/checkout v4)
+      - name: Read the default branch's tree (actions/checkout v7.0.1)
         timeout-minutes: 3
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: refs/heads/${{ github.event.repository.default_branch }}
           path: .wacd-main
@@ -95,9 +95,9 @@ jobs:
           sparse-checkout: .github/wacd.json
           sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Read the pull request's tree (actions/checkout v4)
+      - name: Read the pull request's tree (actions/checkout v7.0.1)
         timeout-minutes: 3
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: .wacd-head
           fetch-depth: 1
@@ -119,9 +119,9 @@ jobs:
             exit 1
           fi
           cat "$RUNNER_TEMP/contract.out" >> "$GITHUB_OUTPUT"
-      - name: Upload the settings copy (actions/upload-artifact v4)
+      - name: Upload the settings copy (actions/upload-artifact v7.0.2)
         timeout-minutes: 3
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: steps.contract.outputs.source == 'hemi'
         with:
           name: wac-ci-contract
@@ -150,14 +150,16 @@ jobs:
             echo "::error::wac-ci: the contract job ended ${CONTRACT_RESULT:-without a result}, so this job's checks cannot run."
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -173,13 +175,14 @@ jobs:
         if: needs.contract.outputs.source == 'hemi'
         shell: bash
         run: rm -rf .wacd-contract
-      - name: Download the settings copy (actions/download-artifact v4)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - name: Download the settings copy (actions/download-artifact v8.0.2)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         if: needs.contract.outputs.source == 'hemi'
         with:
           name: wac-ci-contract
           path: .wacd-contract
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Read the wacd profile
@@ -207,14 +210,16 @@ jobs:
         if: fromJSON(steps.profile.outputs.ci).stack == 'node'
         shell: bash
         run: python3 "$WACD_SCRIPTS"/wacd-profile.py node-layout . >> "$GITHUB_OUTPUT"
-      - if: fromJSON(steps.profile.outputs.ci).stack == 'node'
-        uses: actions/setup-node@v4
+      - name: Set up Node (actions/setup-node v7.1.0)
+        if: fromJSON(steps.profile.outputs.ci).stack == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: ${{ fromJSON(steps.profile.outputs.ci).node_version }}
           cache: ${{ steps.layout.outputs.lockfiles != '' && 'npm' || '' }}
           cache-dependency-path: ${{ steps.layout.outputs.lockfiles }}
-      - if: fromJSON(steps.profile.outputs.ci).stack == 'go'
-        uses: actions/setup-go@v5
+      - name: Set up Go (actions/setup-go v7.1.0)
+        if: fromJSON(steps.profile.outputs.ci).stack == 'go'
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
         with:
           go-version: ${{ fromJSON(steps.profile.outputs.ci).go_version }}
           go-version-file: ${{ fromJSON(steps.profile.outputs.ci).go_version_file }}
@@ -256,14 +261,16 @@ jobs:
             echo "::error::wac-ci: the contract job ended ${CONTRACT_RESULT:-without a result}, so this job's checks cannot run."
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -279,13 +286,14 @@ jobs:
         if: needs.contract.outputs.source == 'hemi'
         shell: bash
         run: rm -rf .wacd-contract
-      - name: Download the settings copy (actions/download-artifact v4)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - name: Download the settings copy (actions/download-artifact v8.0.2)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         if: needs.contract.outputs.source == 'hemi'
         with:
           name: wac-ci-contract
           path: .wacd-contract
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Read the wacd profile
@@ -363,8 +371,9 @@ jobs:
           kubeconform -strict -summary -schema-location default \
             -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             "$RUNNER_TEMP/render.yaml"
-      - if: inputs.parity_kustomize_dir != ''
-        uses: astral-sh/setup-uv@v5
+      - name: Set up uv (astral-sh/setup-uv v10.3.3)
+        if: inputs.parity_kustomize_dir != ''
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
       - name: Render the kustomize tree
         if: inputs.parity_kustomize_dir != ''
         shell: bash

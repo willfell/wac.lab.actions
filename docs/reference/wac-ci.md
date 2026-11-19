@@ -56,7 +56,7 @@ It runs six jobs. `contract` runs first and decides where `checks` and
 `npm ci` first, but only when the repo has a root `package.json`; a repo
 without one, such as finance, lists `npm ci --prefix <dir>` in `ci.commands`
 itself. The npm cache is keyed on every `package-lock.json` in the repo.
-Nothing implicit runs for `go`; setup-go takes `ci.go_version`, or reads the version from `ci.go_version_file` when the profile names one. When the profile lists `ci.apt_packages`,
+Nothing implicit runs for `go`; setup-go takes `ci.go_version`, or reads the version from `ci.go_version_file` when the profile names one (from a `go.mod`, its `toolchain` line before its `go` line). setup-go sets `GOTOOLCHAIN=local` for every later step, so the commands run on the Go it installed and never download another toolchain: `ci.go_version` must be at least the `go` line of the repo's `go.mod`. When the profile lists `ci.apt_packages`,
 `checks` first runs `sudo apt-get update` and
 `sudo apt-get install -y --no-install-recommends` with those packages, before
 setup-node, the root `npm ci` and `ci.commands`; a profile without the field
