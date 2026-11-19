@@ -53,7 +53,7 @@ on a push that input is empty.
 
 | Input | Meaning | Default |
 | --- | --- | --- |
-| `runner` | `runs-on` label for every job but `build` when `build_runner` is set, in the caller's repo | empty: the caller's `CI_RUNNER_SMALL` |
+| `runner` | `runs-on` label for every job but `build` when `build_runner` is set, in the caller's repo; it must provide `python3` 3.12 or later | empty: the caller's `CI_RUNNER_SMALL` |
 | `build_runner` | `runs-on` label for `build`, the one job that runs `docker build` | empty: `runner` |
 | `version_source` | `commits` computes the version from conventional commits; `caller` takes it from `version` | `commits` |
 | `version` | the caller-computed bare `X.Y.Z` with `version_source: caller`; empty means no release | empty |
@@ -149,19 +149,23 @@ kept for one day (`retention-days: 1`): a re-run of failed jobs must start
 within a day of the run, or its `publish` finds no copy and fails. "Re-run all
 jobs" runs `plan` again, which reads the copy afresh and replaces the artifact.
 
-**What runs beside the token.** `plan` holds `id-token: write`, and a GitHub
-OIDC token does not say which step minted it, so `plan` runs nothing fetched
-at run time. It uses the runner image's own `python3`, which its first step
-requires to be 3.12 or later, failing with the runner's name, OS and
-architecture and the `python3` path and version it found, and it uses only
-actions pinned by full commit SHA, with the tag in each step's name.
+**What runs beside the token.** `plan`, `shadow` and `deploy` hold
+`id-token: write`, and a GitHub OIDC token does not say which step minted it, so
+none of them runs anything fetched at run time. Each uses the runner image's own
+`python3`, which its first step requires to be 3.12 or later, failing with the
+runner's name, OS and architecture and the `python3` path and version it found
+(`shadow` records its clock first, then checks), and each uses only actions
+pinned by full commit SHA, with the tag in each step's name. `deploy` and
+`shadow` used to run `actions/setup-python` on tag-pinned actions, which
+downloaded a Python build at run time on the fleet's runners. A caller's
+`runner` (and `build_runner`) must therefore provide `python3` 3.12 or later:
+the fleet's runner image has 3.12.3, and a runner on an image with an older
+Python fails these jobs at that first step, before any token is requested.
 `.github/scripts/test_reusable_workflows.py` holds every job of `wac-cd` and
-`wac-ci` that holds `id-token: write` to an allowlist of commit-pinned actions
-and refuses a step that runs `install-tools.sh`, `pip`, `npm`, `npx`, `uvx`,
-`curl` piped to a shell, or `get-helm`. `install-helm.sh` is allowed: it checks
-a committed digest before it runs anything. `deploy` and `shadow` are the
-known exceptions, still on tag-pinned actions and `setup-python`; that list
-only shrinks.
+`wac-ci` that holds `id-token: write` to an allowlist of commit-pinned actions,
+exempts none, and refuses a step that runs `install-tools.sh`, `pip`, `npm`,
+`npx`, `uvx`, `curl` piped to a shell, or `get-helm`. `install-helm.sh` is
+allowed: it checks a committed digest before it runs anything.
 
 A 503 (`release dependency unavailable`: GitHub slow, rate-limited or down
 behind the gateway) is retried with a fresh token within `wait_timeout`
@@ -409,7 +413,7 @@ number, in the future or older than the job). In seconds:
 | Part | Seconds |
 | --- | --- |
 | "Set up job" before the stamp, assumed at most | 10 |
-| deadline after the stamp, shared by both checkouts, `setup-python`, the install step and the script | 95 |
+| deadline after the stamp, shared by both checkouts, the Python check, the install step and the script | 95 |
 | reserve for writing the summary | 15 |
 | total | 120 |
 

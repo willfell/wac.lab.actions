@@ -30,10 +30,7 @@ FETCHED_INSTALLERS = (
     ("curl piped to a shell", re.compile(r"\bcurl\b[^\n]*\|\s*(sudo\s+)?(ba|z|da)?sh\b")),
     ("get-helm", re.compile(r"get-helm")),
 )
-# Known exceptions, owned by the coordinator and raised with the owner: these
-# jobs held id-token: write with tag-pinned actions and setup-python before the
-# rule existed. This list may only shrink; a job fixed here must leave it.
-KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE = (("wac-cd.yml", "deploy"), ("wac-cd.yml", "shadow"))
+KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE = ()
 SHA = "${{ job.workflow_sha }}"
 
 
@@ -428,7 +425,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             needs = other.get("needs") or []
             with self.subTest(job=name):
                 self.assertNotIn("shadow", [needs] if isinstance(needs, str) else needs)
-        app = job["steps"][1]
+        app = next(st for st in job["steps"] if st.get("name") == "Check out the app (actions/checkout v4)")
         self.assertTrue(app["uses"].startswith("actions/checkout@"))
         self.assertNotIn("repository", app.get("with") or {})
         self.assertIs((app.get("with") or {}).get("persist-credentials"), False)
@@ -544,20 +541,16 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertEqual(id_token_problems(doc, job_name, job), [])
         self.assertIn(("wac-cd.yml", "plan"), checked)
 
-    def test_the_known_id_token_exposures_only_shrink(self):
+    def test_no_job_holding_id_token_is_exempt_from_the_rule(self):
+        self.assertEqual(KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE, (), "a job holding id-token: write may never be an exception")
         import yaml
 
-        self.assertLessEqual(
-            set(KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE), {("wac-cd.yml", "deploy"), ("wac-cd.yml", "shadow")},
-            "a job holding id-token: write may never be added as an exception",
-        )
-        root = Path(__file__).resolve().parents[1] / "workflows"
-        for name, job_name in KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE:
-            doc = yaml.safe_load((root / name).read_text())
-            job = doc["jobs"][job_name]
-            with self.subTest(workflow=name, job=job_name):
-                self.assertTrue(holds_id_token(doc, job), "no longer holds id-token: remove it from the list")
-                self.assertTrue(id_token_problems(doc, job_name, job), "now passes the rule: remove it from the list")
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-cd.yml").read_text())
+        holders = sorted(name for name, job in doc["jobs"].items() if holds_id_token(doc, job))
+        self.assertEqual(holders, ["deploy", "plan", "shadow"])
+        for name in holders:
+            with self.subTest(job=name):
+                self.assertEqual(id_token_problems(doc, name, doc["jobs"][name]), [])
 
     def test_the_id_token_rule_names_each_way_in(self):
         pinned = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
@@ -591,14 +584,23 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertFalse(holds_id_token(inherited, {"permissions": {"contents": "read"}}))
         self.assertTrue(holds_id_token({}, {"permissions": "write-all"}))
 
-    def test_wac_cd_plan_first_requires_the_runners_python3_and_names_the_runner(self):
-        import os
+    def test_wac_cd_jobs_holding_id_token_require_the_runners_python3_before_anything_else(self):
+        jobs = self.wac_cd()["jobs"]
+        for job_name, position in (("plan", 0), ("deploy", 0), ("shadow", 1)):
+            with self.subTest(job=job_name):
+                self.python_check_holds(jobs[job_name], job_name, position)
+        self.assertEqual(
+            jobs["shadow"]["steps"][0]["run"], 'echo "WACD_SHADOW_STARTED=$(date +%s)" >> "$GITHUB_ENV"',
+            "only the clock stamp precedes the check in shadow: its budget starts there",
+        )
+
+    def python_check_holds(self, job, job_name, position):
         import subprocess
 
-        plan = self.wac_cd()["jobs"]["plan"]
-        self.assertFalse([s for s in plan["steps"] if "setup-python" in str(s.get("uses", ""))],
+        self.assertFalse([s for s in job["steps"] if "setup-python" in str(s.get("uses", ""))],
                          "setup-python fetches and runs a Python build in a job that can mint a gateway token")
-        step = plan["steps"][0]
+        step = job["steps"][position]
+        self.assertEqual(step["name"], "Require the runner's python3 3.12 or later")
         self.assertEqual(step["env"], {"JOB_RUNNER_NAME": "${{ runner.name }}",
                                        "JOB_RUNNER_OS": "${{ runner.os }}", "JOB_RUNNER_ARCH": "${{ runner.arch }}"})
         fake = (
@@ -621,11 +623,11 @@ class ReusableWorkflowTests(unittest.TestCase):
                 if label == "3.10":
                     self.assertEqual(
                         result.stdout,
-                        "::error::wac-cd: plan needs python3 3.12 or later on the runner; found Python 3.10.12 "
+                        f"::error::wac-cd: {job_name} needs python3 3.12 or later on the runner; found Python 3.10.12 "
                         f"at {bin_dir}/python3 on ci-light-abc12 (Linux, ARM64).\n",
                     )
                 if label == "absent":
-                    self.assertIn("found no python3 on ci-light-abc12 (Linux, ARM64).", result.stdout)
+                    self.assertIn(f"{job_name} needs python3 3.12 or later on the runner; found no python3 on ci-light-abc12 (Linux, ARM64).", result.stdout)
 
     def test_wac_cd_plan_fails_with_the_refusal_sentence(self):
         import os

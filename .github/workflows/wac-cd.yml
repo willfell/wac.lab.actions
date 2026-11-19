@@ -296,14 +296,35 @@ jobs:
       - name: Start the clock
         shell: bash
         run: echo "WACD_SHADOW_STARTED=$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - name: Require the runner's python3 3.12 or later
+        timeout-minutes: 1
+        shell: bash
+        env:
+          JOB_RUNNER_NAME: ${{ runner.name }}
+          JOB_RUNNER_OS: ${{ runner.os }}
+          JOB_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          python="$(command -v python3 || true)"
+          found="no python3"
+          if [[ -n "$python" ]]; then
+            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              exit 0
+            fi
+            version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
+            found="$version at $python"
+          fi
+          echo "::error::wac-cd: shadow needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
+          exit 1
+      - name: Check out the app (actions/checkout v4)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v4)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -315,9 +336,6 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Install helm
         continue-on-error: true
         timeout-minutes: 1
@@ -557,11 +575,31 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Require the runner's python3 3.12 or later
+        timeout-minutes: 1
+        shell: bash
+        env:
+          JOB_RUNNER_NAME: ${{ runner.name }}
+          JOB_RUNNER_OS: ${{ runner.os }}
+          JOB_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          python="$(command -v python3 || true)"
+          found="no python3"
+          if [[ -n "$python" ]]; then
+            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              exit 0
+            fi
+            version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
+            found="$version at $python"
+          fi
+          echo "::error::wac-cd: deploy needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
+          exit 1
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v4)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -573,9 +611,6 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Read the published images
         id: chart
         shell: bash
@@ -616,7 +651,8 @@ jobs:
             --images "$IMAGES" --wait-timeout "$WAIT_TIMEOUT" \
             --mode "$MODE" --tag "$TAG" --expected-sha "$EXPECTED_SHA" \
             --receipt "$RUNNER_TEMP/wac-cd-release.json"
-      - uses: actions/upload-artifact@v4
+      - name: Upload the release receipt (actions/upload-artifact v4)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: wac-cd-release-${{ needs.plan.outputs.version }}
           path: ${{ runner.temp }}/wac-cd-release.json
