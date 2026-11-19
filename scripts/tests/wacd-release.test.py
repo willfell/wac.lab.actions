@@ -568,6 +568,7 @@ UNSTEADY = {
         "localhost:30500/sidecar:1@sha256:" + "2" * 64),
     "an image with no digest": lambda v: v["deployments"][0].update(images=["localhost:30500/travel-app:0.1.0"]),
     "no image at all": lambda v: v["deployments"][0].update(images=[]),
+    "only a foreign image": lambda v: v["deployments"][0].update(images=["docker.io/envoyproxy/envoy:v1.30@sha256:" + "3" * 64]),
 }
 
 
@@ -610,6 +611,15 @@ class RunningTests(unittest.TestCase):
                 status["deployments"][0]["images"] = images
                 _, _, _, (code, out, err, _) = self.run_cli((200, status))
                 self.assertEqual(code, 0, err)
+
+    def test_a_foreign_sidecar_beside_the_release_image_is_steady_not_mid_rollout(self):
+        for sidecar in ("docker.io/envoyproxy/envoy:v1.30@sha256:" + "3" * 64, "ghcr.io/acme/agent:2", "busybox"):
+            with self.subTest(sidecar=sidecar):
+                status = evidence()
+                status["deployments"][0]["images"].append(sidecar)
+                script, _, _, (code, out, err, _) = self.run_cli((200, status))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(len(script.bodies), 1, "steady on the first read")
 
     def test_an_unsteady_status_is_read_again_until_it_settles(self):
         for label, change in UNSTEADY.items():

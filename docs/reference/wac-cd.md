@@ -526,10 +526,12 @@ copy as for any run, and then, in `Plan the settings release`:
    only when the same answer is Synced at its `chart_digest` and Healthy, every
    Deployment is rolled out (observed generation, and updated, ready and
    available replicas all equal to replicas; a Deployment listed by name only
-   is not), and every image the Deployments run is one of V's
-   `wacwini.com/images` references by repository and digest, with at least
-   one. The status lists only the Deployments' containers, so this is
-   containment, not equality. V's chart is read at the push address, and
+   is not), and every image the Deployments run from the fleet's registry
+   (`localhost:30500/`) is one of V's `wacwini.com/images` references by
+   repository and digest, with at least one such image. Images from any
+   other registry, such as a third-party sidecar, are ignored. The status
+   lists only the Deployments' containers, so this is containment, not
+   equality. V's chart is read at the push address, and
    `chart_digest` must be its manifest digest. An unsteady answer is read
    again; one that never settles is refused (below). A `version` that is not
    a bare `X.Y.Z` (an unknown digest or a lost ledger), a `chart_digest` the
@@ -618,7 +620,8 @@ points at V' whatever happens next.
 | Behind a workflow change | `failure` | `cd / plan`, step `Refuse a settings release behind a workflow change` `failure` | no | no | no |
 | Mid-rollout | `failure` | `cd / plan`, step `Refuse a settings release while the app is rolling out` `failure` | no | no | no |
 | Already released, then rolled back | `failure` | `cd / plan`, step `Plan the settings release` `failure`, sentence `Revision <n> was released as <V'old>, and <V> runs now after a rollback; save the settings again to release them on the running code.` | no | no | no |
-| Failed before deploying | `failure` | `cd / plan`, `cd / retag` or `cd / publish` `failure` with `cd / deploy` `skipped`; or `cd / deploy` `failure` at step `Release through the gateway` | if `cd / plan` succeeded | if `cd / retag` succeeded | no, when the gateway refused the release or never accepted it (see the note below) |
+| Failed before deploying | `failure` | `cd / plan`, `cd / retag` or `cd / publish` `failure` with `cd / deploy` `skipped` | if `cd / plan` succeeded | if `cd / retag` succeeded | no |
+| Failed at the release | `failure` | `cd / deploy` failed at `Release through the gateway`: the release may or may not have been accepted. The app's target tells them apart: if it is V' (its chart carries the settings revision), the patch landed and this is failed after deploying; if it is not, nothing was patched and this is failed before deploying; if hemi could not read the target since the run ended, it concludes nothing yet. | yes | yes | by the app's target (see that cell) |
 | Failed after deploying | `failure` | `cd / deploy` step `Release through the gateway` `success`, then step `Prove the served build` `failure` | yes | yes | yes, and it stays |
 | Cancelled | `cancelled` | the run's conclusion; `cd / deploy` `success` or its step `Release through the gateway` `success` says the patch landed | if `cd / plan` succeeded | if `cd / retag` succeeded | only if `Release through the gateway` succeeded |
 | Released | `success` | `cd / retag` `success` and `cd / deploy` `success` | yes | yes | yes |
@@ -626,11 +629,11 @@ points at V' whatever happens next.
 `Release through the gateway` asks for the release and then waits, within
 `wait_timeout`, for the gateway's proof that it rolled out. A refused release
 (403), a refused downgrade or a gateway unavailable for the whole wait patches
-nothing. If the gateway accepted the release and the proof did not arrive in
-time, the step fails too, although the Application was already pointed at V'.
-That failure reads `release evidence deadline exceeded`, the same line as a
-gateway unavailable for the whole wait, so neither the step's conclusion nor
-its line tells the two apart; the gateway's `status` does.
+nothing; a release the gateway accepted whose proof did not arrive in time
+leaves the Application pointed at V'. Both fail the step with no difference
+in its conclusion (a timed-out proof and a gateway that never answered print
+the same `release evidence deadline exceeded`), which is why the "Failed at
+the release" row reads the app's target instead.
 
 **Re-runs and rollbacks.** "Re-run failed jobs" reuses `plan`, so it releases
 the same V'; the retag PUTs the same bytes again and `publish` finds its chart.

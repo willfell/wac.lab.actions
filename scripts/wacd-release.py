@@ -23,8 +23,9 @@ rolled-back version included. The status's `version` is the version the
 gateway last pointed the Application at, not proof that it runs, so the read
 is taken only from a steady status (steady() below): Synced at its
 chart_digest and Healthy, every Deployment rolled out, and every running image
-one of that version's chart images by repository and digest, with at least
-one. That chart is read from the push address (wacd-chart.py's constant), and
+from the fleet's registry (localhost:30500/) one of that version's chart
+images by repository and digest, with at least one; images from any other
+registry are ignored. That chart is read from the push address (wacd-chart.py's constant), and
 chart_digest must be its manifest digest. An unsteady status is read again
 until N seconds pass, then the read exits ROLLING_OUT_EXIT (3) so plan can
 report the rollout from its own step. A version that is not a bare X.Y.Z, a
@@ -416,7 +417,12 @@ def image_digest(ref):
 
 
 def steady(value, release):
-    """Whether a status proves release runs: synced, healthy, rolled out, and only its images."""
+    """Whether a status proves release runs: synced, healthy, rolled out, and only its fleet images.
+
+    Only images from the fleet's own registry (localhost:30500/) are held to the
+    release's references; another registry's image, such as a third-party
+    sidecar, is not the release's to prove and is ignored.
+    """
     sync = value.get("sync")
     health = value.get("health")
     if (
@@ -439,7 +445,11 @@ def steady(value, release):
         if not isinstance(refs, list):
             return False
         for ref in refs:
-            if not isinstance(ref, str) or (image_repository(ref), image_digest(ref)) not in wanted:
+            if not isinstance(ref, str):
+                return False
+            if not ref.startswith(PULL_REGISTRY + "/"):
+                continue
+            if (image_repository(ref), image_digest(ref)) not in wanted:
                 return False
             seen += 1
     return seen > 0
