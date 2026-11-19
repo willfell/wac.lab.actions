@@ -150,7 +150,9 @@ app's first pull request (the one that adds `.github/wacd.json`, `cd.yml` and
 run of the app fails at `plan` with the uncoded-denial sentence, which ends
 `if this app is new, register it with lab first.` Under `v1.34.0` a
 `deploy: false` run never asked the gateway, so the app's first chart could be
-published before the registration; that order no longer works.
+published before the registration; that order no longer works. From `v1.36.0`
+the app's first merge needs no `deploy: false`: it publishes without releasing
+on its own (**A new app's first merge** below).
 
 | The gateway answers | Settings come from | The chart also carries |
 | --- | --- | --- |
@@ -259,14 +261,15 @@ seconds (default `2100`), the bound `deploy` gives a `release`, passed to the
 script as `--wait-timeout` and parsed by the same function `deploy` uses, so
 both jobs accept exactly the same values. `plan`'s wait is capped at 2100
 seconds (35 minutes) whatever the input, while `deploy` honours the full
-`wait_timeout`: `plan` has `timeout-minutes: 72` (GitHub expressions have no
+`wait_timeout`: `plan` has `timeout-minutes: 74` (GitHub expressions have no
 arithmetic, so it cannot be sized from the input), and the cap makes a long
-outage end in `plan`'s own summary line rather than the job timeout. The 72 is
+outage end in `plan`'s own summary line rather than the job timeout. The 74 is
 a strict sum: 35 minutes for the capped wait, one for its last request (a token
-mint and a connection), and 36 for every other step's own kill switch (one to
-nine minutes each; `Plan the settings release`'s six hold the status read's 120
-seconds, and `Plan the version`'s nine hold the documentation-only read's 150
-seconds; before `v1.36.0` they were six and the sum 68), so even a run in which every step uses its whole bound ends at a
+mint and a connection), and 38 for every other step's own kill switch (one to
+ten minutes each; `Plan the settings release`'s six hold the status read's 120
+seconds, and `Plan the version`'s ten hold the documentation-only read's 150
+seconds and the first-release status read's 60 on top of the six it had before
+`v1.36.0`, when the sum was 68), so even a run in which every step uses its whole bound ends at a
 step's kill switch, never at the job's.
 `.github/scripts/test_reusable_workflows.py` holds the sum. A push release is
 unaffected unless a step hangs. The interval starts at 5 seconds and
@@ -321,18 +324,19 @@ status could not be read before the deadline, so whether it acted is unknown;
 run the deploy again.`, never sending it again blind. Status reads that go
 unanswered for the whole restart window, or until `wait_timeout` ends, fail
 instead with the could-not-be-reached sentence above, `The gateway could not
-be reached for <n> s, ...`. The settings plan's
-status read in `plan` (`Plan the settings release`) does not ride out a
-restart: a refused connection there fails the step as a transport fault, as
-in `v1.35.0`. A certificate that fails verification and
+be reached for <n> s, ...`. The status reads in `plan` do not ride out a
+restart: in `Plan the settings release` a refused connection fails the step as
+a transport fault, as in `v1.35.0`, and the first-release read in `Plan the
+version` (**A new app's first merge** below) is one request, so a restart
+there means the merge releases as before and `deploy` rides it out. A certificate that fails verification and
 every other transport failure still fail at once with `release transport
 failed; check TLS trust and service readiness`, a coded refusal is still
 final, and `wait_timeout` still bounds it all. When the release waited out a
 restart, the run summary gains one line after the `### wac-cd deploy` table:
 `The gateway was restarting; the release waited <n> s for it.`
 
-Every other `plan` step has its own `timeout-minutes` (one to nine minutes), so
-only the gateway wait can use most of the job's 72 minutes: a stalled checkout,
+Every other `plan` step has its own `timeout-minutes` (one to ten minutes), so
+only the gateway wait can use most of the job's 74 minutes: a stalled checkout,
 upload or tag push fails within minutes instead. `wacd-tag.py` bounds each
 call that reaches the remote (`ls-remote`, `push`) at 60 seconds and kills git
 and its transport helpers when it passes, and lets go of git's output 5 seconds
@@ -415,7 +419,8 @@ shows in the job log and on the run's page as well.
 `Plan the version` then writes `### wac-cd plan`: a table with the columns
 `mode`, `version`, `tag` and `expected sha` and one row, such as `release`, the
 new version, its tag and the commit, followed by the sentences of the run (a
-resume, a superseded run, `mode: settings`) when it has any. Every run that
+resume, a superseded run, a documentation-only push, a new app's first merge,
+`mode: settings`) when it has any. Every run that
 reaches `Plan the version` has both sections; the first differs by what the
 gateway answered, as in the table above.
 
@@ -436,6 +441,7 @@ exists on another commit fails the plan.
 | --- | --- | --- |
 | `release` | a new version on a push | build, publish, deploy, github-release |
 | `publish` | a new version with `deploy: false` | build, publish |
+| `publish` | a new version on a push to an app with no version tag whose gateway target was never released (**A new app's first merge** below) | build, publish |
 | `release` | HEAD already carries a `<tag_prefix>X.Y.Z` tag, but its deploy chart is not in the registry | build, publish, deploy, github-release |
 | `publish` | the same, with `deploy: false` | build, publish |
 | `resume` | HEAD already carries a `<tag_prefix>X.Y.Z` tag and its deploy chart is published from this SHA | deploy, github-release |
@@ -500,6 +506,61 @@ untouched.
 - `Refuse a settings release behind an unfinished code release` never counts
   a documentation commit as an unfinished release: it reads only tags, and a
   documentation-only push claims none.
+
+**A new app's first merge.** A new app's Application starts at its
+registration's `bootstrapRevision` (`0.1.0`, say) with automated sync off, a
+chart version that does not exist until the first publish, so it is never
+Synced or Healthy on its own and a release to it fails. Before `v1.36.0` the
+first merge therefore needed `deploy: false` and a second pull request to flip
+it. From `v1.36.0` the first merge publishes without releasing on its own. On a
+`push` only, when the version plan is `release`, after the documentation-only
+decision (a documentation-only push claims no tag and has nothing to publish,
+so it is decided first) and before the tag is claimed, `Plan the version`
+asks two things:
+
+1. whether any `<tag_prefix>X.Y.Z` tag exists in the checkout, merged into
+   `main` or not (`wacd-version.py --mode tagged`); a tag means a release
+   was claimed, and the gateway is not asked;
+2. when none does, the gateway's `status`, once (`wacd-release.py
+   bootstrap`): a target is never released when its `chart_digest` is empty
+   and its `version`, the Application's raw `targetRevision` when that is not
+   a digest, is a name that does not start with `sha256:`. Sync and health are
+   not consulted. The read mints its token and is bounded as the settings
+   reads are: 60 seconds in all, the request ending 15 seconds before that,
+   its token mint included, with a backstop at the 60. It is not asked again.
+
+When both say so, the run is `mode: publish` exactly as with `deploy: false`:
+the version is claimed and the chart published, and `deploy` and
+`github-release` are `skipped`. The step `Publish only: the app has not been
+released yet` concludes `success` with the annotation `wac-cd: <the sentence>`
+(it is `skipped` in every other run), and the `### wac-cd plan` summary gains
+the sentence `<app> has not been released yet (the gateway's target is at its
+bootstrap revision <revision>), so this merge publishes <version> without
+releasing it; the next merge releases.` Anything else releases as before, and
+a status that cannot be read says why in the log line `wac-cd: a release,
+since the gateway's status could not be read: <reason>`:
+
+| A push to an app | `mode` | Gateway asked | Then |
+| --- | --- | --- | --- |
+| with no version tag, whose target is at its bootstrap revision | `publish` | once | the version is claimed and published; no deploy and no GitHub Release |
+| with no version tag, whose target was released (a digest the ledger names, a digest as the version, or an empty version, which the gateway gives for a digest its ledger lost) | `release` | once | as before |
+| with a version tag, even one whose chart never published (a first run that claimed its tag and failed) and even while the target never moved | `release` | no | as before: `deploy`'s own pre-check reports |
+| with `deploy: false` | `publish` | no | as before; no publish-only sentence |
+| with no version tag, whose status read fails, is refused, is not JSON or goes unanswered | `release` | once | as before: `deploy`'s own pre-check reports |
+
+So a new app's first two merges read:
+
+- the first is `mode: publish`: its summary carries the sentence above, the
+  step `Publish only: the app has not been released yet` is green, `deploy`
+  and `github-release` are `skipped`, and there is no GitHub Release; the
+  chart `deploy/<app>:<version>` and its tag exist;
+- the second is `mode: release`: it finds the first's tag, so the gateway is
+  not asked, releases the next version through the gateway (which points the
+  Application at its digest and turns on automated sync), and its
+  `github-release` creates the GitHub Release.
+
+`deploy: false` keeps working, and settings, rollback and resume runs, and the
+`deploy` input, are unchanged.
 
 `deploy: false` is publish-only, used for cutover step 1: the old route still
 deploys while `wac-cd` publishes the first deploy chart. From `v1.35.0` Lab's

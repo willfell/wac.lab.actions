@@ -46,6 +46,11 @@ release while the newest of them has no published chart and no version above
 V has a GitHub Release, so that re-running the unfinished code release stays
 the way out; a Release above V proves a rollback, and the settings release
 proceeds.
+
+`--mode tagged` prints tagged=true when any tag <prefix>X.Y.Z exists in the
+checkout, merged into main or not, and tagged=false when none does: wac-cd's
+plan asks the gateway whether a push is an app's first only when no such tag
+exists, so an app that ever claimed a version is never asked about.
 """
 
 import argparse
@@ -322,6 +327,13 @@ def first_on_its_commit(repo, prefix, parsed, tag):
     )
 
 
+def tagged(repo, prefix):
+    """Whether any tag with the prefix and an X.Y.Z suffix exists in the checkout."""
+    if any(ch in prefix for ch in "\r\n\0"):
+        raise VersionError("tag prefix contains a line break")
+    return any(parse_tag(tag, prefix) for tag in tag_lines(Path(repo), "--list"))
+
+
 def finish(result, deploy):
     if deploy:
         return result
@@ -337,10 +349,18 @@ def main(argv):
     parser.add_argument("--deploy", choices=("true", "false"), default="true")
     parser.add_argument("--published", choices=PUBLISHED, default="unknown")
     parser.add_argument("--main-ref", default=MAIN_REF)
-    parser.add_argument("--mode", choices=("code", "settings"), default="code")
+    parser.add_argument("--mode", choices=("code", "settings", "tagged"), default="code")
     parser.add_argument("--commit", default="")
     parser.add_argument("--running", default="")
     args = parser.parse_args(argv[1:])
+    if args.mode == "tagged":
+        try:
+            found = tagged(Path.cwd(), args.prefix)
+        except VersionError as err:
+            print(f"wacd version: {' '.join(str(err).split())}", file=sys.stderr)
+            return 1
+        print(f"tagged={'true' if found else 'false'}")
+        return 0
     if args.mode == "settings":
         try:
             result = plan_settings(Path.cwd(), args.prefix, args.commit, args.running, args.main_ref)

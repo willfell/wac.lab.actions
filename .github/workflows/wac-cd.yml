@@ -70,7 +70,7 @@ concurrency:
 jobs:
   plan:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
-    timeout-minutes: 72
+    timeout-minutes: 74
     env:
       PYTHONSAFEPATH: "1"
     permissions:
@@ -406,7 +406,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
       - name: Plan the version
-        timeout-minutes: 9
+        timeout-minutes: 10
         id: version
         shell: bash
         env:
@@ -513,6 +513,23 @@ jobs:
                     ;;
                 esac
               fi
+              if [[ "${EVENT_NAME:-}" == push && "$mode" == release ]]; then
+                tagged="$(python3 -I "$WACD_SCRIPTS"/wacd-version.py --mode tagged --prefix "$TAG_PREFIX" 2> /dev/null || true)"
+                if [[ "$tagged" == tagged=false ]]; then
+                  if answer="$(python3 -I "$WACD_SCRIPTS"/wacd-release.py bootstrap --deadline "$(( $(date +%s) + 60 ))" \
+                    2> "$RUNNER_TEMP/bootstrap.err")"; then
+                    bootstrap="$(sed -n 's/^bootstrap=//p' <<< "$answer")"
+                    if [[ -z "$bootstrap" ]]; then
+                      echo "wac-cd: a release, since the gateway's target has been released"
+                    fi
+                  else
+                    echo "wac-cd: a release, since the gateway's status could not be read: $(tr '\r\n' '  ' < "$RUNNER_TEMP/bootstrap.err" | sed 's/^wacd release: //; s/ *$//')"
+                  fi
+                fi
+                if [[ -n "${bootstrap:-}" ]]; then
+                  mode=publish
+                fi
+              fi
             fi
             expected_sha="$GITHUB_SHA"
           fi
@@ -559,6 +576,10 @@ jobs:
                 ;;
             esac
           fi
+          publish_only=""
+          if [[ "$mode" == publish && -n "${bootstrap:-}" ]]; then
+            publish_only="$APP has not been released yet (the gateway's target is at its bootstrap revision $bootstrap), so this merge publishes $version without releasing it; the next merge releases."
+          fi
           {
             echo "mode=$mode"
             echo "version=$version"
@@ -566,6 +587,9 @@ jobs:
             echo "expected_sha=$expected_sha"
             if [[ -n "${docs_since:-}" ]]; then
               echo "docs_since=$docs_since"
+            fi
+            if [[ -n "$publish_only" ]]; then
+              echo "publish_only=$publish_only"
             fi
           } | tee -a "$GITHUB_OUTPUT"
           {
@@ -585,6 +609,10 @@ jobs:
             if [[ -n "${docs_since:-}" ]]; then
               echo
               echo "nothing to release: only documentation changed since $docs_since."
+            fi
+            if [[ -n "$publish_only" ]]; then
+              echo
+              echo "$publish_only"
             fi
             if [[ -n "${SETTINGS_REVISION:-}" && "$mode" == settings ]]; then
               echo
@@ -623,6 +651,14 @@ jobs:
           SINCE: ${{ steps.version.outputs.docs_since }}
         run: |
           echo "::notice::wac-cd: nothing to release: only documentation changed since $SINCE."
+      - name: "Publish only: the app has not been released yet"
+        timeout-minutes: 1
+        if: ${{ steps.version.outputs.publish_only != '' }}
+        shell: bash
+        env:
+          SENTENCE: ${{ steps.version.outputs.publish_only }}
+        run: |
+          echo "::notice::wac-cd: $SENTENCE"
 
   shadow:
     needs: plan

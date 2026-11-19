@@ -570,8 +570,9 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertIsInstance(refusal["timeout-minutes"], int)
         self.assertNotIn("continue-on-error", refusal, "a refusal fails plan, never a green run")
         self.assertNotIn("continue-on-error", doc["jobs"]["plan"], "a refusal fails plan, never a green run")
-        self.assertEqual(names[names.index("Plan the version") + 2:], ["Nothing to release: only documentation changed"],
-                         "after the refusal only the documentation-only report follows")
+        self.assertEqual(names[names.index("Plan the version") + 2:], ["Nothing to release: only documentation changed",
+                                                                        "Publish only: the app has not been released yet"],
+                         "after the refusal only the documentation-only and publish-only reports follow")
 
         def git(repo, *args):
             return subprocess.run(
@@ -689,14 +690,21 @@ class ReusableWorkflowTests(unittest.TestCase):
                 if "cancelled()" in condition:
                     self.assertIn("!failure()", condition)
 
-    def docs_plan(self, after, released=("0.2.0",), docs_paths='["docs/**","mkdocs.yml","*.md"]', event="push"):
+    def docs_plan(self, after, released=("0.2.0",), docs_paths='["docs/**","mkdocs.yml","*.md"]', event="push",
+                  tagged=True, gateway=None, deploy="true"):
         """Run plan's `Plan the version` on a push in a temp repository with real tags, the real scripts and a bare
         origin, against stand-in GitHub Releases for the versions in released ("unreadable": every read is a 502).
 
-        main starts with C, tagged v0.2.0, holding src/app.ts, src/notes.md and docs/guide.md; each item of after
-        is one more commit: docs (docs/ and README.md), docs-rename (a page renamed within docs/), code (src/app.ts),
-        claim (a code commit tagged v0.2.1, as a release that claimed its tag and never finished leaves it), rename
-        (src/notes.md into docs/), github (a workflow file) or github-doc (a Markdown file under .github/). The step's last commit is HEAD, as a push leaves it.
+        main starts with C, tagged v0.2.0 unless tagged is False, holding src/app.ts, src/notes.md and
+        docs/guide.md; each item of after is one more commit: docs (docs/ and README.md), docs-rename (a page renamed
+        within docs/), code (src/app.ts), claim (a code commit tagged v0.2.1, as a release that claimed its tag and
+        never finished leaves it), side-claim (a commit on another branch tagged v0.9.0, never merged into main),
+        other-prefix (a code commit tagged ui-v0.1.0), rename (src/notes.md into docs/), github (a workflow file) or
+        github-doc (a Markdown file under .github/). The step's last commit is HEAD, as a push leaves it.
+
+        gateway is the stand-in gateway's answer to every request, (code, body), or "refused" for a port nothing
+        listens on. With it, the step runs wacd-release.py with only the runner's parts replaced: the gateway's
+        address, the OIDC mint (each mint is logged) and the CA file; every other script is the real one.
         """
         import os
         import shutil
@@ -708,6 +716,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         steps = self.wac_cd()["jobs"]["plan"]["steps"]
         by_name = {s.get("name"): s for s in steps}
         step, report = by_name["Plan the version"], by_name["Nothing to release: only documentation changed"]
+        publish_only = by_name["Publish only: the app has not been released yet"]
 
         def git(repo, *args):
             return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
@@ -745,12 +754,20 @@ class ReusableWorkflowTests(unittest.TestCase):
             (repo / path).write_text(text)
         git(repo, "add", ".")
         git(repo, "commit", "-q", "-m", "feat: first")
-        git(repo, "tag", "v0.2.0")
+        if tagged:
+            git(repo, "tag", "v0.2.0")
         for n, kind in enumerate(after):
+            if kind == "side-claim":
+                git(repo, "checkout", "-q", "-b", "side")
+                (repo / "src" / "app.ts").write_text(f"side {n}\n")
+                git(repo, "commit", "-q", "-am", f"fix: side {n}")
+                git(repo, "tag", "v0.9.0")
+                git(repo, "checkout", "-q", "main")
+                continue
             if kind == "docs":
                 (repo / "docs" / "guide.md").write_text(f"guide {n}\n")
                 (repo / "README.md").write_text(f"readme {n}\n")
-            elif kind in ("code", "claim"):
+            elif kind in ("code", "claim", "other-prefix"):
                 (repo / "src" / "app.ts").write_text(f"code {n}\n")
             elif kind == "rename":
                 git(repo, "mv", "src/notes.md", "docs/notes.md")
@@ -764,6 +781,8 @@ class ReusableWorkflowTests(unittest.TestCase):
             git(repo, "commit", "-q", "-m", f"{'docs' if kind == 'docs' else 'fix'}: {kind} {n}")
             if kind == "claim":
                 git(repo, "tag", "v0.2.1")
+            if kind == "other-prefix":
+                git(repo, "tag", "ui-v0.1.0")
         git(repo, "remote", "add", "origin", str(bare))
         git(repo, "push", "-q", "origin", "main", "refs/tags/*")
         head = git(repo, "rev-parse", "HEAD")
@@ -773,7 +792,57 @@ class ReusableWorkflowTests(unittest.TestCase):
                "PYTHONSAFEPATH": "1", "WACD_SCRIPTS": str(root / "scripts"), "RUNNER_TEMP": str(tmp),
                "GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_SHA": head,
                "GITHUB_API_URL": f"http://127.0.0.1:{server.server_address[1]}", "GITHUB_REPOSITORY": "wacwini/app"}
-        step_env = {"ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "", "DEPLOY": "true",
+        asked, mints = [], tmp / "mints"
+        if gateway is not None:
+            class Gateway(BaseHTTPRequestHandler):
+                def do_POST(self):
+                    length = int(self.headers.get("Content-Length", "0"))
+                    asked.append((json.loads(self.rfile.read(length)), self.headers.get("Authorization")))
+                    body = json.dumps(gateway[1]).encode()
+                    self.send_response(gateway[0])
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *args):
+                    pass
+
+            if gateway == "refused":
+                import socket
+
+                with socket.socket() as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    url = f"http://127.0.0.1:{probe.getsockname()[1]}/v1/release"
+            else:
+                stand_in = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
+                threading.Thread(target=stand_in.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+                self.addCleanup(stand_in.server_close)
+                self.addCleanup(stand_in.shutdown)
+                url = f"http://127.0.0.1:{stand_in.server_address[1]}/v1/release"
+            scripts = tmp / "scripts"
+            scripts.mkdir()
+            for real in (root / "scripts").iterdir():
+                if real.name != "wacd-release.py":
+                    (scripts / real.name).symlink_to(real)
+            (scripts / "wacd-release.py").write_text(
+                "import importlib.util, os, sys\n"
+                "spec = importlib.util.spec_from_file_location('wacd_release_real', os.environ['WACD_REAL_RELEASE'])\n"
+                "real = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(real)\n"
+                "real.ci.URL = os.environ['WACD_GATEWAY_URL']\n"
+                "def mint(timeout=real.ci.OIDC_TIMEOUT):\n"
+                "    with open(os.environ['WACD_MINT_LOG'], 'a') as log:\n"
+                "        log.write(f'{timeout}\\n')\n"
+                "    return 'minted-token'\n"
+                "real.ci.oidc_token = mint\n"
+                "real.trust_context = lambda: None\n"
+                "if __name__ == '__main__':\n"
+                "    sys.exit(real.main(sys.argv))\n"
+                "globals().update({k: v for k, v in vars(real).items() if not k.startswith('__')})\n"
+            )
+            env.update({"WACD_SCRIPTS": str(scripts), "WACD_REAL_RELEASE": str(root / "scripts" / "wacd-release.py"),
+                        "WACD_GATEWAY_URL": url, "WACD_MINT_LOG": str(mints)})
+        step_env = {"ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "", "DEPLOY": deploy,
                     "APP": "app", "TAG_PREFIX": "v", "SETTINGS_REVISION": "", "SETTINGS_MODE": "",
                     "SETTINGS_VERSION": "", "SETTINGS_TAG": "", "SETTINGS_COMMIT": "", "SETTINGS_SUMMARY": "",
                     "SETTINGS_UNFINISHED": "", "EVENT_NAME": event, "DOCS_PATHS": docs_paths,
@@ -785,12 +854,19 @@ class ReusableWorkflowTests(unittest.TestCase):
         outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
         pushed = sorted(set(git(bare, "for-each-ref", "--format=%(refname)").splitlines()) - before)
         plan = {"outputs": outputs, "pushed": pushed, "summary": summary.read_text(), "head": head, "reads": reads,
-                "log": result.stdout + result.stderr}
+                "log": result.stdout + result.stderr, "asked": asked,
+                "mints": mints.read_text().splitlines() if mints.exists() else []}
         self.assertEqual(report["if"], "${{ steps.version.outputs.docs_since != '' }}")
         self.assertEqual(report["env"], {"SINCE": "${{ steps.version.outputs.docs_since }}"})
+        self.assertEqual(publish_only["if"], "${{ steps.version.outputs.publish_only != '' }}")
+        self.assertEqual(publish_only["env"], {"SENTENCE": "${{ steps.version.outputs.publish_only }}"})
         if outputs.get("docs_since"):
             plan["report"] = subprocess.run(["bash", "-c", report["run"]], env={**env, "SINCE": outputs["docs_since"]},
                                             capture_output=True, text=True)
+        if outputs.get("publish_only"):
+            plan["publish_only"] = subprocess.run(["bash", "-c", publish_only["run"]],
+                                                  env={**env, "SENTENCE": outputs["publish_only"]},
+                                                  capture_output=True, text=True)
         return plan
 
     def assertReleases(self, plan, version):
@@ -840,6 +916,110 @@ class ReusableWorkflowTests(unittest.TestCase):
         ):
             with self.subTest(case=label):
                 self.assertReleases(self.docs_plan(("docs",), **kwargs), "0.2.1")
+
+    DIGEST_A = "sha256:" + "a" * 64
+
+    def status(self, version, digest, **extra):
+        """A 200 status in the shape wac.lab cideploy/backend.py's _chart_view returns."""
+        return 200, {"application": "app", "chart": "deploy/app", "version": version, "chart_digest": digest,
+                     "automated": bool(digest), "source_sha": "b" * 40,
+                     "sync": {"status": "OutOfSync", "revision": ""}, "health": {"status": "Missing"},
+                     "operation_phase": "", "deployments": [], **extra}
+
+    FIRST = ("app has not been released yet (the gateway's target is at its bootstrap revision 0.1.0), so this "
+             "merge publishes 0.1.0 without releasing it; the next merge releases.")
+
+    def assertAskedOnce(self, plan):
+        self.assertEqual(len(plan["mints"]), 1, "one status read, never asked again")
+        self.assertLessEqual(float(plan["mints"][0]), 20, "the mint is bounded by the read's time left")
+        self.assertIn(plan["asked"], ([], [({"operation": "status"}, "Bearer minted-token")]))
+
+    def test_wac_cd_a_first_merge_to_a_never_released_target_publishes_without_releasing(self):
+        """No version tag and a target at its bootstrap revision: claimed and published as deploy: false does."""
+        for label, after in (("no tag at all", ("code",)), ("only another prefix's tag", ("other-prefix",))):
+            with self.subTest(case=label):
+                plan = self.docs_plan(after, released=(), tagged=False, gateway=self.status("0.1.0", ""))
+                self.assertEqual(plan["outputs"], {"mode": "publish", "version": "0.1.0", "tag": "v0.1.0",
+                                                   "expected_sha": plan["head"], "publish_only": self.FIRST},
+                                 plan["log"])
+                self.assertEqual(plan["pushed"], ["refs/tags/v0.1.0"], "the version is claimed")
+                self.assertEqual(plan["asked"], [({"operation": "status"}, "Bearer minted-token")])
+                self.assertAskedOnce(plan)
+                self.assertIn("| publish | 0.1.0 | v0.1.0 |", plan["summary"])
+                self.assertIn("\n" + self.FIRST + "\n", plan["summary"])
+                self.assertEqual(plan["publish_only"].returncode, 0)
+                self.assertEqual(plan["publish_only"].stdout, "::notice::wac-cd: " + self.FIRST + "\n")
+                self.assertEqual(plan["reads"], [], "no Release is read for an app with no tag")
+
+    def test_wac_cd_a_first_merge_to_a_released_target_releases(self):
+        for label, answer in (
+            ("a digest the ledger names", self.status("0.1.0", self.DIGEST_A)),
+            ("a digest as the version", self.status(self.DIGEST_A, "")),
+            ("a digest the ledger lost", self.status("", "")),
+            ("no chart_digest", (200, {"version": "0.1.0"})),
+        ):
+            with self.subTest(case=label):
+                plan = self.docs_plan(("code",), released=(), tagged=False, gateway=answer)
+                self.assertReleases(plan, "0.1.0")
+                self.assertNotIn("publish_only", plan["outputs"])
+                self.assertNotIn("has not been released yet", plan["summary"])
+                self.assertEqual(len(plan["asked"]), 1)
+                self.assertAskedOnce(plan)
+
+    def test_wac_cd_a_first_merge_whose_status_read_fails_releases(self):
+        """Unknown is not never-released: deploy's own pre-check then reports, as before."""
+        for label, answer in (("unavailable", (503, {})), ("refused with no reason", (403, {})),
+                              ("refused with a code", (403, {"reason": "fleet_copy_missing"})),
+                              ("not JSON", (200, "not an object")), ("nothing listening", "refused")):
+            with self.subTest(case=label):
+                plan = self.docs_plan(("code",), released=(), tagged=False, gateway=answer)
+                self.assertReleases(plan, "0.1.0")
+                self.assertNotIn("publish_only", plan["outputs"])
+                self.assertAskedOnce(plan)
+                self.assertIn("wac-cd: a release, since the gateway's status could not be read", plan["log"])
+                self.assertNotIn("The gateway refused", plan["summary"])
+
+    def test_wac_cd_a_merge_with_a_version_tag_releases_without_asking_the_gateway(self):
+        """A tag means a release was claimed, so the gateway is never asked, even when its target never moved."""
+        for label, kwargs, version in (
+            ("a released tag on main", {"after": ("code",)}, "0.2.1"),
+            ("a claimed tag whose chart never published", {"after": ("claim", "code"), "released": (),
+                                                           "tagged": False}, "0.2.2"),
+            ("a tag never merged into main", {"after": ("side-claim", "code"), "released": (), "tagged": False},
+             "0.1.0"),
+            ("not a push", {"after": ("code",), "released": (), "tagged": False, "event": "workflow_dispatch"},
+             "0.1.0"),
+        ):
+            with self.subTest(case=label):
+                plan = self.docs_plan(gateway=self.status("0.1.0", ""), **kwargs)
+                self.assertReleases(plan, version)
+                self.assertNotIn("publish_only", plan["outputs"])
+                self.assertEqual((plan["asked"], plan["mints"]), ([], []))
+
+    def test_wac_cd_deploy_false_still_publishes_without_asking_the_gateway(self):
+        for tagged, version in ((False, "0.1.0"), (True, "0.2.1")):
+            with self.subTest(tagged=tagged):
+                plan = self.docs_plan(("code",), tagged=tagged, deploy="false", gateway=self.status("0.1.0", ""))
+                self.assertEqual({k: plan["outputs"][k] for k in ("mode", "version", "tag")},
+                                 {"mode": "publish", "version": version, "tag": f"v{version}"}, plan["log"])
+                self.assertEqual(plan["pushed"], [f"refs/tags/v{version}"])
+                self.assertNotIn("publish_only", plan["outputs"])
+                self.assertNotIn("has not been released yet", plan["summary"])
+                self.assertEqual((plan["asked"], plan["mints"]), ([], []))
+
+    def test_wac_cd_a_publish_only_run_builds_and_publishes_and_never_deploys(self):
+        jobs = self.wac_cd()["jobs"]
+        steps = jobs["plan"]["steps"]
+        names = [s.get("name") for s in steps]
+        step = steps[names.index("Publish only: the app has not been released yet")]
+        self.assertEqual(names.index("Publish only: the app has not been released yet"),
+                         names.index("Nothing to release: only documentation changed") + 1)
+        self.assertEqual(step["if"], "${{ steps.version.outputs.publish_only != '' }}")
+        self.assertEqual(step["timeout-minutes"], 1)
+        self.assertNotIn("continue-on-error", step)
+        ran = {name for name in ("shadow", "build", "retag", "publish", "deploy", "github-release")
+               if self.runs(jobs[name], "publish", "files")}
+        self.assertEqual(ran, {"shadow", "build", "publish"}, "no deploy and no GitHub Release")
 
     def test_wac_cd_shadow_observes_and_never_holds_a_release(self):
         """A hemi outage must not fail or delay a release: the shadow job is off the release path."""
@@ -1433,6 +1613,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             ("plan", "Plan the version"): [(code, 0), ({**code, "ROLLBACK_VERSION": "1.4.2"}, 0), (settings, 0)],
             ("plan", "Refuse to replay an old version"): [refusal],
             ("plan", "Nothing to release: only documentation changed"): [({"SINCE": "v1.4.2"}, 0)],
+            ("plan", "Publish only: the app has not been released yet"): [({"SENTENCE": "app has not been released yet"}, 0)],
             ("shadow", "Start the clock"): [({}, 0)],
             ("shadow", "Require the runner's python3 3.12 or later"): [(runner, 0)],
             ("shadow", "Require the defining workflow commit"): [(guard, 0)],
@@ -1532,6 +1713,8 @@ class ReusableWorkflowTests(unittest.TestCase):
             "wacd-release.py unfinished-release": "left=",
             "wacd-release.py": "Verified",
             "wacd-version.py --mode settings": "mode=settings\nversion=1.4.3\ntag=v1.4.3\nclaimed=\nabove=\ncodes=",
+            "wacd-version.py --mode tagged": "tagged=false",
+            "wacd-release.py bootstrap": "bootstrap=0.1.0",
             "wacd-version.py": "mode=release\nversion=1.4.3\ntag=v1.4.3",
             "wacd-chart.py chart-revision": f"revision={head}",
             "wacd-chart.py chart-images": "images=" + json.dumps(running),
@@ -2001,7 +2184,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                                 "a capped wait still ends inside the job, with its summary line")
 
     def test_wac_cd_plan_ends_inside_its_job_bound_even_when_every_step_uses_its_own(self):
-        """35 + 1 + 36 = 72: the gateway wait's cap, a minute for its last request, and every other step's bound.
+        """35 + 1 + 38 = 74: the gateway wait's cap, a minute for its last request, and every other step's bound.
 
         The gateway wait has no kill switch of its own: it ends PLAN_WAIT_CAP seconds after it starts,
         plus one last request (a token mint and a connection), allowed a minute. Every other step stops at
@@ -2018,12 +2201,12 @@ class ReusableWorkflowTests(unittest.TestCase):
         spec.loader.exec_module(contract)
         wait = math.ceil(contract.PLAN_WAIT_CAP / 60) + 1
         others = sum(step["timeout-minutes"] for step in plan["steps"] if step.get("id") != "contract")
-        self.assertEqual((wait, others, plan["timeout-minutes"]), (36, 36, 72),
+        self.assertEqual((wait, others, plan["timeout-minutes"]), (36, 38, 74),
                          "the sum the docstring and docs/reference/wac-cd.md state")
         self.assertEqual(wait + others, plan["timeout-minutes"], f"{wait} + {others} is plan's bound")
 
     def test_wac_cd_plan_bounds_every_step_but_the_gateway_wait(self):
-        """With 72 minutes for the job, a stalled checkout or git push must not use them all."""
+        """With 74 minutes for the job, a stalled checkout or git push must not use them all."""
         steps = self.wac_cd()["jobs"]["plan"]["steps"]
         for step in steps:
             name = step.get("name") or step.get("uses")
@@ -2032,8 +2215,23 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertNotIn("timeout-minutes", step, "the wait is bounded by --wait-timeout")
                     continue
                 self.assertIsInstance(step.get("timeout-minutes"), int)
-                self.assertLessEqual(step["timeout-minutes"], 9 if name == "Plan the version" else 6,
-                                     "Plan the version also holds the documentation-only read's 150 seconds")
+                self.assertLessEqual(step["timeout-minutes"], 10 if name == "Plan the version" else 6,
+                                     "Plan the version also holds the documentation-only and first-release reads")
+
+    def test_wac_cd_plan_the_version_holds_both_of_its_gateway_and_github_reads(self):
+        """Ten minutes: the six it had before v1.36.0, the documentation-only read's 150 s and the status read's 60."""
+        import math
+
+        step = next(s for s in self.wac_cd()["jobs"]["plan"]["steps"] if s.get("name") == "Plan the version")
+        spec = importlib.util.spec_from_file_location(
+            "wacd_docs_bound", Path(__file__).resolve().parents[2] / "scripts" / "wacd-docs.py"
+        )
+        docs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(docs)
+        read = int(re.search(r'wacd-release\.py bootstrap --deadline "\$\(\( \$\(date \+%s\) \+ (\d+) \)\)"',
+                             step["run"]).group(1))
+        self.assertEqual((docs.RELEASE_SCOPE_SECONDS, read), (150, 60))
+        self.assertEqual(step["timeout-minutes"], 6 + math.ceil((docs.RELEASE_SCOPE_SECONDS + read) / 60))
 
     def test_wac_cd_plan_checks_the_trigger_before_asking_the_gateway(self):
         """A malformed dispatch must not wait out a gateway outage before saying so."""

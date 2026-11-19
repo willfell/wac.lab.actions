@@ -800,6 +800,51 @@ class DeadlineTests(unittest.TestCase):
         self.assertIn("did not finish within the settings plan's deadline", err)
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_the_first_release_read_is_one_request_that_ends_at_its_deadline(self):
+        """plan's bootstrap read: a gateway that never answers, or trickles, costs one request and its deadline."""
+        seen = []
+
+        class Silent(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.server.drip:
+                    self.send_response(200)
+                    self.send_header("Content-Length", "100000")
+                    self.end_headers()
+                try:
+                    for _ in range(100):
+                        if self.server.drip:
+                            self.wfile.write(b" ")
+                            self.wfile.flush()
+                        time.sleep(0.1)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        for drip in (False, True):
+            with self.subTest(drip=drip):
+                seen.clear()
+                server = ThreadingHTTPServer(("127.0.0.1", 0), Silent)
+                server.drip = drip
+                server.daemon_threads = True
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                self.addCleanup(server.server_close)
+                self.addCleanup(server.shutdown)
+                started = time.monotonic()
+                with patch.object(wacd, "trust_context", lambda: None), \
+                        patch.object(wacd.ci, "URL", f"http://127.0.0.1:{server.server_address[1]}/v1/release"), \
+                        patch.object(wacd.ci, "oidc_token", lambda timeout=20: "t0k"), \
+                        patch.object(wacd, "DEADLINE_MARGIN", 1):
+                    code, out, err = CliTests.main(self, "bootstrap", "--deadline", str(time.time() + 4))
+                self.assertEqual((code, out), (1, ""), err)
+                self.assertTrue(err.startswith("wacd release: "), err)
+                self.assertNotIn("t0k", err)
+                self.assertEqual(seen, [json.dumps(wacd.STATUS_BODY()).encode()], "one request, never asked again")
+                self.assertLess(time.monotonic() - started, 6)
+                self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
     def test_a_deadline_already_past_or_too_close_reads_nothing(self):
         for offset in (-1, 10):
             with self.subTest(offset=offset):

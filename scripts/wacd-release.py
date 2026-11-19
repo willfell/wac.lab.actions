@@ -89,6 +89,22 @@ deadline itself stops a read that trickles past every socket timeout; each
 command disarms it and restores the previous handler in a finally, so it
 cannot fire once the command has decided.
 
+`bootstrap --deadline <epoch seconds>` is plan's read on a push to an app
+with no version tag at all: whether the gateway's target has never been
+released. It sends one status request, under the same bounds as the settings
+reads (the request ends DEADLINE_MARGIN seconds before the deadline, its token
+mint included, and the backstop fires at the deadline itself), and is not
+asked again: a status read in plan does not ride out a restart. A 200 whose
+chart_digest is "" and whose version, the Application's raw targetRevision
+when it is not a digest (wac.lab cideploy/backend.py, _released_version and
+_chart_view), is a non-empty name (TAG_PATTERN) that does not start with
+sha256: is a target still at its bootstrap revision, and it prints
+bootstrap=<that revision>. Any other 200 prints bootstrap=, a target that was
+released. An empty version is not a bootstrap revision: the gateway gives it
+for a digest its ledger does not know, so it reads as released. Anything else
+(a refusal, a 503, a transport failure, a mint failure, the deadline) exits 1,
+and plan releases as it would have without the read.
+
 `release` rides out a gateway restart. The gateway's Deployment is Recreate,
 so a rollout leaves about 35 s with nothing listening. A request that never
 left the runner (never_sent(): a connection refused, reset or closed in the
@@ -933,6 +949,36 @@ def running_release(app, wait_timeout, request=None):
     raise ReleaseError("status deadline exceeded; the gateway could not read the cluster")
 
 
+def bootstrap_revision(value):
+    """The bootstrap revision a 200 status names when its target was never released, else ""."""
+    version = value.get("version")
+    if value.get("chart_digest") != "" or not isinstance(version, str):
+        return ""
+    if version.startswith("sha256:") or not TAG_PATTERN.fullmatch(version):
+        return ""
+    return version
+
+
+def bootstrap(deadline, request=None):
+    """One status read, bounded by deadline: the bootstrap revision, or "" for a released target."""
+    if request is None:
+        request = status_transport
+        trust = trust_context()
+    else:
+        trust = None
+    left, previous = arm_deadline(deadline)
+    try:
+        timeout = left - DEADLINE_MARGIN
+        if timeout < MIN_READ_SECONDS:
+            raise Deadline("too little of the plan's deadline was left to read the status")
+        code, value = request(STATUS_BODY(), trust, timeout)
+    finally:
+        disarm(previous)
+    if code == 200:
+        return bootstrap_revision(value)
+    raise ReleaseError(f"the gateway answered the status read with HTTP {code}")
+
+
 def probe(url, timeout):
     opener = urllib.request.build_opener(
         ci.NoRedirect(), urllib.request.ProxyHandler({})
@@ -1093,6 +1139,8 @@ def build_parser():
     for name in ("--app", "--prefix", "--running", "--versions", "--codes"):
         unfinished.add_argument(name, required=True)
     unfinished.add_argument("--deadline", type=float, required=True)
+    first = commands.add_parser("bootstrap")
+    first.add_argument("--deadline", type=float, required=True)
     gh = commands.add_parser("github-release")
     gh.add_argument("--tag", required=True)
     gh.add_argument("--sha", required=True)
@@ -1102,6 +1150,8 @@ def build_parser():
 def run(args):
     if args.command == "github-release":
         return github_release(args.tag, args.sha, os.environ)
+    if args.command == "bootstrap":
+        return "bootstrap=" + bootstrap(args.deadline)
     if args.command == "unfinished-release":
         versions = [v for v in args.versions.split(",") if v]
         codes = [v for v in args.codes.split(",") if v]
