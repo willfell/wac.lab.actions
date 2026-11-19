@@ -66,7 +66,8 @@ TOP_LEVEL_KEY = re.compile(
 )
 TOP_LEVEL_ITEM = re.compile(r"-(\s|$)")
 BUILD_ARG_KEY = re.compile(r"[A-Z_][A-Z0-9_]*")
-DECIMAL = re.compile(r"[1-9][0-9]*", re.ASCII)
+DECIMAL = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
+MAX_REVISION = 9999999999
 
 
 class ChartError(Exception):
@@ -85,15 +86,20 @@ def revision_annotation(revision):
     This and revision_from_annotation are the only place the two spellings
     meet; the gateway reads the annotation back with int().
     """
-    if type(revision) is not int or revision < 1:
-        raise ChartError(f"the copy's revision must be a whole number of at least 1, not {str(revision)[:20]!r}")
+    if type(revision) is not int or not 1 <= revision <= MAX_REVISION:
+        raise ChartError(
+            f"the copy's revision must be a whole number from 1 to {MAX_REVISION}, not {str(revision)[:20]!r}"
+        )
     return str(revision)
 
 
 def revision_from_annotation(text):
     """The inverse of revision_annotation; refuses any other spelling of the number."""
     if not isinstance(text, str) or not DECIMAL.fullmatch(text):
-        raise ChartError(f"{CONTRACT_REVISION_ANNOTATION} must be a decimal of at least 1, not {str(text)[:20]!r}")
+        raise ChartError(
+            f"{CONTRACT_REVISION_ANNOTATION} must be a decimal from 1 to {MAX_REVISION}, the gateway's "
+            f"width, not {str(text)[:20]!r}"
+        )
     return int(text)
 
 

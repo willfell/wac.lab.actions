@@ -60,18 +60,21 @@ RELEASED_MODES = ("release", "resume", "rollback")
 REASON_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 # The gateway's closed list of refusal codes, each with the sentence a run
-# summary shows. The first three answer the contract operation, the rest the
-# release checks; one map serves wacd-contract.py and the release below.
+# summary shows. The contract operation can return only the three fleet_copy_*
+# codes; the release check can return all seven, those three included (a copy
+# missing, unreadable or naming another repository at the chart's own fleet
+# commit). One map serves wacd-contract.py and the release below, so every
+# sentence holds for each place its code can come from.
 REFUSALS = {
     "fleet_copy_missing": (
-        "This app has released from hemi's settings before, and the gateway found no copy "
-        "of them, so nothing was built."
+        "The gateway found no copy of this app's settings where one is required, so the "
+        "run stopped."
     ),
     "fleet_copy_unreadable": (
-        "The gateway could not read hemi's copy of this app's settings, so nothing was built."
+        "The gateway could not read hemi's copy of this app's settings, so the run stopped."
     ),
     "fleet_copy_mismatch": (
-        "hemi's copy of this app's settings names another app, so nothing was built."
+        "hemi's copy of this app's settings names another app, so the run stopped."
     ),
     "fleet_commit_not_on_default_branch": (
         "The settings this release was planned with are no longer on the fleet copy's main line."
@@ -80,11 +83,12 @@ REFUSALS = {
         "The settings this release was planned with are older than the settings already released."
     ),
     "revision_annotation_missing": (
-        "This app releases from hemi's settings, and this chart does not say which revision "
-        "of them it was built from."
+        "This chart does not carry both of the settings annotations, and the gateway requires "
+        "them for this app."
     ),
     "revision_mismatch": (
-        "This chart names a different revision of the settings from the copy it points to."
+        "This chart's settings revision is not the one the fleet copy holds now; plan again to "
+        "release the current settings."
     ),
 }
 UNKNOWN_REFUSAL = "The gateway refused this request for a reason this wac-cd does not know"

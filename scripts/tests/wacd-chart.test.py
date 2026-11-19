@@ -660,16 +660,16 @@ class RevisionAnnotationTests(unittest.TestCase):
     """The copy's revision is a JSON number; the chart annotation is its decimal string."""
 
     def test_revision_converts_both_ways(self):
-        for number, text in ((1, "1"), (7, "7"), (120, "120")):
+        for number, text in ((1, "1"), (7, "7"), (120, "120"), (9999999999, "9999999999")):
             with self.subTest(number=number):
                 self.assertEqual(chart.revision_annotation(number), text)
                 self.assertEqual(chart.revision_from_annotation(text), number)
 
     def test_revision_refuses_what_the_gateway_would_misread(self):
-        for bad in (0, -1, True, 1.0, "7", None):
+        for bad in (0, -1, True, 1.0, "7", None, 10 ** 10):
             with self.subTest(number=bad), self.assertRaises(chart.ChartError):
                 chart.revision_annotation(bad)
-        for bad in ("", "0", "07", "-1", "1.0", " 7", "7\n", "seven", "\u0667", 7):
+        for bad in ("", "0", "07", "-1", "1.0", " 7", "7\n", "seven", "\u0667", 7, "10000000000"):
             with self.subTest(text=bad), self.assertRaises(chart.ChartError):
                 chart.revision_from_annotation(bad)
 
