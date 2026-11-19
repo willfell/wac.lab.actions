@@ -477,11 +477,11 @@ code; "Re-run all jobs" on c2 is refused with that sentence, and only a new
 commit releases c2's changes, as `v1.0.3`. From `v1.36.0` that settings
 release is refused instead, by `Refuse a settings release behind an unfinished
 code release` (**Settings-only releases**, rule 5), while c2's chart is
-unpublished and no version above the running one published, so "Re-run all
-jobs" on c2 stays the way out. The sentence is left for a c2 whose chart was
-published before its run failed, for a c2 a settings release passed after a
-deliberate rollback (rule 5), and for tags a settings release placed under an
-older pin; it reaches the run as `Refuse to replay an old version`. Git ancestry alone tells the two
+unpublished and no version above the running one has a GitHub Release, so
+"Re-run all jobs" on c2 stays the way out. The sentence is left for a c2 whose
+chart was published before its run failed, for a c2 a settings release passed
+after a rollback (a version above the running one has a GitHub Release; rule
+5), and for tags a settings release placed under an older pin; it reaches the run as `Refuse to replay an old version`. Git ancestry alone tells the two
 apart, so when c2 had been released and then rolled back before the settings
 release, the sentence still says it was never released.
 An untagged HEAD, or a tagged one that lacks a tag on main, gets `This commit is
@@ -716,30 +716,47 @@ copy as for any run, and then, in `Plan the settings release`:
    `wacd-release.py unfinished-release` then reads `deploy/<app>:<version>` at
    the push address for each, newest first, within the step's deadline, each
    read bounded by the time left and the same `SIGALRM` backstop behind it.
-   The scan ends at the first chart present. An absent chart of a settings
-   claim is passed over, since rule 6 takes that claim again; the first
-   absent chart of a code release is the newest unfinished code release, the
-   one a re-run could still release (one below it could only be replayed).
-   - With no chart above V present (#83's c2 shape: V runs, and the next code
-     release failed in `build`), that claim records the refusal for `Refuse a
-     settings release behind an unfinished code release` (below): a settings
-     version above it would overtake it, and re-running the code release, the
-     way out, would then be refused.
-   - With a chart above V present, V runs below a published version, which is
-     the evidence of a deliberate rollback, and the only one: V is never
-     taken as rolled back merely because it is older, and no run list is
-     read. The settings release then proceeds past the claim, which can now
-     ship only as a new commit, and the run summary gains exactly one line
-     after the `mode: settings` summary: `<tag> was left unfinished and can now
-     ship only as a new commit.` V' goes above that claim as usual. A later
-     "Re-run all jobs" on the code release is refused at `Refuse to replay an
-     old version`, whose sentence ends `push a new commit to release it.`
-   - With no unfinished code release above V, the run proceeds and the
-     summary gains nothing.
+   An absent chart of a settings claim is passed over, since rule 6 takes
+   that claim again.
+   - When the first chart present comes before any absent chart of a code
+     release, there is no unfinished code release (one below a published
+     version could only be replayed): the scan ends there, reads no Release,
+     and the run proceeds with nothing added to the summary. With no version
+     above V nothing is read.
+   - Otherwise the first absent chart of a code release is the newest
+     unfinished code release, the one a re-run could still release. The scan
+     goes on through the charts below it, and for each one present reads its
+     GitHub Release with the job's `GITHUB_TOKEN`, through rule 6's reader
+     (`GET /repos/{repo}/releases/tags/{tag}`, 404 for none). A Release is the
+     only evidence of a rollback: `github-release` creates one only after
+     `deploy` proved the served build, and an older build runs below a proved
+     newer one only by a rollback. V is never taken as rolled back merely
+     because it is older or below a published chart, and no run list is read.
+     A published chart with no Release (a code release whose deploy failed or
+     whose proof timed out, a `deploy: false` publish, a settings release
+     whose deploy failed) proves nothing and is passed over.
+   - After a rollback (a version above the running one has a GitHub Release),
+     the settings release proceeds past the unfinished code release, which
+     can now ship only as a new commit, and the run summary gains exactly one
+     line after the `mode: settings` summary: `<tag> was left unfinished and
+     can now ship only as a new commit.` V' goes above that claim as usual. A
+     later "Re-run all jobs" on the code release is refused at `Refuse to
+     replay an old version`, whose sentence ends `push a new commit to release
+     it.`
+   - With no Release above V (#83's c2 shape: V runs, and the next code
+     release failed in `build`, with or without a never-deployed chart between
+     them), the claim records the refusal for `Refuse a settings release
+     behind an unfinished code release` (below): a settings version above it
+     would overtake it, and re-running the code release, the way out, would
+     then be refused.
 
-   A chart that cannot be read fails `plan` with a sentence and never counts
-   as absent, and the scan reads at most 25 charts, failing with a sentence
-   when it runs out of them. With no version above V nothing is read.
+   A Release that cannot be read (any answer but 200 or 404, or none)
+   concludes nothing, neither a rollback nor a refusal: `Plan the settings
+   release` fails with `the GitHub Releases of <app> could not be read, so
+   this settings release cannot tell a rollback from an unfinished release;
+   run it again.` A chart that cannot be read fails `plan` with a sentence and
+   never counts as absent, and the scan reads at most 25 charts, failing with
+   a sentence when it runs out of them.
 6. Never spends a second version on one revision, and never undoes a
    rollback:
    - when V's chart already carries `settings_revision`, V' is V (a re-run
@@ -825,9 +842,9 @@ refusal gave no reason.`
   claimed by a code release that never published; re-run that release, or
   release a new commit, before releasing settings.`, naming the tag, such as
   `v1.0.1`. Re-running that code release releases it; dispatch the settings
-  release again afterwards. It is never shown after a deliberate rollback:
-  then a published chart sits above V, and the settings release proceeds past
-  the claim with the summary line above.
+  release again afterwards. It is never shown after a rollback (a version
+  above the running one has a GitHub Release): the settings release then
+  proceeds past the claim with the summary line above.
 - `Refuse a settings release behind a workflow change`: GitHub refuses a
   `GITHUB_TOKEN` tag push at a commit whose `.github/workflows` differ from the
   default branch's (**Why the tag comes first** below), and C is usually
@@ -852,7 +869,7 @@ points at V' whatever happens next.
 | Superseded | `success` | `cd / plan` `success`, and `cd / shadow`, `cd / retag`, `cd / publish`, `cd / deploy` and `cd / github-release` all `skipped`; summary `mode: none (a newer revision is live; its own release follows)` | no | no | no |
 | Behind a workflow change | `failure` | `cd / plan`, step `Refuse a settings release behind a workflow change` `failure` | no | no | no |
 | Behind an unfinished code release | `failure` | `cd / plan`, step `Refuse a settings release behind an unfinished code release` `failure`, sentence `<tag> was claimed by a code release that never published; re-run that release, or release a new commit, before releasing settings.` | no | no | no |
-| Proceeds past an unfinished code release after a rollback | `success` | `cd / retag` `success` and `cd / deploy` `success`, as Released; the summary also carries `<tag> was left unfinished and can now ship only as a new commit.` | yes | yes | yes |
+| Proceeds past an unfinished code release after a rollback (a version above the running one has a GitHub Release) | `success` | `cd / retag` `success` and `cd / deploy` `success`, as Released; the summary also carries `<tag> was left unfinished and can now ship only as a new commit.` | yes | yes | yes |
 | Mid-rollout | `failure` | `cd / plan`, step `Refuse a settings release while the app is rolling out` `failure` | no | no | no |
 | Already released, then rolled back | `failure` | `cd / plan`, step `Plan the settings release` `failure`, sentence `Revision <n> was released as <V'old>, and <V> runs now after a rollback. To put those settings on the running code, make them live again in hemi; they are released as a new revision.` | no | no | no |
 | Failed before deploying | `failure` | `cd / plan`, `cd / retag` or `cd / publish` `failure` with `cd / deploy` `skipped` | if `cd / plan` succeeded | if `cd / retag` succeeded | no |
@@ -886,26 +903,27 @@ keeps the revision number is not released: the running version is re-proved
 unchanged. A hand edit must carry a new revision number (hemi's runbook).
 
 **Known limit: a settings release over a published, unreleased code
-release.** Rule 5 refuses a settings release only while the newest code
-release above V never published its chart and no chart above V is present.
-A code release whose chart was published without being proved running counts
-as published: one whose run then failed (at `deploy`, or with its proof timed
-out), and a deliberate `deploy: false` publish, which leaves a chart and no
-Release by design. A settings release still plans V' above it, and "Re-run all
-jobs" on that code release is then refused at `Refuse to replay an old
+release.** Rule 5 refuses a settings release only for a code release that
+never published its chart. One whose chart was published without being proved
+running counts as published: a code release whose run then failed (at
+`deploy`, or with its proof timed out), and a deliberate `deploy: false`
+publish, which leaves a chart and no Release by design. When it is the newest
+code release above V, a settings release still plans V' above it, and "Re-run
+all jobs" on that code release is then refused at `Refuse to replay an old
 version` with `<tag> was taken by a later release (<newest>) that does not
 contain this commit, which has not been released; push a new commit to release
-it.`, so only a new commit releases that code. Such a chart also counts as
-the evidence of a rollback: with one above V, a settings release proceeds past
-a newer unfinished code release too, and says so in its summary line. The same
-holds for a claim a settings release overtook under a pin before `v1.36.0`.
+it.`, so only a new commit releases that code. The same holds for a claim a
+settings release overtook under a pin before `v1.36.0`.
 
 **Known limit: a rollback leaves the unfinished code release behind.** After
-a deliberate rollback (a published chart above V), a settings release proceeds
-past an unfinished code release rather than block every settings change until
-code ships over the rollback. That code release's own re-run is then refused
-as above, and its changes ship only as a new commit. The run summary names the
-tag: `<tag> was left unfinished and can now ship only as a new commit.`
+a rollback (a version above the running one has a GitHub Release), a settings
+release proceeds past an unfinished code release rather than block every
+settings change until code ships over the rollback. That code release's own
+re-run is then refused as above, and its changes ship only as a new commit.
+The run summary names the tag: `<tag> was left unfinished and can now ship
+only as a new commit.` A rollback from a version whose `github-release` job
+itself failed leaves no Release to prove it, so there the settings release is
+refused behind the unfinished code release instead.
 
 **Known limit: tags placed outside wac-cd's rules.** Rule 5 tells a code
 release's version from a settings release's by wac-cd's own tagging: a code

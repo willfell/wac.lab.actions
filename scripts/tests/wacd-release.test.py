@@ -1010,12 +1010,15 @@ Registry = _CHART_TESTS.Registry
 class UnfinishedReleaseTests(unittest.TestCase):
     """A settings release waits for an unfinished code release above the running version, unless it was rolled back.
 
-    The evidence of a rollback is a published chart above the running version.
+    The evidence of a rollback is a version above the running one with a GitHub
+    Release, which github-release creates only after deploy proved the build.
     """
 
     SENTENCE = ("wacd release: {tag} was claimed by a code release that never published; re-run that release, "
                 "or release a new commit, before releasing settings.\n")
     LEFT = "left={tag} was left unfinished and can now ship only as a new commit.\n"
+    UNREADABLE = ("wacd release: the GitHub Releases of travel could not be read, so this settings release cannot "
+                  "tell a rollback from an unfinished release; run it again.\n")
 
     def setUp(self):
         self.registry = Registry()
@@ -1024,16 +1027,25 @@ class UnfinishedReleaseTests(unittest.TestCase):
         address.start()
         self.addCleanup(address.stop)
 
-    def run_cli(self, versions, codes, published=(), deadline=60.0, prefix="v"):
+    def run_cli(self, versions, codes, published=(), deadline=60.0, prefix="v", releases=(404,)):
+        """releases: the GitHub API's answers to the Release reads, in order (the last repeats)."""
         for version in published:
             self.registry.put_chart("travel", version)
         self.registry.requests.clear()
-        code, out, err = CliTests.main(
-            self, "unfinished-release", "--app", "travel", "--prefix", prefix, "--running", "1.4.2",
-            "--versions", versions, "--codes", codes, "--deadline", str(time.time() + deadline))
+        self.api = ReleasesApi(list(releases))
+        self.addCleanup(self.api.close)
+        env = {"GITHUB_API_URL": self.api.url, "GITHUB_REPOSITORY": "willfell/travel", "GITHUB_TOKEN": "t0k"}
+        with patch.dict(os.environ, env):
+            code, out, err = CliTests.main(
+                self, "unfinished-release", "--app", "travel", "--prefix", prefix, "--running", "1.4.2",
+                "--versions", versions, "--codes", codes, "--deadline", str(time.time() + deadline))
         self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0), "the backstop is disarmed")
+        self.assertNotIn("t0k", out + err)
         read = [path.split("/manifests/")[1] for path, _ in self.registry.requests if "/manifests/" in path]
         return read, (code, out, err)
+
+    def asked(self):
+        return [path.rsplit("/", 1)[-1] for _, path, _, _ in self.api.seen]
 
     def test_the_newest_code_claim_with_no_chart_refuses_naming_its_tag(self):
         read, result = self.run_cli("1.4.3", "1.4.3", published=("1.4.2",))
@@ -1042,7 +1054,8 @@ class UnfinishedReleaseTests(unittest.TestCase):
         _, result = self.run_cli("2.0.0", "2.0.0", prefix="travel-v")
         self.assertEqual(result[2], self.SENTENCE.format(tag="travel-v2.0.0"))
 
-    def test_a_published_version_above_ends_the_scan_without_a_refusal(self):
+    def test_a_newest_published_version_with_no_code_claim_above_it_says_nothing_and_reads_no_release(self):
+        """No unfinished code claim sits above the newest published chart, so the first chart read settles it."""
         for label, versions, codes, published in (
             ("a rollback target's newer releases", "1.4.4,1.4.3", "1.4.4,1.4.3", ("1.4.4", "1.4.3")),
             ("a code claim below a published release", "1.4.5,1.4.4,1.4.3", "1.4.5,1.4.3", ("1.4.5", "1.4.4")),
@@ -1051,6 +1064,7 @@ class UnfinishedReleaseTests(unittest.TestCase):
                 read, result = self.run_cli(versions, codes, published=published)
                 self.assertEqual(result, (0, "left=\n", ""))
                 self.assertEqual(read, [versions.split(",")[0]], "the newest published version settles it")
+                self.assertEqual(self.asked(), [])
 
     def test_after_a_rollback_the_newest_unfinished_code_claim_is_left_behind(self):
         for label, codes, left in (
@@ -1058,9 +1072,33 @@ class UnfinishedReleaseTests(unittest.TestCase):
             ("a settings claim above them", "1.4.4,1.4.3", "v1.4.4"),
         ):
             with self.subTest(case=label):
-                read, result = self.run_cli("1.4.5,1.4.4,1.4.3", codes, published=("1.4.3",))
+                read, result = self.run_cli("1.4.5,1.4.4,1.4.3", codes, published=("1.4.3",), releases=(200,))
                 self.assertEqual(result, (0, self.LEFT.format(tag=left), ""))
                 self.assertEqual(read, ["1.4.5", "1.4.4", "1.4.3"], "read down to the published version")
+                self.assertEqual(self.asked(), ["v1.4.3"], "its Release proves the rollback")
+
+    def test_a_published_version_with_no_release_is_no_rollback(self):
+        """1.4.2 runs; 1.4.3 published and never deployed (a failed deploy, or deploy: false); 1.4.4 failed in build."""
+        read, result = self.run_cli("1.4.4,1.4.3", "1.4.4,1.4.3", published=("1.4.3",), releases=(404,))
+        self.assertEqual(result, (wacd.UNFINISHED_EXIT, "", self.SENTENCE.format(tag="v1.4.4")))
+        self.assertEqual((read, self.asked()), (["1.4.4", "1.4.3"], ["v1.4.3"]))
+        read, result = self.run_cli("1.4.5,1.4.4,1.4.3", "1.4.5", published=("1.4.4", "1.4.3"), releases=(404,))
+        self.assertEqual(result, (wacd.UNFINISHED_EXIT, "", self.SENTENCE.format(tag="v1.4.5")),
+                         "behind a settings release whose deploy failed, too")
+        self.assertEqual(self.asked(), ["v1.4.4", "v1.4.3"])
+
+    def test_a_rollback_is_found_past_a_published_version_that_never_ran(self):
+        """1.4.3 released and rolled back to 1.4.2; 1.4.4 published and never deployed; 1.4.5 failed in build."""
+        read, result = self.run_cli("1.4.5,1.4.4,1.4.3", "1.4.5,1.4.4,1.4.3", published=("1.4.4", "1.4.3"),
+                                    releases=(404, 200))
+        self.assertEqual(result, (0, self.LEFT.format(tag="v1.4.5"), ""))
+        self.assertEqual(self.asked(), ["v1.4.4", "v1.4.3"])
+
+    def test_releases_that_cannot_be_read_conclude_nothing(self):
+        for status in (401, 403, 500, 502):
+            with self.subTest(status=status):
+                _, result = self.run_cli("1.4.4,1.4.3", "1.4.4", published=("1.4.3",), releases=(status,))
+                self.assertEqual(result, (1, "", self.UNREADABLE), "neither a refusal nor a rollback")
 
     def test_a_settings_claim_with_no_chart_is_passed_over(self):
         read, result = self.run_cli("1.4.4,1.4.3", "1.4.3")

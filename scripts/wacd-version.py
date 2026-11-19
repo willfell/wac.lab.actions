@@ -22,10 +22,10 @@ HEAD (a settings release tagged it on older running code after HEAD's run
 claimed its version and failed before releasing), the refusal says HEAD was
 never released and a new commit releases it, instead of calling it a replay.
 wac-cd refuses such a settings release while HEAD's chart is unpublished
-and nothing above the running version published (codes= below), so this is
-left for a run that failed after publishing its chart, for a claim a settings
-release passed after a deliberate rollback, and for tags placed by hand or
-under an older pin.
+and no version above the running one has a GitHub Release (codes= below), so
+this is left for a run that failed after publishing its chart, for a claim a
+settings release passed after a rollback, and for tags placed by hand or under
+an older pin.
 
 `--mode settings --commit C --running V` plans a settings-only release: the
 running version V's images, built from C, released again under a new version
@@ -43,8 +43,9 @@ tags a commit that no tag with the prefix names yet, while a settings release
 tags code an earlier version already ran, so a version is a code release's when
 no lower tag with the prefix sits on its commit. wac-cd refuses the settings
 release while the newest of them has no published chart and no version above
-V has one, so that re-running the unfinished code release stays the way out;
-a published chart above V is a rollback, and the settings release proceeds.
+V has a GitHub Release, so that re-running the unfinished code release stays
+the way out; a Release above V proves a rollback, and the settings release
+proceeds.
 """
 
 import argparse

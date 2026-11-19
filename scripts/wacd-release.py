@@ -55,19 +55,27 @@ candidates' Releases are read, never V's.
 refuses the settings release behind an unfinished code release, before a new
 version is chosen. L is the versions on main above V, newest first, and K
 those of them a code release claimed (wacd-version.py's above= and codes=). It
-reads deploy/<app>:<version> at the push address for each, newest first,
-until the first present chart. An absent chart K does not name is a settings
-release's claim, which the settings plan takes again, and is passed over; the
-first absent chart K names is the newest unfinished code release, the one a
-re-run could still release (one below it is a replay). With no present chart
-above V, that claim exits UNFINISHED_EXIT (5) with UNFINISHED: a settings
-version above it would overtake it, and re-running the code release would then
-be refused. A present chart above V is the evidence of a deliberate rollback
-(V runs below a published version), and then the settings release proceeds
-past the claim: it prints left=LEFT_UNFINISHED for the run summary, since that
-code can now ship only as a new commit. Otherwise it prints an empty left=. At
-most MAX_EARLIER charts are read, and running out of them fails with a
-sentence. A chart that cannot be read fails, never counting as absent.
+reads deploy/<app>:<version> at the push address for each, newest first. An
+absent chart K does not name is a settings release's claim, which the settings
+plan takes again, and is passed over. When the first present chart comes
+before any absent chart K names, there is no unfinished code release (one
+below a published version could only be replayed), and it prints an empty
+left= having read no Release. Otherwise the first absent chart K names is the
+newest unfinished code release, and the scan goes on through the present
+charts below it, reading each one's GitHub Release with release_exists(), rule
+B's reader. A Release is the evidence of a rollback: github-release creates
+one only after deploy proved the served build, and an older build runs below
+a proved newer one only by a rollback. At the first Release the settings
+release proceeds past the claim and it prints left=LEFT_UNFINISHED for the run
+summary, since that code can now ship only as a new commit. A published chart
+with no Release (a failed deploy, a deploy: false publish, a settings release
+whose deploy failed) proves nothing and is passed over. When the scan runs out
+with no Release, the claim exits UNFINISHED_EXIT (5) with UNFINISHED: a
+settings version above it would overtake it, and re-running the code release
+would then be refused. A Release that cannot be read (anything but 200 or 404)
+concludes nothing and fails with RELEASES_UNREADABLE. At most MAX_EARLIER
+charts are read, and running out of them fails with a sentence. A chart that
+cannot be read fails, never counting as absent.
 
 All three settings reads take `--deadline <epoch seconds>`, the plan step's one
 wall-clock deadline. The status wait ends DEADLINE_MARGIN seconds before it,
@@ -145,6 +153,10 @@ UNFINISHED = (
     "before releasing settings."
 )
 LEFT_UNFINISHED = "{tag} was left unfinished and can now ship only as a new commit."
+RELEASES_UNREADABLE = (
+    "the GitHub Releases of {app} could not be read, so this settings release cannot tell a rollback from an "
+    "unfinished release; run it again."
+)
 STATUS_REFUSED = (
     "The gateway refused the status read (HTTP 403 with no reason), so the running version is unknown "
     "and no settings were released."
@@ -599,23 +611,37 @@ def chart_published(app, version, timeout):
 def unfinished_release(running, versions, codes, prefix, app, deadline):
     """The newest unfinished code release above running that a rollback left behind, or "".
 
-    versions are newest first. With no published chart above running, an
-    unfinished code release refuses instead.
+    versions are newest first. Without a GitHub Release above running to
+    prove a rollback, an unfinished code release refuses instead.
     """
     unfinished = ""
     for checked, version in enumerate(versions):
         if checked == MAX_EARLIER:
             raise ReleaseError(
-                f"{MAX_EARLIER} versions above {running} were read and none was published, so whether a code "
-                "release is unfinished is unknown; the settings plan stops here and nothing was tagged"
+                f"{MAX_EARLIER} versions above {running} were read and none settled whether a code release is "
+                "unfinished; the settings plan stops here and nothing was tagged"
             )
-        if chart_published(app, version, max(1, min(chart.TIMEOUT, deadline - time.time()))):
+        if not chart_published(app, version, max(1, min(chart.TIMEOUT, deadline - time.time()))):
+            if version in codes and not unfinished:
+                unfinished = prefix + version
+            continue
+        if not unfinished:
+            return ""
+        if rolled_back_from(app, prefix + version):
             return unfinished
-        if version in codes and not unfinished:
-            unfinished = prefix + version
     if unfinished:
         raise Unfinished(UNFINISHED.format(tag=unfinished))
     return ""
+
+
+def rolled_back_from(app, tag):
+    """Whether tag has a GitHub Release, the proof that it ran; an unreadable one concludes nothing."""
+    try:
+        return release_exists(tag)
+    except Deadline:
+        raise
+    except ReleaseError:
+        raise ReleaseError(RELEASES_UNREADABLE.format(app=app)) from None
 
 
 def expire(signum, frame):

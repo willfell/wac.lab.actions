@@ -1481,11 +1481,13 @@ class ReusableWorkflowTests(unittest.TestCase):
     def settings_plan(self, *, running="1.4.2", copy_revision="7", revision="7", source="hemi", charts=None,
                       workflow_change=False, rollback=False, extra_tags=(), claim="pushed", profile_images=None,
                       running_copy="6", status_exit=0, earlier="reuse=", status_err=None,
-                      published=("1.3.9", "1.4.2"), unfinished_err=None):
+                      published=("1.3.9", "1.4.2"), unfinished_err=None, code_claims=(), released=()):
         """Run plan's settings steps against a temp repo, real wacd-version.py and stub gateway and registry reads.
 
         unfinished-release is the real script over a stand-in registry holding the charts in published, where
-        "unreadable" makes every chart read fail.
+        "unreadable" makes every chart read fail, and stand-in GitHub Releases for the versions in released, where
+        "unreadable" makes every Release read fail. code_claims tags each on a new commit after main's head, as
+        a code release's run claims its version.
         """
         import os
         import shutil
@@ -1528,6 +1530,9 @@ class ReusableWorkflowTests(unittest.TestCase):
             git(repo, "commit", "-q", "-am", "ci: take the revision input")
         else:
             git(repo, "commit", "--allow-empty", "-q", "-m", "docs: later")
+        for tag in code_claims:
+            git(repo, "commit", "--allow-empty", "-q", "-m", f"fix: claims {tag}")
+            git(repo, "tag", tag)
         for tag, where in extra_tags:
             git(repo, "tag", tag, {"code": code, "old": old, "head": git(repo, "rev-parse", "HEAD")}[where])
         head = git(repo, "rev-parse", "HEAD")
@@ -1560,6 +1565,13 @@ class ReusableWorkflowTests(unittest.TestCase):
             "            raise real.chart.ChartError('cannot reach the registry at http://' + registry)\n"
             "        return {'name': app, 'version': version} if version in published else None\n"
             "    real.chart.chart_config = chart_config\n"
+            "    released = json.loads(os.environ['STUB_RELEASED'])\n"
+            "    def release_exists(tag):\n"
+            "        assert os.environ['GITHUB_TOKEN'] == 'job-token'\n"
+            "        if 'unreadable' in released:\n"
+            "            raise real.ReleaseError('GitHub answered HTTP 502 for the Release of ' + tag)\n"
+            "        return tag[1:] in released\n"
+            "    real.release_exists = release_exists\n"
             "    sys.exit(real.main(['wacd-release.py', *sys.argv[1:]]))\n"
             "if code:\n"
             "    sys.exit(print('wacd release: the gateway reports an unknown version', file=sys.stderr) or 1)\n"
@@ -1611,7 +1623,8 @@ class ReusableWorkflowTests(unittest.TestCase):
                "PROFILE_IMAGES": json.dumps(profile), "STUB_LOG": str(log), "STUB_RUNNING": running,
                "STUB_CHARTS": json.dumps(charts), "STUB_CLAIM": claim, "STUB_STATUS_EXIT": str(status_exit),
                "STUB_EARLIER": earlier, "GITHUB_TOKEN": "job-token", "FLEET_COMMIT": "f" * 40,
-               "STUB_REAL_RELEASE": str(root / "scripts" / "wacd-release.py"), "STUB_PUBLISHED": json.dumps(published)}
+               "STUB_REAL_RELEASE": str(root / "scripts" / "wacd-release.py"), "STUB_PUBLISHED": json.dumps(published),
+               "STUB_RELEASED": json.dumps(released)}
         if status_err is not None:
             env["STUB_STATUS_ERR"] = status_err
         if unfinished_err is not None:
@@ -1735,48 +1748,78 @@ class ReusableWorkflowTests(unittest.TestCase):
 
     LEFT = "v1.4.3 was left unfinished and can now ship only as a new commit."
 
+    def unfinished_sentence(self, tag):
+        return self.UNFINISHED.replace("v1.4.3", tag, 1)
+
     def test_wac_cd_settings_release_behind_an_unfinished_code_release_is_refused_by_its_own_step(self):
-        """c2: 1.4.2 runs, c2's run claimed v1.4.3 on main's head and failed in build; a settings release follows."""
-        for label, kw in (
-            ("no rollback", {}),
-            ("older code, but nothing above it published", {"running": "1.3.9", "rollback": True,
-                                                            "published": ("1.3.9",)}),
+        """1.4.2 runs (or 1.3.9, with nothing above it proved running) and a code release above it never published."""
+        never_deployed = ("1.3.9", "1.4.2", "1.4.3")
+        for label, kw, tag in (
+            ("c2: its run claimed v1.4.3 on main's head and failed in build", {"extra_tags": (("v1.4.3", "head"),)},
+             "v1.4.3"),
+            ("c2 on older code, but nothing above it published",
+             {"extra_tags": (("v1.4.3", "head"),), "running": "1.3.9", "rollback": True, "published": ("1.3.9",)},
+             "v1.4.3"),
+            ("v1.4.3 published and never deployed (a failed deploy, or deploy: false), then v1.4.4 failed in build",
+             {"code_claims": ("v1.4.3", "v1.4.4"), "published": never_deployed}, "v1.4.4"),
+            ("a settings release v1.4.3 failed at deploy, then v1.4.4 failed in build",
+             {"extra_tags": (("v1.4.3", "code"),), "code_claims": ("v1.4.4",), "published": never_deployed}, "v1.4.4"),
+            ("1.3.9 runs below 1.4.2, which has no Release, and v1.4.3 failed in build",
+             {"extra_tags": (("v1.4.3", "head"),), "running": "1.3.9", "rollback": True}, "v1.4.3"),
         ):
             with self.subTest(case=label):
-                plan = self.settings_plan(extra_tags=(("v1.4.3", "head"),), **kw)
+                plan = self.settings_plan(**kw)
                 self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
                 self.assertEqual(set(plan["settings_outputs"]), {"unfinished_refused"}, "no mode, version or tag is left")
                 refusal = plan["refusal"]
+                sentence = self.unfinished_sentence(tag)
                 self.assertEqual(refusal.returncode, 1)
-                self.assertIn(self.UNFINISHED, refusal.stderr)
-                self.assertIn(f"::error::wac-cd: {self.UNFINISHED}", refusal.stdout)
-                self.assertIn(self.UNFINISHED, plan["summary"].read_text())
+                self.assertIn(sentence, refusal.stderr)
+                self.assertIn(f"::error::wac-cd: {sentence}", refusal.stdout)
+                self.assertIn(sentence, plan["summary"].read_text())
                 calls = plan["log"].read_text()
                 self.assertNotIn("wacd-tag.py", calls, "nothing tagged")
                 self.assertNotIn("earlier-release", calls, "refused before the version is chosen")
                 self.assertRegex(self.unfinished_call(plan),
                                  r"^wacd-release\.py unfinished-release --app app --prefix v --running \S+ "
-                                 r"--versions 1\.4\.3(,1\.4\.2)? --codes 1\.4\.3(,1\.4\.2)? --deadline \d+$")
+                                 r"--versions \S+ --codes \S+ --deadline \d+$")
         self.assertFalse(self.runs(self.wac_cd()["jobs"]["retag"], ""), "with no mode, nothing is retagged")
 
     def test_wac_cd_settings_release_after_a_rollback_proceeds_past_an_unfinished_code_release(self):
-        """c2 after a rollback: 1.4.2 published and was rolled back to 1.3.9, so v1.4.3 ships only as a new commit."""
-        plan = self.settings_plan(running="1.3.9", rollback=True, extra_tags=(("v1.4.3", "head"),))
-        self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
-        self.assertNotIn("unfinished_refused", plan["settings_outputs"])
-        self.assertEqual(plan["settings_outputs"]["unfinished_left"], self.LEFT)
-        self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
-        old = plan["old"]
-        self.assertEqual({k: plan["version_outputs"][k] for k in ("mode", "version", "tag", "expected_sha")},
-                         {"mode": "settings", "version": "1.4.4", "tag": "v1.4.4", "expected_sha": old},
-                         "above the unfinished claim, on the rolled-back code")
-        calls = plan["log"].read_text()
-        self.assertIn(f"wacd-tag.py claim-tag --tag v1.4.4 --commit {old}", calls)
-        self.assertIn("--versions 1.4.3,1.4.2 --claimed  --deadline", calls, "rule B still judges every version above")
-        summary = plan["summary"].read_text()
-        self.assertEqual(summary.count(self.LEFT), 1)
-        self.assertEqual(summary.count("left unfinished"), 1, "exactly one line")
-        self.assertIn(f"settings revision 7 on 1.3.9's code ({old[:12]}), released as 1.4.4", summary)
+        """1.4.2 was released (it has a GitHub Release) and rolled back to 1.3.9; a code release above never published."""
+        for label, kw, tag, version in (
+            ("c2: v1.4.3 failed in build", {"extra_tags": (("v1.4.3", "head"),)}, "v1.4.3", "1.4.4"),
+            ("v1.4.3 published and never deployed, then v1.4.4 failed in build",
+             {"code_claims": ("v1.4.3", "v1.4.4"), "published": ("1.3.9", "1.4.2", "1.4.3")}, "v1.4.4", "1.4.5"),
+        ):
+            with self.subTest(case=label):
+                plan = self.settings_plan(running="1.3.9", rollback=True, released=("1.4.2",), **kw)
+                self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+                self.assertNotIn("unfinished_refused", plan["settings_outputs"])
+                left = self.LEFT.replace("v1.4.3", tag, 1)
+                self.assertEqual(plan["settings_outputs"]["unfinished_left"], left)
+                self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+                old = plan["old"]
+                self.assertEqual({k: plan["version_outputs"][k] for k in ("mode", "version", "tag", "expected_sha")},
+                                 {"mode": "settings", "version": version, "tag": f"v{version}", "expected_sha": old},
+                                 "above the unfinished claim, on the rolled-back code")
+                calls = plan["log"].read_text()
+                self.assertIn(f"wacd-tag.py claim-tag --tag v{version} --commit {old}", calls)
+                self.assertIn(" --claimed  --deadline", calls, "rule B still judges every version above")
+                summary = plan["summary"].read_text()
+                self.assertEqual(summary.count(left), 1)
+                self.assertEqual(summary.count("left unfinished"), 1, "exactly one line")
+                self.assertIn(f"settings revision 7 on 1.3.9's code ({old[:12]}), released as {version}", summary)
+
+    def test_wac_cd_unreadable_releases_conclude_neither_a_rollback_nor_a_refusal(self):
+        plan = self.settings_plan(running="1.3.9", rollback=True, extra_tags=(("v1.4.3", "head"),),
+                                  released=("unreadable",))
+        self.assertEqual(plan["settings"].returncode, 1, plan["settings"].stdout)
+        self.assertIn("::error::wac-cd: wacd release: the GitHub Releases of app could not be read, so this settings "
+                      "release cannot tell a rollback from an unfinished release; run it again.",
+                      plan["settings"].stdout)
+        self.assertEqual(plan["settings_outputs"], {})
+        self.assertNotIn("wacd-tag.py", plan["log"].read_text())
 
     def test_wac_cd_re_proving_the_live_version_is_never_refused_as_unfinished(self):
         """1.4.3 runs revision 7; c2 claimed v1.4.4 and failed in build; a re-run of revision 7 claims no new tag."""
