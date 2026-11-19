@@ -166,20 +166,32 @@ only shrinks.
 A 503 (`release dependency unavailable`: GitHub slow, rate-limited or down
 behind the gateway) is retried with a fresh token within `wait_timeout`
 seconds (default `2100`), the bound `deploy` gives a `release`, passed to the
-script as `--wait-timeout`. The interval starts at 5
-seconds and doubles up to 30, so a long outage costs about two
-requests a minute. Each request may wait the whole time left for its answer,
-as `deploy`'s requests do, because the gateway checks the caller against
-`main` with several GitHub calls before it reads wac.fleet and can be slow. A
-refused or reset connection or a TLS failure fails at once, as for a
-`release`, and so does a request still unanswered at the deadline; both read
-`could not be reached`. `plan` has `timeout-minutes: 40`, the default
-`wait_timeout` plus five minutes for its other steps; GitHub expressions have
-no arithmetic, so it cannot be sized from the input, and a `wait_timeout`
-above 2100 is cut short by that limit. While `plan` waits out an outage it
-holds the repository's `cd` concurrency group for up to `wait_timeout`, about
-35 to 40 minutes, and since a group keeps one pending run, a newer push then
-replaces an older pending one. That is the wait `deploy` already had before
+script as `--wait-timeout` and parsed by the same function `deploy` uses, so
+both jobs accept exactly the same values. `plan`'s wait is capped at 2100
+seconds (35 minutes) whatever the input, while `deploy` honours the full
+`wait_timeout`: `plan` has `timeout-minutes: 40`, the cap plus five minutes
+for its other steps (GitHub expressions have no arithmetic, so it cannot be
+sized from the input), and the cap makes a long outage end in `plan`'s own
+summary line rather than the job timeout. The interval starts at 5 seconds and
+doubles up to 30, so a long outage costs about two requests a minute. Each
+request may wait the whole time left for its answer, as `deploy`'s requests
+do, because the gateway checks the caller against `main` with several GitHub
+calls before it reads wac.fleet and can be slow. A refused or reset connection
+or a TLS failure fails at once, as for a `release`, and so does a request
+still unanswered at the deadline; both read `could not be reached`.
+
+Every other `plan` step has its own `timeout-minutes` (one to six minutes), so
+only the gateway wait can use the job's 40 minutes: a stalled checkout,
+upload or tag push fails within minutes instead. `wacd-tag.py` bounds each
+call that reaches the remote (`ls-remote`, `push`) at 60 seconds and kills git
+and its transport helpers when it passes; a timed-out push fails the plan and
+is never read as superseded. `Check the trigger` runs before the gateway is
+asked, so a malformed dispatch fails at once, even during an outage.
+
+While `plan` waits out an outage it holds the repository's `cd` concurrency
+group for up to the capped wait, about 35 to 40 minutes, and since a group
+keeps one pending run, a newer push then replaces an older pending one. That
+is the wait `deploy` already had before
 `v1.35.0`, moved earlier, not a new delay. A 403 is not retried. A
 denial is told apart from a 503 by its status, never by its body, and the body
 is never printed: a 403 without a

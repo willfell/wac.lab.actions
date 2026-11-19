@@ -5,12 +5,17 @@ Every scenario runs in a fresh temp directory: an app repo whose only remote,
 network remote or the repository this file lives in.
 """
 
+import contextlib
+import importlib.util
+import io
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).parents[1] / "wacd-tag.py"
 ISOLATED = {
@@ -210,6 +215,57 @@ class PushTagTests(TagCase):
             timeout=60,
         )
         self.assert_fails(result)
+
+
+class NetworkBoundTests(TagCase):
+    """A stalled remote must not hold plan's runner and the cd concurrency group for 40 minutes."""
+
+    def setUp(self):
+        super().setUp()
+        spec = importlib.util.spec_from_file_location("wacd_tag", SCRIPT)
+        self.tag = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.tag)
+
+    def run_in_process(self, *argv, env=None):
+        err = io.StringIO()
+        cwd = os.getcwd()
+        os.chdir(self.repos.app)
+        started = time.monotonic()
+        try:
+            with patch.object(self.tag, "NETWORK_TIMEOUT", 1), \
+                    patch.dict(os.environ, {**self.repos.env, **(env or {})}, clear=True), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = self.tag.main(["wacd-tag.py", *argv])
+        finally:
+            os.chdir(cwd)
+        return code, err.getvalue(), time.monotonic() - started
+
+    def test_a_hanging_ls_remote_fails_within_the_bound(self):
+        r = self.repos
+        ssh = r.root / "hang-ssh"
+        ssh.write_text("#!/bin/sh\nexec sleep 30\n")
+        ssh.chmod(0o755)
+        r.git("remote", "set-url", "origin", "ssh://hang.invalid/origin.git")
+        code, err, elapsed = self.run_in_process(
+            "claim-tag", "--tag", "v1.0.0", "--sha", r.second, env={"GIT_SSH_COMMAND": str(ssh)}
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "wacd tag: git ls-remote did not finish within 1 seconds\n")
+        self.assertLess(elapsed, 10)
+
+    def test_a_hanging_push_fails_within_the_bound_and_is_not_superseded(self):
+        r = self.repos
+        hook = r.origin / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\nexec sleep 30\n")
+        hook.chmod(0o755)
+        code, err, elapsed = self.run_in_process("claim-tag", "--tag", "v1.0.0", "--sha", r.second)
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "wacd tag: git push did not finish within 1 seconds\n")
+        self.assertLess(elapsed, 10)
+        self.assertEqual(r.origin_tags(), {})
+
+    def test_the_bound_is_a_few_minutes_at_most(self):
+        self.assertLessEqual(self.tag.NETWORK_TIMEOUT, 120)
 
 
 class ClaimTagTests(TagCase):

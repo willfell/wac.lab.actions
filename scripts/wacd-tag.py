@@ -24,15 +24,25 @@ claim=superseded.
 
 A published tag is never moved, deleted or forced. Any problem exits 1 with one
 "wacd tag: ..." stderr line.
+
+Every call that reaches the remote (ls-remote, push) is bounded at
+NETWORK_TIMEOUT seconds: plan holds the repository's cd concurrency group, so
+a stalled remote must fail the run rather than hold it. git runs in its own
+session and the whole group is killed on a timeout, because git's transport
+helpers (ssh, git-remote-https, a hook behind receive-pack) would otherwise
+keep its pipes open. A timed-out push is a failure, never "superseded".
 """
 
 import argparse
+import os
 import re
+import signal
 import subprocess
 import sys
 
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 REMOTE_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+NETWORK_TIMEOUT = 60
 
 
 class TagError(Exception):
@@ -43,16 +53,29 @@ class PushRefused(TagError):
     pass
 
 
-def git(*args, check=True):
+def git(*args, check=True, timeout=None):
+    """Run git; with a timeout, git and everything it starts is killed when it passes."""
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             ["git", *args],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             encoding="utf-8",
             errors="replace",
+            start_new_session=timeout is not None,
         )
     except FileNotFoundError:
         raise TagError("git is not installed") from None
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise TagError(f"git {args[0]} did not finish within {timeout} seconds") from None
+    result = subprocess.CompletedProcess(["git", *args], process.returncode, stdout, stderr)
     if check and result.returncode != 0:
         detail = " ".join((result.stderr or "").split())[:200]
         raise TagError(f"git {args[0]} failed: {detail}")
@@ -62,7 +85,7 @@ def git(*args, check=True):
 def remote_commit(remote, tag):
     """The commit tag names on the remote, peeling an annotated tag; None when absent."""
     ref = f"refs/tags/{tag}"
-    out = git("ls-remote", "--tags", remote, ref, ref + "^{}").stdout
+    out = git("ls-remote", "--tags", remote, ref, ref + "^{}", timeout=NETWORK_TIMEOUT).stdout
     found = {}
     for line in out.splitlines():
         sha, _, name = line.partition("\t")
@@ -105,7 +128,7 @@ def push_tag_outcome(remote, tag, sha):
         raise TagError(f"local tag {tag} is on {local}, not {sha}")
     if local is None:
         git("tag", tag, sha)
-    pushed = git("push", remote, f"refs/tags/{tag}", check=False)
+    pushed = git("push", remote, f"refs/tags/{tag}", check=False, timeout=NETWORK_TIMEOUT)
     if pushed.returncode != 0:
         # A concurrent run may have pushed the same tag first; that is fine
         # only when it names this commit.
@@ -121,7 +144,7 @@ def push_tag_outcome(remote, tag, sha):
 
 def branch_tip(remote, branch):
     ref = f"refs/heads/{branch}"
-    out = git("ls-remote", "--heads", remote, ref).stdout
+    out = git("ls-remote", "--heads", remote, ref, timeout=NETWORK_TIMEOUT).stdout
     for line in out.splitlines():
         sha, _, name = line.partition("\t")
         if name.strip() == ref:

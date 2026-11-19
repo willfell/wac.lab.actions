@@ -749,6 +749,33 @@ class ReusableWorkflowTests(unittest.TestCase):
         plan = doc["jobs"]["plan"]
         self.assertIsInstance(plan["timeout-minutes"], int, "GitHub expressions have no arithmetic to size it from the input")
         self.assertGreaterEqual(plan["timeout-minutes"], math.ceil(default / 60) + 5)
+        spec = importlib.util.spec_from_file_location(
+            "wacd_contract_cap", Path(__file__).resolve().parents[2] / "scripts" / "wacd-contract.py"
+        )
+        contract = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(contract)
+        self.assertEqual(contract.PLAN_WAIT_CAP, default, "plan waits the default and no longer")
+        self.assertGreaterEqual(plan["timeout-minutes"], math.ceil(contract.PLAN_WAIT_CAP / 60) + 5,
+                                "a capped wait still ends inside the job, with its summary line")
+
+    def test_wac_cd_plan_bounds_every_step_but_the_gateway_wait(self):
+        """With 40 minutes for the job, a stalled checkout or git push must not use them all."""
+        steps = self.wac_cd()["jobs"]["plan"]["steps"]
+        for step in steps:
+            name = step.get("name") or step.get("uses")
+            with self.subTest(step=name):
+                if step.get("id") == "contract":
+                    self.assertNotIn("timeout-minutes", step, "the wait is bounded by --wait-timeout")
+                    continue
+                self.assertIsInstance(step.get("timeout-minutes"), int)
+                self.assertLessEqual(step["timeout-minutes"], 6)
+
+    def test_wac_cd_plan_checks_the_trigger_before_asking_the_gateway(self):
+        """A malformed dispatch must not wait out a gateway outage before saying so."""
+        steps = self.wac_cd()["jobs"]["plan"]["steps"]
+        names = [s.get("name") or s.get("uses") for s in steps]
+        contract_index = next(i for i, s in enumerate(steps) if s.get("id") == "contract")
+        self.assertLess(names.index("Check the trigger"), contract_index)
 
     def test_wac_ci_setup_go_takes_the_version_or_the_version_file_from_the_profile(self):
         import yaml

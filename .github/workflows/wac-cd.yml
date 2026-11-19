@@ -84,6 +84,7 @@ jobs:
       fleet_commit: ${{ steps.contract.outputs.fleet_commit }}
     steps:
       - name: Require the runner's python3 3.12 or later
+        timeout-minutes: 1
         shell: bash
         env:
           JOB_RUNNER_NAME: ${{ runner.name }}
@@ -101,63 +102,8 @@ jobs:
           fi
           echo "::error::wac-cd: plan needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
           exit 1
-      - name: Check out the app (actions/checkout v4)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-      - name: Require the defining workflow commit
-        env:
-          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
-        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - name: Check out the shared scripts (actions/checkout v4)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: willfell/wac.lab.actions
-          ref: ${{ job.workflow_sha }}
-          path: .wacd
-          persist-credentials: false
-      - name: Move the shared checkout out of the workspace
-        shell: bash
-        run: |
-          rm -rf "$RUNNER_TEMP/wacd"
-          mv .wacd "$RUNNER_TEMP/wacd"
-          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - name: Read the settings from the gateway
-        id: contract
-        shell: bash
-        env:
-          WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
-        run: |
-          set -euo pipefail
-          if ! python3 "$WACD_SCRIPTS"/wacd-contract.py fetch --out .wacd-contract --wait-timeout "$WAIT_TIMEOUT" \
-            > "$RUNNER_TEMP/contract.out" 2> "$RUNNER_TEMP/contract.err"; then
-            echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/contract.err")"
-            exit 1
-          fi
-          cat "$RUNNER_TEMP/contract.out" >> "$GITHUB_OUTPUT"
-      - name: Upload the settings copy (actions/upload-artifact v4)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: steps.contract.outputs.revision != ''
-        with:
-          name: wac-cd-contract
-          path: .wacd-contract/
-          include-hidden-files: true
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 1
-      - name: Read the wacd profile
-        id: profile
-        shell: bash
-        env:
-          SOURCE: ${{ steps.contract.outputs.source }}
-        run: |
-          if [[ "$SOURCE" == hemi ]]; then
-            python3 "$WACD_SCRIPTS"/wacd-profile.py --contract .wacd-contract/contract.json >> "$GITHUB_OUTPUT"
-          else
-            python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
-          fi
       - name: Check the trigger
+        timeout-minutes: 1
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -185,7 +131,70 @@ jobs:
           if [[ -n "$ROLLBACK_VERSION" && "$DEPLOY" != true ]]; then
             fail "rollback_version cannot be combined with deploy: false"
           fi
+      - name: Check out the app (actions/checkout v4)
+        timeout-minutes: 5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Require the defining workflow commit
+        timeout-minutes: 1
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out the shared scripts (actions/checkout v4)
+        timeout-minutes: 3
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+      - name: Read the settings from the gateway
+        id: contract
+        shell: bash
+        env:
+          WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
+        run: |
+          set -euo pipefail
+          if ! python3 "$WACD_SCRIPTS"/wacd-contract.py fetch --out .wacd-contract --wait-timeout "$WAIT_TIMEOUT" \
+            > "$RUNNER_TEMP/contract.out" 2> "$RUNNER_TEMP/contract.err"; then
+            echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/contract.err")"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/contract.out" >> "$GITHUB_OUTPUT"
+      - name: Upload the settings copy (actions/upload-artifact v4)
+        timeout-minutes: 3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: steps.contract.outputs.revision != ''
+        with:
+          name: wac-cd-contract
+          path: .wacd-contract/
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+      - name: Read the wacd profile
+        timeout-minutes: 1
+        id: profile
+        shell: bash
+        env:
+          SOURCE: ${{ steps.contract.outputs.source }}
+        run: |
+          if [[ "$SOURCE" == hemi ]]; then
+            python3 "$WACD_SCRIPTS"/wacd-profile.py --contract .wacd-contract/contract.json >> "$GITHUB_OUTPUT"
+          else
+            python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+          fi
       - name: Plan the version
+        timeout-minutes: 6
         id: version
         shell: bash
         env:
