@@ -1,8 +1,9 @@
 """The wacd profile validator names the failing field and rejects anything unknown."""
 
-import copy
+import ast
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -41,8 +42,7 @@ class ProfileTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.base = Path(self._tmp.name)
-        self.root = self.base / "repo"
+        self.root = Path(self._tmp.name) / "repo"
         self.root.mkdir()
         (self.root / ".github").mkdir()
         (self.root / "deploy").mkdir()
@@ -53,62 +53,9 @@ class ProfileTest(unittest.TestCase):
         self.path.write_text(json.dumps(data))
         return self.path
 
-    def profile(self, **changes):
-        data = copy.deepcopy(TRAVEL)
-        data.update(changes)
-        return data
-
-    def assertRejected(self, data, field):
-        self.write(data)
-        with self.assertRaises(profile.ProfileError) as caught:
-            profile.load(self.path)
-        self.assertIn(field, str(caught.exception))
-
-    def cli(self, data):
-        self.write(data)
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), str(self.path)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
     def test_the_spec_example_is_valid(self):
         self.write(TRAVEL)
         self.assertEqual(profile.load(self.path), TRAVEL)
-
-    def test_unknown_top_level_field(self):
-        self.assertRejected(self.profile(colour="red"), "colour")
-
-    def test_unknown_nested_fields(self):
-        data = self.profile()
-        data["images"][0]["tag"] = "x"
-        self.assertRejected(data, "images[0].tag")
-        data = self.profile()
-        data["ci"]["cache"] = True
-        self.assertRejected(data, "ci.cache")
-
-    def test_schema_version_must_be_one(self):
-        self.assertRejected(self.profile(schema_version=2), "schema_version")
-        self.assertRejected(self.profile(schema_version=True), "schema_version")
-
-    def test_values_file_must_exist_and_stay_inside(self):
-        self.assertRejected(self.profile(values_file="deploy/missing.yaml"), "does not exist")
-        (self.base / "x.yaml").write_text("escaped: true\n")
-        self.assertRejected(self.profile(values_file="../x.yaml"), "'..' segment")
-        outside = self.base / "abs.yaml"
-        outside.write_text("absolute: true\n")
-        self.assertRejected(self.profile(values_file=str(outside)), "relative path inside the repo")
-
-    def test_relative_paths_reject_line_breaks(self):
-        (self.root / "deploy" / "values.yaml\nextra=1").write_text("x: 1\n")
-        self.assertRejected(
-            self.profile(values_file="deploy/values.yaml\nextra=1"),
-            "relative path inside the repo",
-        )
-        data = self.profile()
-        data["images"][0]["dockerfile"] = "Dockerfile\r"
-        self.assertRejected(data, "images[0].dockerfile")
 
     def test_profile_must_be_utf8_json(self):
         self.path.write_bytes(b"\xff\xfe{")
@@ -125,144 +72,152 @@ class ProfileTest(unittest.TestCase):
         self.assertTrue(result.stderr.startswith("wacd profile:"))
         self.assertNotIn("Traceback", result.stderr)
 
-    def test_duplicate_image_names(self):
-        data = self.profile()
-        data["images"].append(
-            {"name": "travel-app", "dockerfile": "Dockerfile", "context": "."}
+
+CASES = Path(__file__).parents[1] / "fixtures" / "wacd-profile-cases.json"
+CASE_NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+CASE_INPUT = {"profile": ".github/wacd.json", "contract": ".wacd-contract/contract.json"}
+PREFIX = "wacd profile: "
+
+# Functions whose refusals no case can express, and why. The test fails if one
+# of them stops refusing, so the list cannot outlive the code it excuses.
+NOT_A_CASE = {
+    "read_json": "a case's input is a JSON value the test writes, so an unreadable, "
+    "non-UTF-8 or malformed file is not expressible, and the sentence names the file's own path",
+    "node_layout": "node-layout reads a checkout, not a profile or a copy",
+}
+# Refusals only a copy reaches; every other refusal is reachable from a profile
+# file and needs a profile case of its own.
+CONTRACT_ONLY = {"from_contract", "contract_object", "contract_field"}
+
+
+def text_pattern(node, what):
+    """A regex for a refusal argument: literal text, with each f-string field as a wildcard."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return re.escape(node.value)
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            re.escape(part.value) if isinstance(part, ast.Constant) else ".*" for part in node.values
         )
-        self.assertRejected(data, "images[1].name")
+    if what == "path":
+        return ".*"
+    raise AssertionError(f"line {node.lineno}: a refusal's message must be literal text or an f-string")
 
-    def test_stack_versions_match_the_stack(self):
-        data = self.profile()
-        del data["ci"]["node_version"]
-        self.assertRejected(data, "ci.node_version")
-        data = self.profile(ci={"stack": "go", "node_version": "22", "go_version": "1.24", "commands": ["go test ./..."]})
-        self.assertRejected(data, "ci.node_version")
-        data = self.profile(ci={"stack": "go", "commands": ["go test ./..."]})
-        self.assertRejected(data, "ci.go_version")
 
-    def go_ci(self, **fields):
-        return self.profile(ci={"stack": "go", "commands": ["go test ./..."], **fields})
+def refusal_templates(source):
+    """Every refusal sentence the script can print, as (function, line, regex).
 
-    def test_go_version_file_is_accepted_and_reaches_the_ci_output(self):
-        (self.root / "go.mod").write_text("module example.com/x\n\ngo 1.24.2\n")
-        (self.root / "svc").mkdir()
-        (self.root / "svc" / ".go-version").write_text("1.24.2\n")
-        for path in ("go.mod", "svc/.go-version"):
-            with self.subTest(path=path):
-                data = self.go_ci(go_version_file=path)
-                result = self.cli(data)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                ci_line = next(l for l in result.stdout.splitlines() if l.startswith("ci="))
-                self.assertEqual(json.loads(ci_line[3:])["go_version_file"], path)
-                self.assertNotIn("go_version", json.loads(ci_line[3:]))
+    A `fail(path, message)` call is one template, `<path>: <message>`. The
+    pattern check's own `fail` is replaced by its callers, each of which names
+    what the value must be.
+    """
+    tree = ast.parse(source)
+    templates, excused = [], set()
+    for function in tree.body:
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        for node in ast.walk(function):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id == "ProfileError" and function.name != "fail":
+                    raise AssertionError(f"line {node.lineno}: refuse through fail(), so the refusal is a template")
+                if node.func.id == "fail" and function.name == "check_pattern":
+                    continue
+                if node.func.id == "fail":
+                    path, message = node.args
+                elif node.func.id == "check_pattern":
+                    _, path, _, what = node.args
+                    message = ast.JoinedStr([ast.Constant("must be "), what])
+                    if not (isinstance(what, ast.Constant) and isinstance(what.value, str)):
+                        raise AssertionError(f"line {node.lineno}: check_pattern's description must be literal")
+                else:
+                    continue
+                if function.name in NOT_A_CASE:
+                    excused.add(function.name)
+                    continue
+                regex = text_pattern(path, "path") + re.escape(": ") + text_pattern(message, "message")
+                templates.append((function.name, node.lineno, re.compile(regex)))
+    return templates, excused
 
-    def test_go_version_file_and_go_version_are_exclusive(self):
-        (self.root / "go.mod").write_text("module example.com/x\n")
-        self.assertRejected(
-            self.go_ci(go_version="1.24", go_version_file="go.mod"), "ci.go_version_file: not allowed together"
-        )
 
-    def test_go_stack_needs_one_version_source(self):
-        self.assertRejected(self.go_ci(), "ci.go_version: required when stack is 'go', unless go_version_file")
+class CaseTableTest(unittest.TestCase):
+    """`scripts/fixtures/wacd-profile-cases.json` is the contract hemi's check mirrors.
 
-    def test_go_version_file_must_exist_and_stay_inside(self):
-        self.assertRejected(self.go_ci(go_version_file="go.mod"), "ci.go_version_file: go.mod does not exist")
-        (self.root / "dir").mkdir()
-        self.assertRejected(self.go_ci(go_version_file="dir"), "ci.go_version_file: dir does not exist")
-        self.assertRejected(self.go_ci(go_version_file="../go.mod"), "'..' segment")
-        self.assertRejected(self.go_ci(go_version_file="/etc/hostname"), "relative path inside the repo")
-        self.assertRejected(self.go_ci(go_version_file=""), "relative path inside the repo")
-        self.assertRejected(self.go_ci(go_version_file=["go.mod"]), "must be a string")
+    hemi loads the table at the tag it pins and keys on each case's name and
+    outcome, so every case must hold against the real CLI, and every refusal
+    the script can print must have a case.
+    """
 
-    def test_go_version_file_is_refused_for_node(self):
-        (self.root / "go.mod").write_text("module example.com/x\n")
-        data = self.profile()
-        data["ci"]["go_version_file"] = "go.mod"
-        self.assertRejected(data, "ci.go_version_file: not allowed when stack is 'node'")
+    @classmethod
+    def setUpClass(cls):
+        cls.table = json.loads(CASES.read_text())
+        cls.cases = cls.table["cases"]
 
-    def test_empty_commands_and_multiline_command(self):
-        data = self.profile()
-        data["ci"]["commands"] = []
-        self.assertRejected(data, "ci.commands")
-        data["ci"]["commands"] = ["a\nb"]
-        self.assertRejected(data, "ci.commands[0]")
+    def test_the_table_has_the_published_shape(self):
+        self.assertEqual(set(self.table), {"version", "cases"})
+        self.assertEqual(self.table["version"], 1)
+        self.assertIsInstance(self.cases, list)
+        self.assertTrue(self.cases)
+        names = [case.get("name") for case in self.cases]
+        self.assertEqual(len(names), len(set(names)), "case names are unique")
+        for case in self.cases:
+            with self.subTest(case=case.get("name")):
+                self.assertIsInstance(case["name"], str)
+                self.assertTrue(CASE_NAME.fullmatch(case["name"]), "kebab-case name")
+                self.assertTrue({"name", "kind", "input", "expect"} <= set(case) <= {"name", "kind", "input", "files", "expect"})
+                self.assertIn(case["kind"], CASE_INPUT)
+                expect = case["expect"]
+                if "refused" in expect:
+                    self.assertEqual(set(expect), {"refused"})
+                    self.assertIsInstance(expect["refused"], str)
+                else:
+                    self.assertIn(set(expect), ({"ok"}, {"ok", "outputs"}))
+                    self.assertIs(expect["ok"], True)
+                    for key, value in expect.get("outputs", {}).items():
+                        self.assertIsInstance(key, str)
+                        self.assertIsInstance(value, str)
+                for path, content in case.get("files", {}).items():
+                    self.assertIsInstance(content, str)
+                    self.assertFalse(path.startswith("/") or ".." in path.split("/"), path)
+                    self.assertNotIn(path, CASE_INPUT.values())
 
-    def test_health_url_must_be_in_cluster_http(self):
-        self.assertRejected(self.profile(health_url="https://wacwini.com/x"), "health_url")
+    def run_case(self, case):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            for relative, content in case.get("files", {}).items():
+                (repo / relative).parent.mkdir(parents=True, exist_ok=True)
+                (repo / relative).write_text(content)
+            target = repo / CASE_INPUT[case["kind"]]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(case["input"]))
+            args = [str(target)] if case["kind"] == "profile" else ["--contract", str(target)]
+            return subprocess.run(
+                [sys.executable, str(SCRIPT), *args], capture_output=True, text=True, check=False
+            )
 
-    def test_health_expect_db_ok_is_an_optional_boolean(self):
-        result = self.cli(TRAVEL)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("health_expect_db_ok=true", result.stdout.splitlines())
-        result = self.cli(self.profile(health_expect_db_ok=False))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("health_expect_db_ok=false", result.stdout.splitlines())
-        self.assertRejected(self.profile(health_expect_db_ok="false"), "health_expect_db_ok")
-        self.assertRejected(self.profile(health_expect_db_ok=0), "health_expect_db_ok")
+    def test_every_case_holds_against_the_cli(self):
+        for case in self.cases:
+            with self.subTest(case=case["name"]):
+                result = self.run_case(case)
+                expect = case["expect"]
+                if "refused" in expect:
+                    self.assertEqual((result.returncode, result.stdout), (1, ""))
+                    self.assertEqual(result.stderr, f"{PREFIX}{expect['refused']}\n")
+                else:
+                    self.assertEqual((result.returncode, result.stderr), (0, ""))
+                    printed = parse_github_output(result.stdout)
+                    for key, value in expect.get("outputs", {}).items():
+                        self.assertEqual(printed.get(key), value, key)
 
-    def test_prefixes(self):
-        for good in ("", "v", "app-v"):
-            self.write(self.profile(tag_prefix=good))
-            profile.load(self.path)
-        for bad in ("V", "-v", "v/"):
-            self.assertRejected(self.profile(tag_prefix=bad), "tag_prefix")
-
-    def with_apt(self, packages):
-        data = self.profile()
-        data["ci"]["apt_packages"] = packages
-        return data
-
-    def test_apt_packages_are_accepted_and_printed_space_separated(self):
-        data = self.with_apt(["python3", "make", "g++", "libssl3t64", "lib.x-1"])
-        self.write(data)
-        self.assertEqual(profile.load(self.path), data)
-        result = self.cli(data)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            "apt_packages=python3 make g++ libssl3t64 lib.x-1", result.stdout.splitlines()
-        )
-
-    def test_apt_packages_are_optional_and_print_empty_when_absent(self):
-        result = self.cli(TRAVEL)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("apt_packages=", result.stdout.splitlines())
-
-    def test_apt_packages_apply_to_go_too(self):
-        data = self.profile(
-            ci={"stack": "go", "go_version": "1.24", "commands": ["go test ./..."], "apt_packages": ["make"]}
-        )
-        self.write(data)
-        self.assertEqual(profile.load(self.path), data)
-
-    def test_apt_packages_reject_bad_names(self):
-        for bad in ("Make", "-o", "", "make g++", "make;rm", "$(id)", "make\n", "a/b", "make:arm64", "é"):
-            with self.subTest(name=bad):
-                self.assertRejected(self.with_apt(["python3", bad]), "ci.apt_packages[1]")
-        self.assertRejected(self.with_apt([1]), "ci.apt_packages[0]")
-        self.assertRejected(self.with_apt([None]), "ci.apt_packages[0]")
-
-    def test_apt_packages_reject_duplicates(self):
-        self.assertRejected(self.with_apt(["make", "g++", "make"]), "ci.apt_packages[2]: duplicate")
-
-    def test_apt_packages_reject_an_empty_list(self):
-        self.assertRejected(self.with_apt([]), "ci.apt_packages: must be a non-empty list")
-
-    def test_apt_packages_must_be_a_list(self):
-        for bad in ("make", {"make": True}, None, True):
-            with self.subTest(value=bad):
-                self.assertRejected(self.with_apt(bad), "ci.apt_packages: must be a non-empty list")
-
-    def test_cli_prints_outputs_and_fails_cleanly(self):
-        result = self.cli(TRAVEL)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        lines = result.stdout.splitlines()
-        self.assertIn("app=travel", lines)
-        self.assertTrue(any(line.startswith("images=[") for line in lines))
-        self.assertTrue(any(line.startswith("ci={") for line in lines))
-        result = self.cli(self.profile(colour="red"))
-        self.assertEqual(result.returncode, 1)
-        self.assertTrue(result.stderr.startswith("wacd profile:"))
+    def test_every_refusal_the_script_can_print_has_a_case(self):
+        templates, excused = refusal_templates(SCRIPT.read_text())
+        self.assertTrue(templates, "found no refusals in the script")
+        self.assertEqual(excused, set(NOT_A_CASE), "every excused function still refuses")
+        refused = {kind: [c["expect"]["refused"] for c in self.cases if c["kind"] == kind and "refused" in c["expect"]] for kind in CASE_INPUT}
+        missing = []
+        for function, line, regex in templates:
+            kind = "contract" if function in CONTRACT_ONLY else "profile"
+            if not any(regex.fullmatch(sentence) for sentence in refused[kind]):
+                missing.append(f"line {line} in {function}: no {kind} case matches {regex.pattern}")
+        self.assertEqual(missing, [])
 
 
 def parse_github_output(text):
@@ -348,34 +303,6 @@ class ContractTest(unittest.TestCase):
         self.write(data, contract)
         lines = self.assertSameOutputs()
         self.assertIn("apt_packages=", lines)
-
-    def test_the_copy_needs_no_values_file_in_the_repository(self):
-        (self.root / "deploy" / "values.yaml").unlink()
-        result = self.run_cli("--contract", str(self.contract_path))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("values_file=deploy/values.yaml", result.stdout.splitlines())
-
-    def test_a_contract_that_does_not_fit_names_the_field(self):
-        base = json.loads((FIXTURES / "contract.json").read_text())
-        data = json.loads((FIXTURES / "wacd.json").read_text())
-        cases = (
-            ("version", lambda c: c.update(version=2), "contract.version"),
-            ("missing health url", lambda c: c["delivery"].pop("healthUrl"), "contract.delivery.healthUrl"),
-            ("unknown image field", lambda c: c["build"]["images"][0].update(port=80), "contract.build.images[0].port"),
-            ("unknown build field", lambda c: c["build"].update(rustVersion="1"), "contract.build.rustVersion"),
-            ("no gate commands", lambda c: c.update(gates=[]), "contract.gates"),
-            ("bad image name", lambda c: c["build"]["images"][0].update(name="Travel"), "images[0].name"),
-            ("not an object", lambda c: c.clear(), "contract.version"),
-        )
-        for label, change, field in cases:
-            with self.subTest(case=label):
-                contract = copy.deepcopy(base)
-                change(contract)
-                self.write(data, contract)
-                result = self.run_cli("--contract", str(self.contract_path))
-                self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertTrue(result.stderr.startswith("wacd profile:"), result.stderr)
-                self.assertIn(field, result.stderr)
 
 
 class NodeLayoutTest(unittest.TestCase):

@@ -92,3 +92,47 @@ inside `build` or one of its images fails, naming its dotted path under
 silently does nothing. Line equality holds for a profile whose `ci` keys are
 written in the order the table above lists them; the JSON outputs are read
 with `fromJSON`, so key order does not change what a job sees.
+
+## The case table
+
+`scripts/fixtures/wacd-profile-cases.json` holds the rules above as cases:
+profiles and copies, each with the outcome `wacd-profile.py` gives it. It is
+the contract hemi's own check mirrors. hemi's tests load it at the tag hemi
+pins, from
+`https://raw.githubusercontent.com/willfell/wac.lab.actions/<tag>/scripts/fixtures/wacd-profile-cases.json`
+or a git fetch at that tag, and match each case by its `name` and outcome, so
+hemi refuses what the pipeline refuses, with the same sentence.
+
+```json
+{"version": 1, "cases": [
+  {"name": "profile-go-version-file-missing", "kind": "profile",
+   "input": {"schema_version": 1, "...": "..."},
+   "files": {"deploy/values.yaml": "..."},
+   "expect": {"refused": "ci.go_version_file: go.mod does not exist in the repo"}}
+]}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | unique kebab-case, and stable: hemi keys on it, so a case is never renamed; a new one is added instead |
+| `kind` | `profile`, run as `wacd-profile.py .github/wacd.json`, or `contract`, run as `wacd-profile.py --contract .wacd-contract/contract.json` |
+| `input` | the profile, or the copy, as written to that path |
+| `files` | optional; the repository files the check reads, by repo-relative path: the values file for a profile, a `go_version_file` for either |
+| `expect` | `{"ok": true}`, optionally with `"outputs": {"<key>": "<value>"}` for some of the lines printed, or `{"refused": "<sentence>"}`: exactly what the script prints after its `wacd profile: ` prefix |
+
+`version` changes only when the format does in a way a reader would break
+on. A new case, or a new optional field a reader can ignore, is not one.
+
+`scripts/tests/wacd-profile.test.py` runs every case through the real script
+in a fresh temporary repository and fails on any difference. It also reads the
+script's refusal calls and fails when one of them has no case whose sentence
+it can print: a refusal only a copy reaches needs a `contract` case, every
+other a `profile` case. So a new refusal lands with its case, in the same tag
+hemi then pins. Two kinds of refusal are not in the table: a file that cannot
+be read, is not UTF-8 or is not JSON (a case's input is a JSON value, and the
+sentence names the file's path), and `node-layout`'s, which reads a checkout
+rather than settings. The new app's first answer (a `files` answer with no
+settings, [wac-ci](wac-ci.md)) is not a case either: `--contract` only ever
+reads a copy whose source is `hemi`, and the script does not read `flags`, so
+a full copy whose source is `files` is accepted as one whose source is `hemi`.
+The table fixes which check refuses first only where a case breaks two rules.
