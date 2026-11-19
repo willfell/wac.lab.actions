@@ -867,7 +867,7 @@ class BuildSecretsTests(unittest.TestCase):
 
     def test_each_line_becomes_a_0600_file_named_by_the_lowercased_key_and_a_mask(self):
         result, out = self.run_secrets(
-            "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY=abc=def%25 x\r\n\n  \nSENTRY_AUTH_TOKEN=tok\nBLANK=   \nEMPTY=\nIN_CR=a\rb\n"
+            "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY=abc=def%25 x\r\n\n  \nSENTRY_AUTH_TOKEN=tok\nBLANK=   \nIN_CR=a\rb\n"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -882,7 +882,6 @@ class BuildSecretsTests(unittest.TestCase):
                 "next_server_actions_encryption_key": b"abc=def%25 x",
                 "sentry_auth_token": b"tok",
                 "blank": b"   ",
-                "empty": b"",
                 "in_cr": b"a\rb",
             },
         )
@@ -904,6 +903,13 @@ class BuildSecretsTests(unittest.TestCase):
             ("the npm token", f"NODE_AUTH_TOKEN={PLANTED}",
              "build_secrets line 1 names NODE_AUTH_TOKEN, which wac-cd already mounts as node_auth_token"),
             ("a repeated KEY", f"A={PLANTED}\nB=x\nA={PLANTED}2", "build_secrets line 3 repeats A from line 1"),
+            ("an empty value", f"A={PLANTED}\nEMPTY=", "build_secrets line 2 gives EMPTY an empty value; set the "
+                                                     "secret it is read from, or remove the line."),
+            ("an empty value with a carriage return", "EMPTY=\r\n", "build_secrets line 1 gives EMPTY an empty value"),
+            ("a value's second line", f"PEM=-----BEGIN {PLANTED}\n{PLANTED}\n",
+             "build_secrets line 2 is not KEY=VALUE; a value must not span lines."),
+            ("a value's second line holding an equals sign", f"PEM=x\n{PLANTED}=y",
+             "build_secrets line 2 has a KEY that does not match ^[A-Z][A-Z0-9_]*$; a value must not span lines."),
         )
         for label, text, expected in cases:
             with self.subTest(case=label):

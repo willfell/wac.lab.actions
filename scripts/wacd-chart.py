@@ -581,8 +581,12 @@ def build_secrets(text):
 
     Blank lines are skipped and a trailing carriage return is dropped, as for
     build args. Every refusal names the line number, and the KEY only once the
-    KEY is known to be a name, so no sentence can carry a value. Returns
-    (KEY, VALUE) pairs in the order given.
+    KEY is known to be a name, so no sentence can carry a value. An empty
+    value is refused: a secret the caller never set reaches here as KEY=, and
+    mounting it empty would build without it. A value is one line; the
+    sentences for a line that is not KEY=VALUE, or whose KEY is not a name,
+    say so, since that is what the second line of a multi-line value becomes.
+    Returns (KEY, VALUE) pairs in the order given.
     """
     accepted, seen = [], {}
     for number, line in enumerate(text.split("\n"), start=1):
@@ -591,12 +595,13 @@ def build_secrets(text):
             continue
         key, sep, value = line.partition("=")
         if not sep:
-            raise ChartError(f"build_secrets line {number} is not KEY=VALUE.")
+            raise ChartError(f"build_secrets line {number} is not KEY=VALUE; a value must not span lines.")
         if not key:
             raise ChartError(f"build_secrets line {number} has an empty KEY.")
         if not BUILD_SECRET_KEY.fullmatch(key):
             raise ChartError(
-                f"build_secrets line {number} has a KEY that does not match ^[A-Z][A-Z0-9_]*$."
+                f"build_secrets line {number} has a KEY that does not match ^[A-Z][A-Z0-9_]*$; "
+                "a value must not span lines."
             )
         if key in RESERVED_BUILD_SECRETS:
             raise ChartError(
@@ -604,6 +609,11 @@ def build_secrets(text):
             )
         if key in seen:
             raise ChartError(f"build_secrets line {number} repeats {key} from line {seen[key]}; give each KEY once.")
+        if not value:
+            raise ChartError(
+                f"build_secrets line {number} gives {key} an empty value; set the secret it is read from, "
+                "or remove the line."
+            )
         seen[key] = number
         accepted.append((key, value))
     return accepted
@@ -618,8 +628,8 @@ def mask_command(value):
 def write_build_secrets(text, directory):
     """Write each secret to <directory>/<lowercased KEY>, mode 0600, and return the mask commands.
 
-    The whole set is validated before the first file is written. A value that
-    is empty or only whitespace gets no mask: the runner refuses to mask one.
+    The whole set is validated before the first file is written. A value of
+    only whitespace gets no mask: the runner refuses to mask one.
     """
     secrets = build_secrets(text)
     masks = []
