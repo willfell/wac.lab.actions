@@ -52,18 +52,22 @@ fails, never counting as absent. It prints reuse=<X or empty>. Only the
 candidates' Releases are read, never V's.
 
 `unfinished-release --app A --prefix P --running V --versions L --codes K`
-refuses the settings release behind an unfinished code release, before any
+refuses the settings release behind an unfinished code release, before a new
 version is chosen. L is the versions on main above V, newest first, and K
 those of them a code release claimed (wacd-version.py's above= and codes=). It
-reads deploy/<app>:<version> at the push address for each, newest first. The
-first present chart ends the scan: that version published, and a code release
-below it can no longer be re-run anyway (a replay). An absent chart that K
-names exits UNFINISHED_EXIT (5) with UNFINISHED: a settings version above it
-would overtake that claim, and re-running the code release would then be
-refused. An absent chart K does not name is a settings release's claim, which
-the settings plan takes again, and is passed over. At most MAX_EARLIER charts
-are read, and running out of them fails with a sentence. A chart that cannot
-be read fails, never counting as absent. It prints unfinished=none.
+reads deploy/<app>:<version> at the push address for each, newest first,
+until the first present chart. An absent chart K does not name is a settings
+release's claim, which the settings plan takes again, and is passed over; the
+first absent chart K names is the newest unfinished code release, the one a
+re-run could still release (one below it is a replay). With no present chart
+above V, that claim exits UNFINISHED_EXIT (5) with UNFINISHED: a settings
+version above it would overtake it, and re-running the code release would then
+be refused. A present chart above V is the evidence of a deliberate rollback
+(V runs below a published version), and then the settings release proceeds
+past the claim: it prints left=LEFT_UNFINISHED for the run summary, since that
+code can now ship only as a new commit. Otherwise it prints an empty left=. At
+most MAX_EARLIER charts are read, and running out of them fails with a
+sentence. A chart that cannot be read fails, never counting as absent.
 
 All three settings reads take `--deadline <epoch seconds>`, the plan step's one
 wall-clock deadline. The status wait ends DEADLINE_MARGIN seconds before it,
@@ -140,6 +144,7 @@ UNFINISHED = (
     "{tag} was claimed by a code release that never published; re-run that release, or release a new commit, "
     "before releasing settings."
 )
+LEFT_UNFINISHED = "{tag} was left unfinished and can now ship only as a new commit."
 STATUS_REFUSED = (
     "The gateway refused the status read (HTTP 403 with no reason), so the running version is unknown "
     "and no settings were released."
@@ -592,7 +597,12 @@ def chart_published(app, version, timeout):
 
 
 def unfinished_release(running, versions, codes, prefix, app, deadline):
-    """Refuse while the newest code release above running (versions newest first) never published."""
+    """The newest unfinished code release above running that a rollback left behind, or "".
+
+    versions are newest first. With no published chart above running, an
+    unfinished code release refuses instead.
+    """
+    unfinished = ""
     for checked, version in enumerate(versions):
         if checked == MAX_EARLIER:
             raise ReleaseError(
@@ -600,9 +610,12 @@ def unfinished_release(running, versions, codes, prefix, app, deadline):
                 "release is unfinished is unknown; the settings plan stops here and nothing was tagged"
             )
         if chart_published(app, version, max(1, min(chart.TIMEOUT, deadline - time.time()))):
-            return
-        if version in codes:
-            raise Unfinished(UNFINISHED.format(tag=prefix + version))
+            return unfinished
+        if version in codes and not unfinished:
+            unfinished = prefix + version
+    if unfinished:
+        raise Unfinished(UNFINISHED.format(tag=unfinished))
+    return ""
 
 
 def expire(signum, frame):
@@ -912,10 +925,10 @@ def run(args):
             raise ReleaseError("--codes must name only versions in --versions")
         _, previous = arm_deadline(args.deadline)
         try:
-            unfinished_release(args.running, versions, set(codes), args.prefix, args.app, args.deadline)
+            left = unfinished_release(args.running, versions, set(codes), args.prefix, args.app, args.deadline)
         finally:
             disarm(previous)
-        return "unfinished=none"
+        return "left=" + (LEFT_UNFINISHED.format(tag=left) if left else "")
     if args.command == "earlier-release":
         if not chart.DECIMAL.fullmatch(args.revision):
             raise ReleaseError("--revision must be a decimal")

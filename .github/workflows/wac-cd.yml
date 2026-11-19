@@ -305,22 +305,24 @@ jobs:
           claimed="$(sed -n 's/^claimed=//p' <<< "$planned")"
           above="$(sed -n 's/^above=//p' <<< "$planned")"
           codes="$(sed -n 's/^codes=//p' <<< "$planned")"
-          code=0
-          python3 "$WACD_SCRIPTS"/wacd-release.py unfinished-release --app "$APP" --prefix "$TAG_PREFIX" \
-            --running "$running" --versions "$above" --codes "$codes" \
-            --deadline "$deadline" > /dev/null 2> "$RUNNER_TEMP/settings.err" || code=$?
-          if [[ "$code" -eq 5 ]]; then
-            reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
-            [[ -n "$reason" ]] || fail "The settings release was refused behind an unfinished code release, and the refusal gave no reason."
-            printf 'unfinished_refused=%s\n' "$reason" >> "$GITHUB_OUTPUT"
-            echo "wac-cd: settings release refused behind an unfinished code release; the next step reports it"
-            exit 0
-          elif [[ "$code" -ne 0 ]]; then
-            fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/ *$//')"
-          fi
+          left=""
           if [[ "$live" == "$SETTINGS_REVISION" ]]; then
             version="$running"
           else
+            code=0
+            unfinished="$(python3 "$WACD_SCRIPTS"/wacd-release.py unfinished-release --app "$APP" --prefix "$TAG_PREFIX" \
+              --running "$running" --versions "$above" --codes "$codes" \
+              --deadline "$deadline" 2> "$RUNNER_TEMP/settings.err")" || code=$?
+            if [[ "$code" -eq 5 ]]; then
+              reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
+              [[ -n "$reason" ]] || fail "The settings release was refused behind an unfinished code release, and the refusal gave no reason."
+              printf 'unfinished_refused=%s\n' "$reason" >> "$GITHUB_OUTPUT"
+              echo "wac-cd: settings release refused behind an unfinished code release; the next step reports it"
+              exit 0
+            elif [[ "$code" -ne 0 ]]; then
+              fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/ *$//')"
+            fi
+            left="$(sed -n 's/^left=//p' <<< "$unfinished")"
             code=0
             earlier="$(python3 "$WACD_SCRIPTS"/wacd-release.py earlier-release --app "$APP" --prefix "$TAG_PREFIX" \
               --revision "$SETTINGS_REVISION" --running "$running" --versions "$above" --claimed "$claimed" \
@@ -353,6 +355,7 @@ jobs:
             echo "commit=$commit"
             echo "images=$images"
             echo "summary=$summary"
+            echo "unfinished_left=$left"
           } | tee -a "$GITHUB_OUTPUT"
       - name: Refuse a settings release while the app is rolling out
         timeout-minutes: 1
@@ -416,6 +419,7 @@ jobs:
           SETTINGS_TAG: ${{ steps.settings.outputs.tag }}
           SETTINGS_COMMIT: ${{ steps.settings.outputs.commit }}
           SETTINGS_SUMMARY: ${{ steps.settings.outputs.summary }}
+          SETTINGS_UNFINISHED: ${{ steps.settings.outputs.unfinished_left }}
         run: |
           set -euo pipefail
           registry=registry.network.svc.cluster.local:5000
@@ -560,6 +564,10 @@ jobs:
               echo "mode: settings"
               echo
               echo "${SETTINGS_SUMMARY:-}"
+              if [[ -n "${SETTINGS_UNFINISHED:-}" ]]; then
+                echo
+                echo "$SETTINGS_UNFINISHED"
+              fi
             elif [[ -n "${SETTINGS_REVISION:-}" ]]; then
               echo
               echo "mode: none (${SETTINGS_SUMMARY:-})"

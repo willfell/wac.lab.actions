@@ -1008,10 +1008,14 @@ Registry = _CHART_TESTS.Registry
 
 
 class UnfinishedReleaseTests(unittest.TestCase):
-    """A settings release waits for the newest code release above the running version to publish its chart."""
+    """A settings release waits for an unfinished code release above the running version, unless it was rolled back.
+
+    The evidence of a rollback is a published chart above the running version.
+    """
 
     SENTENCE = ("wacd release: {tag} was claimed by a code release that never published; re-run that release, "
                 "or release a new commit, before releasing settings.\n")
+    LEFT = "left={tag} was left unfinished and can now ship only as a new commit.\n"
 
     def setUp(self):
         self.registry = Registry()
@@ -1045,19 +1049,29 @@ class UnfinishedReleaseTests(unittest.TestCase):
         ):
             with self.subTest(case=label):
                 read, result = self.run_cli(versions, codes, published=published)
-                self.assertEqual(result, (0, "unfinished=none\n", ""))
+                self.assertEqual(result, (0, "left=\n", ""))
                 self.assertEqual(read, [versions.split(",")[0]], "the newest published version settles it")
+
+    def test_after_a_rollback_the_newest_unfinished_code_claim_is_left_behind(self):
+        for label, codes, left in (
+            ("code claims only", "1.4.5,1.4.4,1.4.3", "v1.4.5"),
+            ("a settings claim above them", "1.4.4,1.4.3", "v1.4.4"),
+        ):
+            with self.subTest(case=label):
+                read, result = self.run_cli("1.4.5,1.4.4,1.4.3", codes, published=("1.4.3",))
+                self.assertEqual(result, (0, self.LEFT.format(tag=left), ""))
+                self.assertEqual(read, ["1.4.5", "1.4.4", "1.4.3"], "read down to the published version")
 
     def test_a_settings_claim_with_no_chart_is_passed_over(self):
         read, result = self.run_cli("1.4.4,1.4.3", "1.4.3")
         self.assertEqual(result, (wacd.UNFINISHED_EXIT, "", self.SENTENCE.format(tag="v1.4.3")))
         self.assertEqual(read, ["1.4.4", "1.4.3"])
         read, result = self.run_cli("1.4.4", "")
-        self.assertEqual(result, (0, "unfinished=none\n", ""), "its own re-run takes that claim again")
+        self.assertEqual(result, (0, "left=\n", ""), "its own re-run takes that claim again")
 
     def test_no_versions_above_reads_nothing(self):
         read, result = self.run_cli("", "")
-        self.assertEqual((read, result), ([], (0, "unfinished=none\n", "")))
+        self.assertEqual((read, result), ([], (0, "left=\n", "")))
 
     def test_a_registry_that_cannot_be_read_is_a_fault_never_absent(self):
         self.registry.put_manifest("deploy/travel", "1.4.3", "sha256:" + "b" * 64, "x", status=500)
