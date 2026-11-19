@@ -28,6 +28,8 @@ C, which must be on main. It prints mode=settings, version=, tag= and
 claimed=: claimed names main's newest version when that tag already sits on C
 above V (an earlier settings release of this code that never went live), so
 wac-cd can take it again rather than spend a second version on one revision.
+above= lists every version on main newer than V, newest first, comma-separated,
+so wac-cd can find one that already shipped the dispatched revision.
 """
 
 import argparse
@@ -255,6 +257,11 @@ def plan_settings(repo, prefix, commit, running, main_ref=MAIN_REF):
     if newest is None:
         raise VersionError(f"main carries no {prefix}X.Y.Z tag, so there is no release to go above")
     (major, minor, patch), newest_name = newest
+    merged = sorted(
+        ((parsed, tag) for tag in tag_lines(repo, "--merged", main_ref) if (parsed := parse_tag(tag, prefix))),
+        reverse=True,
+    )
+    above = ",".join(".".join(str(part) for part in parsed) for parsed, _ in merged if parsed > current)
     claimed = ""
     if commit_of(repo, newest_name) == commit and newest[0] > current:
         claimed = f"{major}.{minor}.{patch}"
@@ -263,7 +270,7 @@ def plan_settings(repo, prefix, commit, running, main_ref=MAIN_REF):
     existing = commit_of(repo, tag)
     if existing is not None and existing != commit:
         raise VersionError(f"tag {tag} already exists on {existing}, not on {commit}")
-    return {"mode": "settings", "version": new, "tag": tag, "claimed": claimed}
+    return {"mode": "settings", "version": new, "tag": tag, "claimed": claimed, "above": above}
 
 
 def finish(result, deploy):
@@ -291,7 +298,7 @@ def main(argv):
         except VersionError as err:
             print(f"wacd version: {' '.join(str(err).split())}", file=sys.stderr)
             return 1
-        for key in ("mode", "version", "tag", "claimed"):
+        for key in ("mode", "version", "tag", "claimed", "above"):
             print(f"{key}={result[key]}")
         return 0
     try:

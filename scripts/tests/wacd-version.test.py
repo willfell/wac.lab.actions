@@ -482,20 +482,31 @@ class SettingsTest(unittest.TestCase):
         self.commit("feat: merged, not released yet")
         self.assertEqual(
             self.settings(self.code, "1.4.2"),
-            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": ""},
+            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": ""},
         )
 
     def test_after_a_rollback_it_still_releases_above_the_newest(self):
         self.assertEqual(
             self.settings(self.old, "1.3.9"),
-            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": ""},
+            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": "1.4.2"},
         )
+
+    def test_above_names_every_version_on_main_newer_than_the_running_one_newest_first(self):
+        git(self.repo, "tag", "v1.4.10", self.code)
+        git(self.repo, "tag", "v1.4.3", self.code)
+        git(self.repo, "tag", "ui-v9.0.0", self.code)
+        git(self.repo, "checkout", "-q", "-b", "stray")
+        self.commit("feat: never merged")
+        git(self.repo, "tag", "v9.0.0")
+        git(self.repo, "checkout", "-q", "main")
+        self.assertEqual(self.settings(self.old, "1.3.9")["above"], "1.4.10,1.4.3,1.4.2")
+        self.assertEqual(self.settings(self.code, "1.4.10")["above"], "")
 
     def test_a_version_already_claimed_on_the_running_code_is_named(self):
         git(self.repo, "tag", "v1.4.3", self.code)
         self.assertEqual(
             self.settings(self.code, "1.4.2"),
-            {"mode": "settings", "version": "1.4.4", "tag": "v1.4.4", "claimed": "1.4.3"},
+            {"mode": "settings", "version": "1.4.4", "tag": "v1.4.4", "claimed": "1.4.3", "above": "1.4.3"},
         )
         self.assertEqual(self.settings(self.code, "1.4.3")["claimed"], "", "a running version is not a pending claim")
         git(self.repo, "tag", "v1.4.0", self.old)
@@ -553,6 +564,12 @@ class SettingsTest(unittest.TestCase):
         with self.assertRaises(version.ReplayRefused) as ctx:
             version.plan(self.repo, "v", "commits", None, main_ref="main")
         self.assertIn("This run is for v1.4.3, but v1.4.4 is already published.", str(ctx.exception))
+
+    def test_a_rerun_after_a_rollback_to_other_code_sees_the_earlier_release_above_it(self):
+        git(self.repo, "tag", self.settings(self.code, "1.4.2")["tag"], self.code)
+        rerun = self.settings(self.old, "1.3.9")
+        self.assertEqual(rerun["above"], "1.4.3,1.4.2", "plan reads these charts for the revision before taking 1.4.4")
+        self.assertEqual((rerun["version"], rerun["claimed"]), ("1.4.4", ""))
 
     def test_a_settings_tag_after_a_rollback_sits_on_old_code_and_the_next_merge_goes_above_it(self):
         git(self.repo, "tag", self.settings(self.old, "1.3.9")["tag"], self.old)
@@ -663,7 +680,7 @@ class CliTest(unittest.TestCase):
         result = self.cli("--mode", "settings", "--prefix", "v", "--commit", head, "--running", "1.4.2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            result.stdout.splitlines(), ["mode=settings", "version=1.4.3", "tag=v1.4.3", "claimed="]
+            result.stdout.splitlines(), ["mode=settings", "version=1.4.3", "tag=v1.4.3", "claimed=", "above="]
         )
         for args in (
             ["--commit", head, "--running", "v1.4.2"],
