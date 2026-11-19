@@ -80,7 +80,7 @@ dropping `id-token` from its own ci.yml:
 | 200 `files` | absent | absent | fails: wait for the restore pull request (or, for a new app, nothing to check) |
 | 200 `files` | present | any | the files, as before |
 | anything else | present | present | the files, as before; the summary names hemi's status |
-| anything else | present | removes one | fails: hemi did not answer and the pull request removes the files |
+| anything else | present | removes one | fails: the cause (silence, a refused token, a status, a runner outside the cluster, ...) and that the pull request removes the files |
 | 401 or 403 | absent | any | fails: hemi refused the token (or the event, outside `pull_request`); register a new app first |
 | no answer, a timeout or 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
 | an address that does not resolve, three times | absent | any | fails: the job must run on a Lab runner |
@@ -90,14 +90,15 @@ dropping `id-token` from its own ci.yml:
 "Files on main" is `.github/wacd.json` on main, the profile that holds the
 gates; the paths checked in the merge commit are that file, the values path
 main's profile names and the copy's `delivery.valuesFile`. A `files` answer is
-read for its source alone: hemi answers a registered app that was never cut
-over with `version`, `identity.repositoryId`, `identity.repository`,
-`identity.app` and `flags.source` and nothing else, so only `flags.source` is
-required, and `identity.repositoryId`, when present, must be the token's. A
+read for its source and repository: hemi answers a registered app that was
+never cut over with `version`, `identity.repositoryId`, `identity.repository`,
+`identity.app` and `flags.source` and nothing else, so `flags.source` and an
+`identity.repositoryId` equal to the token's are required. A
 `hemi` answer is read in full. A 200 that cannot be read, names another
 repository than the token's or does not derive a profile is treated as an
 answer but a 200, and so is a job with no `id-token` grant.
-No answer, a 5xx and an address that does not resolve are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
+No answer (a connection closed or reset after the request, or an answer
+shorter than its Content-Length), a 5xx and an address that does not resolve are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
 apart; each attempt, token mint included, is bounded at PR_ATTEMPT_SECONDS by
 a worker thread, so a reply that trickles in counts as silence. On success it prints
 `source=hemi|files` and `revision=<n>|`, and with source `hemi` leaves
@@ -172,7 +173,7 @@ PR_ATTEMPT_SECONDS = 15
 GIT_SECONDS = 30
 MAX_ANSWER = 1048576
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-RUNNER_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+RUNNER_NAME = re.compile(r"[A-Za-z0-9_.-](?:[A-Za-z0-9 _.-]{0,98}[A-Za-z0-9_.-])?")
 EVENT_NAME = re.compile(r"[a-z_]{1,40}")
 GRANT_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
 CUT_OVER_CLAUSE = "{app}'s settings live in hemi, so the checks cannot run"
@@ -186,7 +187,27 @@ PR_SENTENCES = {
     "added_back": "{path} was added back; {app}'s settings live in hemi.",
     "changed": "{path} was changed; {app}'s settings live in hemi, so change them there.",
     "stale": "This run's merge commit is older than {app}'s clean-up; update the branch and re-run.",
-    "removed": "hemi did not answer, and this pull request removes {app}'s files; re-run when hemi answers.",
+    "removed_silent": "hemi did not answer, and this pull request removes {app}'s files; re-run when hemi answers.",
+    "removed_refused": (
+        "hemi refused the job token (HTTP {status}), and this pull request removes {app}'s files; " + REGISTER_FIRST
+    ),
+    "removed_status": (
+        "hemi answered HTTP {status}, and this pull request removes {app}'s files; re-run when hemi answers."
+    ),
+    "removed_unreachable": (
+        "the contract job must run on a Lab runner: {runner} cannot reach hemi's in-cluster address, and this "
+        "pull request removes {app}'s files. Pass a Lab pool as `runner`."
+    ),
+    "removed_no_mint": (
+        "GitHub would not mint a job token for hemi, and this pull request removes {app}'s files; re-run the checks."
+    ),
+    "removed_no_grant": (
+        "no job token for hemi: the caller's ci.yml must grant id-token: write, and this pull request removes "
+        "{app}'s files."
+    ),
+    "removed_unreadable": (
+        "hemi's answer could not be read, and this pull request removes {app}'s files; re-run when hemi answers."
+    ),
     "still_on_main": (
         "{path} is still on main until hemi's clean-up pull request merges; hemi's settings were used."
     ),
@@ -323,6 +344,7 @@ def ask(trust, wait):
         try:
             status, value, token = post(trust, max(1, deadline - time.monotonic()))
         except release.Unanswered:
+            last_uncoded = False
             now = time.monotonic()
             refused_since = now if refused_since is None else refused_since
             if now - refused_since >= RESTART_WINDOW:
@@ -540,7 +562,9 @@ def hemi_attempt():
 
     Without an answer the status says why instead: "no_mint" when GitHub
     minted no token, "unreachable" when hemi's address does not resolve (a
-    runner outside the cluster), and None for silence.
+    runner outside the cluster), and None for silence, which includes a
+    connection reset after the request was sent and an answer shorter than
+    the Content-Length it declares.
     """
     try:
         token = shadow.oidc_token()
@@ -561,8 +585,11 @@ def hemi_attempt():
         return None, None, token
     try:
         with response:
+            declared = response.length
             raw = response.read(MAX_ANSWER + 1)
     except (OSError, ValueError, http.client.HTTPException):
+        return None, None, token
+    if declared is not None and len(raw) < min(declared, MAX_ANSWER + 1):
         return None, None, token
     return response.status, raw, token
 
@@ -609,11 +636,10 @@ def ask_hemi():
 def read_pr_copy(raw, token):
     """hemi's answer to a pull request's job, or None when it cannot be used.
 
-    A `files` answer is read for flags.source alone, and for
-    identity.repositoryId when present, which must be the token's: hemi answers
-    a registered app that was never cut over with no revision and no settings
-    document, and the pull request runs on its own files whatever else the
-    answer holds. A `hemi` answer is checked as fetch checks the gateway's copy.
+    A `files` answer is read for flags.source and identity.repositoryId,
+    which must be the token's: hemi answers a registered app that was never
+    cut over with no revision and no settings document, and the pull request
+    runs on its own files whatever else the answer holds. A `hemi` answer is checked as fetch checks the gateway's copy.
     """
     if raw is None or len(raw) > MAX_ANSWER:
         return None
@@ -627,10 +653,9 @@ def read_pr_copy(raw, token):
     if not isinstance(flags, dict) or flags.get("source") not in SOURCES:
         return None
     if flags["source"] == "files":
-        if isinstance(identity, dict) and "repositoryId" in identity:
-            owner = token_repository_id(token) if token else None
-            if owner is None or identity["repositoryId"] != owner:
-                return None
+        owner = token_repository_id(token) if token else None
+        if not isinstance(identity, dict) or owner is None or identity.get("repositoryId") != owner:
+            return None
         return copy
     if (
         type(copy.get("version")) is not int
@@ -699,7 +724,11 @@ def pull_request(out, main, head):
     if outcome != "ok":
         if files_on_main:
             if set(paths) - set(tree_entries(head, paths, "pull request's tree")):
-                raise Refusal(PR_SENTENCES["removed"].format(app=repository_name()))
+                cause = outcome
+                if outcome == "status":
+                    cause = "refused" if answer in (401, 403) else "status"
+                raise Refusal(PR_SENTENCES["removed_" + cause].format(
+                    app=repository_name(), status=answer, runner=runner_name()))
             return "files", "", [PR_SENTENCES[f"{outcome}_files"].format(status=answer, runner=runner_name())]
         app, event = repository_name(), event_name()
         if outcome == "status":

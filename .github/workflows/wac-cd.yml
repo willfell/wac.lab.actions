@@ -856,11 +856,20 @@ jobs:
         shell: bash
         run: rm -rf .wacd-contract
       - name: Download the settings copy plan read (actions/download-artifact v8.0.2)
+        id: copy
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         if: needs.plan.outputs.source == 'hemi'
         with:
           name: wac-cd-contract
           path: .wacd-contract
+      - name: Say how to recover a settings copy that could not be downloaded
+        if: failure() && steps.copy.outcome == 'failure'
+        shell: bash
+        run: |
+          sentence="The settings copy this run's earlier job uploaded could not be downloaded. It is kept for one day, so a re-run more than a day after the run started must re-run all jobs, not only the failed ones."
+          echo "::error::wac-cd: $sentence"
+          echo "$sentence" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - name: Publish the deploy chart and the tag
         shell: bash
         env:

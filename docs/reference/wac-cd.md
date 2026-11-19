@@ -194,7 +194,9 @@ built, published or tagged. Re-run the run once the gateway answers.
 artifact the earlier attempt's `plan` uploaded in the same run, and never
 reads the copy again. The artifact holds settings and Secret names, so it is
 kept for one day (`retention-days: 1`): a re-run of failed jobs must start
-within a day of the run, or its `publish` finds no copy and fails. "Re-run all
+within a day of the run, or its `publish` finds no copy and fails, with the
+step after the download saying so in an `::error::` annotation and the run
+summary: `The settings copy this run's earlier job uploaded could not be downloaded. It is kept for one day, so a re-run more than a day after the run started must re-run all jobs, not only the failed ones.` "Re-run all
 jobs" runs `plan` again, which reads the copy afresh and replaces the artifact.
 
 **What runs beside the token.** `plan`, `shadow` and `deploy` hold

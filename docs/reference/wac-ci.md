@@ -178,7 +178,10 @@ uses, with a token of audience `wacwini:hemi` minted for each attempt. No
 answer, a 5xx and an address that does not resolve are asked three times, 5 and 10 seconds apart, each attempt
 bounded at 15 seconds. When the source is `hemi` it uploads `.wacd-contract/`
 (`contract.json`, `profile.json` and `values.json`, as `wac-cd`'s `plan`
-writes them) as the artifact `wac-ci-contract`, kept for one day.
+writes them) as the artifact `wac-ci-contract`, kept for one day. A re-run of
+failed jobs more than a day after the run finds it gone: `checks` or `render`
+then fails at its download, and the next step says, in an `::error::`
+annotation and the run summary, `The settings copy this run's earlier job uploaded could not be downloaded. It is kept for one day, so a re-run more than a day after the run started must re-run all jobs, not only the failed ones.`
 
 `checks` and `render` need `contract` and run under
 `if: ${{ !cancelled() }}`. A plain dependent of a failed job reports
@@ -213,9 +216,9 @@ into another pull request's branch is judged by main like any other.
 | 200, source `files` | absent | absent | fails: wait for hemi's restore pull request and re-run after it merges; for an answer with no revision, `hemi holds no settings for <app> yet, and neither main nor this pull request has .github/wacd.json, so there is nothing to check.` |
 | 200, source `files` | present | any | the pull request's own files, as before |
 | anything but a readable 200 | present | present | the pull request's own files, as before; the summary names only hemi's status, such as `hemi answered 401; using the repository's files.` |
-| anything but a readable 200 | present | removes either file | fails: `hemi did not answer, and this pull request removes <repository>'s files; re-run when hemi answers.` This is hemi's clean-up pull request during a hemi outage. |
+| anything but a readable 200 | present | removes either file | fails, naming the cause, then `and this pull request removes <repository>'s files`: `hemi did not answer, ...; re-run when hemi answers.` for silence or a 5xx (hemi's clean-up pull request during a hemi outage), `hemi refused the job token (HTTP <status>), ...; if this app is new, register it with lab first.` for a 401 or 403, `hemi answered HTTP <status>, ...` for another status, the Lab-runner sentence for an address that does not resolve, and likewise for an unreadable answer, a token GitHub would not mint or no `id-token` grant. |
 | 401 or 403 | absent | any | fails: `hemi refused this pull request's token (HTTP <status>); <repository>'s settings live in hemi, so the checks cannot run; if this app is new, register it with lab first.` |
-| no answer, a timeout or a 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
+| no answer (a connection closed or reset after the request, or an answer shorter than the `Content-Length` it declares), a timeout or a 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
 | hemi's address does not resolve, on all three attempts | absent | any | fails: ``the contract job must run on a Lab runner: <runner> cannot reach hemi's in-cluster address. Pass a Lab pool as `runner`.`` |
 | GitHub mints no job token | absent | any | fails: `GitHub would not mint a job token for hemi; re-run the checks.` |
 | 404, 422 or any other status | absent | any | fails, naming the status |
@@ -233,9 +236,10 @@ Before the registration hemi answers 403 (`not registered`), and the pull
 request fails with the 401-or-403 sentence above, which says to register
 first.
 
-A `files` answer is read for its source alone: `contract` requires only
-`flags.source`, and `identity.repositoryId`, when it is present, must be the
-job token's. A `hemi` answer must carry the full copy. A 200 that cannot be
+A `files` answer is read for its source and its repository: `contract`
+requires `flags.source` and an `identity.repositoryId` equal to the job
+token's, which hemi sends in every `files` answer, the new app's included. A
+`hemi` answer must carry the full copy. A 200 that cannot be
 read, names another repository than the token's, or does not derive a profile
 counts as "anything but a readable 200". So do an
 address that does not resolve, a token GitHub would not mint, and a job with
@@ -244,7 +248,10 @@ then says which. An address that does not resolve is asked again, like
 silence, since a lookup can fail once on a Lab runner; one that never
 resolves means a runner outside the cluster, such as a hosted one, and the
 sentence names the runner (`runner.name`, passed to the step as
-`JOB_RUNNER_NAME`).
+`JOB_RUNNER_NAME`), when the name is letters, digits, `_`, `.`, `-` and inner
+spaces (a hosted runner's `GitHub Actions <n>` included), up to 100
+characters; any other name, one that could carry a workflow command or a shell
+character, is shown as `this runner`.
 
 Files on both main and the merge commit are compared by blob id
 (`git ls-tree`), never by content read from the checkout: the same blob is the

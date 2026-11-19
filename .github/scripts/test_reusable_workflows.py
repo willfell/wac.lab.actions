@@ -2264,6 +2264,30 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertLess(names.index(clear["name"]), names.index(download["name"]))
                 self.assertLess(names.index(download["name"]), names.index("Read the wacd profile"))
 
+    def test_a_settings_copy_that_cannot_be_downloaded_says_to_re_run_all_jobs(self):
+        """The copy is kept one day; re-running only the failed jobs a day later finds it gone."""
+        import os
+        import subprocess
+
+        for workflow, doc, job_name in (("wac-cd", self.wac_cd(), "publish"), ("wac-ci", self.wac_ci(), "checks"),
+                                        ("wac-ci", self.wac_ci(), "render")):
+            steps = doc["jobs"][job_name]["steps"]
+            index = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/download-artifact@"))
+            download, explain = steps[index], steps[index + 1]
+            with self.subTest(workflow=workflow, job=job_name):
+                self.assertNotIn("continue-on-error", download, "the failed download still fails the job")
+                self.assertEqual(explain["if"], f"failure() && steps.{download['id']}.outcome == 'failure'")
+                with tempfile.TemporaryDirectory() as tmp:
+                    summary = Path(tmp) / "summary"
+                    result = subprocess.run(["bash", "-c", explain["run"]], capture_output=True, text=True,
+                                            env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary)})
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    sentence = ("The settings copy this run's earlier job uploaded could not be downloaded. It is kept "
+                                "for one day, so a re-run more than a day after the run started must re-run all jobs, "
+                                "not only the failed ones.")
+                    self.assertEqual(result.stdout, f"::error::{workflow}: {sentence}\n")
+                    self.assertIn(sentence, summary.read_text())
+
     def test_wac_ci_reads_the_profile_from_the_copy_only_when_the_source_is_hemi(self):
         import os
         import subprocess
