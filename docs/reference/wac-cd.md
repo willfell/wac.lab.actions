@@ -185,7 +185,7 @@ file the profile names, and `helmValues`, Helm's own reading of that file. YAML 
 which Helm uses, reads `yes` and `on` as true, `010` as 8 and a key written `y` as
 the string `true`, and applies `<<` merges; hemi reads the same text as YAML 1.2, so
 hemi compares JSON with JSON. The job installs Helm `v3.16.3` (the version `publish`
-installs) in a step that may fail, and the script runs `helm template probe
+installs) in a step that may fail and is bounded at one minute, and the script, once `helm version --template '{{.Version}}'` prints exactly `v3.16.3` (any other Helm, such as one the runner image ships, is treated as absent), runs `helm template probe
 scripts/fixtures/values-probe -f <values file> --show-only templates/values.json`
 with no cluster (`KUBECONFIG=/dev/null`), none of the job's token variables and a
 30-second timeout. The probe chart's only template is `{{ toJson .Values }}` and it

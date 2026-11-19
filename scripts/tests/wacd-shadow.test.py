@@ -40,6 +40,7 @@ VALUES = "image:\n  repository: travel-app\nreplicas: 2\n"
 VALUES_AS_HELM_READS_THEM = {"image": {"repository": "travel-app"}, "replicas": 2}
 SILENT = "hemi did not answer; nothing was compared.\n"
 HELM_UNREAD = "Helm could not read the values; hemi compared its own reading."
+ANSWER_VERSION = 'if [ "$1" = version ]; then echo v3.16.3; exit 0; fi\n'
 HAVE_HELM = shutil.which("helm") is not None
 NEEDS_HELM = unittest.skipUnless(
     HAVE_HELM or os.environ.get("WACD_REQUIRE_HELM"), "helm is not installed"
@@ -322,6 +323,19 @@ class ShadowTests(Harness, unittest.TestCase):
         self.assertEqual(body["values"], YAML_11_VALUES)
         self.assertEqual(body["helmValues"], YAML_11_AS_HELM_READS_IT)
 
+    def test_an_empty_or_comment_only_file_posts_an_empty_reading_not_none(self):
+        for label, values in {"empty": "", "comment only": "# nothing set\n"}.items():
+            with self.subTest(label):
+                stub = Stub((200, contract(5)))
+                try:
+                    code, _, _, summary = self.run_against(stub, values=values)
+                finally:
+                    stub.close()
+                self.assertEqual((code, summary), (0, "hemi's copy matched the files (copy 5).\n"))
+                body = self.posted(stub)
+                self.assertIn("helmValues", body)
+                self.assertEqual(body["helmValues"], {})
+
     def test_values_helm_cannot_parse_are_posted_without_its_reading(self):
         stub = Stub((200, contract(5)))
         try:
@@ -338,12 +352,12 @@ class ShadowTests(Harness, unittest.TestCase):
 class HelmStandInTests(Harness, unittest.TestCase):
     """Helm absent or misbehaving: the files are still posted and the release is untouched."""
 
-    def bin_dir(self, tmp, script=None):
+    def bin_dir(self, tmp, script=None, answer_version=True):
         directory = Path(tmp) / "bin"
         directory.mkdir()
         if script is not None:
             helm = directory / "helm"
-            helm.write_text("#!/bin/sh\n" + script)
+            helm.write_text("#!/bin/sh\n" + (ANSWER_VERSION if answer_version else "") + script)
             helm.chmod(helm.stat().st_mode | stat.S_IXUSR)
         return directory
 
@@ -362,6 +376,24 @@ class HelmStandInTests(Harness, unittest.TestCase):
         finally:
             stub.close()
         self.assert_posts_files_alone(stub, result)
+
+    def test_a_helm_that_is_not_the_pinned_version_is_treated_as_absent(self):
+        cases = {
+            "another version": ('if [ "$1" = version ]; then echo v4.3.1; exit 0; fi\necho \'{"a": 1}\'\n'),
+            "version fails": 'if [ "$1" = version ]; then exit 1; fi\necho \'{"a": 1}\'\n',
+            "version prints nothing": 'if [ "$1" = version ]; then exit 0; fi\necho \'{"a": 1}\'\n',
+        }
+        for label, script in cases.items():
+            with self.subTest(label):
+                stub = Stub((200, contract(3)))
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        result = self.run_against(
+                            stub, path=self.bin_dir(tmp, script, answer_version=False)
+                        )
+                finally:
+                    stub.close()
+                self.assert_posts_files_alone(stub, result)
 
     def test_a_helm_that_fails_or_answers_badly_posts_the_files_alone(self):
         cases = {

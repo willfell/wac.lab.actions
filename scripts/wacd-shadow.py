@@ -48,6 +48,8 @@ TOKEN_SCHEME = "https"
 TOKEN_HOST_SUFFIX = ".actions.githubusercontent.com"
 TIMEOUT = 10
 HELM_TIMEOUT = 30
+HELM_VERSION_TIMEOUT = 10
+HELM_VERSION = "v3.16.3"
 PROBE_CHART = Path(__file__).resolve().parent / "fixtures" / "values-probe"
 MAX_RESPONSE = 1048576
 SILENT = "hemi did not answer; nothing was compared."
@@ -147,6 +149,8 @@ def one_line(value: Any) -> str:
 def helm_values(values_file: Path) -> dict[str, Any] | None:
     """Helm's own reading of the values file as JSON, or None when it cannot be had.
 
+    Only the pinned Helm counts: another version (a runner image's own, when the
+    install step failed) reads YAML differently and would be posted as Helm's.
     Helm gets a bare environment: no cluster (KUBECONFIG=/dev/null) and none of
     the job's token variables.
     """
@@ -158,6 +162,12 @@ def helm_values(values_file: Path) -> dict[str, Any] | None:
         if name in os.environ:
             env[name] = os.environ[name]
     try:
+        version = subprocess.run(
+            [helm, "version", "--template", "{{.Version}}"],
+            capture_output=True, text=True, env=env, timeout=HELM_VERSION_TIMEOUT, check=False,
+        )
+        if version.returncode != 0 or version.stdout.strip() != HELM_VERSION:
+            return None
         result = subprocess.run(
             [helm, "template", "probe", str(PROBE_CHART), "-f", str(values_file),
              "--show-only", "templates/values.json"],

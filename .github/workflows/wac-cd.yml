@@ -257,6 +257,7 @@ jobs:
           python-version: "3.12"
       - name: Install helm
         continue-on-error: true
+        timeout-minutes: 1
         shell: bash
         env:
           HELM_VERSION: v3.16.3

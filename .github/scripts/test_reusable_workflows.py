@@ -379,7 +379,9 @@ class ReusableWorkflowTests(unittest.TestCase):
         publish_installs = [
             st for st in jobs["publish"]["steps"] if "install-tools.sh helm" in st.get("run", "")
         ]
+        self.assertEqual(install["env"], {"HELM_VERSION": "v3.16.3"}, "an unpinned install fetches Helm 4")
         self.assertEqual(install["env"], publish_installs[0]["env"], "one pinned Helm for the whole workflow")
+        self.assertEqual(install.get("timeout-minutes"), 1, "a stalled download must leave time for the comparison")
         self.assertIs(install.get("continue-on-error"), True, "a failed download must not skip the comparison")
         self.assertEqual(
             sorted((root / "scripts" / "fixtures" / "values-probe").rglob("*")),
