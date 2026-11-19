@@ -14,7 +14,7 @@ again, which is how a version is recovered after a registry loss and how a HEAD
 tagged by an older pipeline gets its first chart. `true` and `unknown` resume.
 
 A deploying run whose HEAD's highest tag is lower than the highest tag with the
-prefix anywhere in the repository fails: what is running changes by a rollback
+prefix merged into origin/main fails: what is running changes by a rollback
 or a new release, never by replaying an old build.
 """
 
@@ -30,6 +30,7 @@ BREAKING_HEADER = re.compile(r"\w+(\([^)]*\))?!:")
 FEAT_HEADER = re.compile(r"feat(\([^)]*\))?:")
 BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
 PUBLISHED = ("true", "false", "unknown")
+MAIN_REF = "origin/main"
 
 
 class VersionError(Exception):
@@ -94,10 +95,13 @@ def bump(latest, messages):
 
 
 def commit_of(repo, tag):
-    ref = f"refs/tags/{tag}^{{commit}}"
+    return commit_of_ref(repo, f"refs/tags/{tag}")
+
+
+def commit_of_ref(repo, ref):
     try:
         out = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "-q", "--verify", ref],
+            ["git", "-C", str(repo), "rev-parse", "-q", "--verify", f"{ref}^{{commit}}"],
             check=True,
             capture_output=True,
             encoding="utf-8",
@@ -112,7 +116,9 @@ def tag_lines(repo, *args):
     return [line for line in git(repo, "tag", *args).splitlines() if line]
 
 
-def plan(repo, prefix, source, caller_version, deploy=True, published="unknown"):
+def plan(
+    repo, prefix, source, caller_version, deploy=True, published="unknown", main_ref=MAIN_REF
+):
     if any(ch in prefix for ch in "\r\n\0"):
         raise VersionError("tag prefix contains a line break")
     if source not in ("commits", "caller"):
@@ -134,8 +140,12 @@ def plan(repo, prefix, source, caller_version, deploy=True, published="unknown")
     if at_head:
         parsed, tag = max(at_head)
         if deploy:
-            newest = newest_tag(tag_lines(repo), prefix)
-            if parsed < newest[0]:
+            if commit_of_ref(repo, main_ref) is None:
+                raise VersionError(
+                    f"{main_ref} is not in the checkout, so the newest published version cannot be judged; fetch with full depth"
+                )
+            newest = newest_tag(tag_lines(repo, "--merged", main_ref), prefix)
+            if newest is not None and parsed < newest[0]:
                 raise VersionError(
                     f"This run is for {tag}, but {newest[1]} is already published. "
                     "Roll back or release anew; an old build is never replayed."
@@ -185,6 +195,7 @@ def main(argv):
     parser.add_argument("--version", default="")
     parser.add_argument("--deploy", choices=("true", "false"), default="true")
     parser.add_argument("--published", choices=PUBLISHED, default="unknown")
+    parser.add_argument("--main-ref", default=MAIN_REF)
     args = parser.parse_args(argv[1:])
     try:
         result = plan(
@@ -194,6 +205,7 @@ def main(argv):
             args.version,
             args.deploy == "true",
             args.published,
+            args.main_ref,
         )
     except VersionError as err:
         message = " ".join(str(err).split())

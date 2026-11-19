@@ -425,7 +425,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                 cwd=repo, check=True, capture_output=True, text=True,
             ).stdout.strip()
 
-        def run(case_head, rollback="", extra_commit=False):
+        def run(case_head, rollback="", extra_commit=False, origin=True):
             with tempfile.TemporaryDirectory() as tmp:
                 tmp = Path(tmp)
                 repo, scripts = tmp / "repo", tmp / "scripts"
@@ -438,6 +438,8 @@ class ReusableWorkflowTests(unittest.TestCase):
                 git(repo, "tag", "v0.1.0")
                 git(repo, "commit", "--allow-empty", "-q", "-m", "feat: second")
                 git(repo, "tag", "v0.2.0")
+                if origin:
+                    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
                 if case_head == "first":
                     git(repo, "checkout", "-q", first)
                 if extra_commit:
@@ -470,6 +472,11 @@ class ReusableWorkflowTests(unittest.TestCase):
         result, outputs, _ = run("main")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((outputs["mode"], outputs["version"]), ("resume", "0.2.0"))
+
+        result, outputs, summary = run("main", origin=False)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(outputs, {})
+        self.assertIn("origin/main is not in the checkout", summary)
 
         result, outputs, _ = run("main", extra_commit=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

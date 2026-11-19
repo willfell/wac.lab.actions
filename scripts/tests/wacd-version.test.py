@@ -97,6 +97,7 @@ class RepoTest(unittest.TestCase):
         git(self.repo, "tag", name, ref)
 
     def plan(self, prefix="v", source="commits", caller=None, **kw):
+        kw.setdefault("main_ref", "main")
         return version.plan(self.repo, prefix, source, caller, **kw)
 
     def test_first_release_without_tags(self):
@@ -172,15 +173,32 @@ class RepoTest(unittest.TestCase):
             with self.subTest(published=published):
                 self.assertEqual(self.refusal(published=published), sentence)
 
-    def test_the_newest_version_is_judged_across_every_branch(self):
-        self.commit("feat: first")
-        self.tag("v0.1.0")
-        base = git(self.repo, "rev-parse", "HEAD")
-        git(self.repo, "checkout", "-q", "-b", "elsewhere")
-        self.commit("feat: elsewhere")
+    def test_a_higher_tag_off_main_does_not_make_main_s_newest_old(self):
+        self.two_releases()
+        git(self.repo, "checkout", "-q", "-b", "stray", "HEAD~1")
+        self.commit("feat: stray")
+        self.tag("v0.9.0")
+        git(self.repo, "checkout", "-q", "main")
+        self.assertEqual(
+            self.plan(), {"mode": "resume", "version": "0.2.0", "tag": "v0.2.0"}
+        )
+
+    def test_a_higher_tag_on_main_makes_an_older_head_old(self):
+        first, _ = self.two_releases()
+        self.commit("feat: third")
         self.tag("v0.3.0")
-        git(self.repo, "checkout", "-q", base)
-        self.assertIn("but v0.3.0 is already published", self.refusal())
+        git(self.repo, "checkout", "-q", first)
+        self.assertIn(
+            "This run is for v0.1.0, but v0.3.0 is already published", self.refusal()
+        )
+
+    def test_a_missing_main_ref_fails_instead_of_judging_by_every_tag(self):
+        self.two_releases()
+        message = self.refusal(main_ref="origin/main")
+        self.assertIn("origin/main is not in the checkout", message)
+        self.assertEqual(
+            self.plan(main_ref="origin/main", deploy=False)["mode"], "none"
+        )
 
     def test_other_tag_families_do_not_make_a_version_old(self):
         first, _ = self.two_releases()
@@ -386,6 +404,7 @@ class CliTest(unittest.TestCase):
         self.repo = Path(self._tmp.name)
         git(self.repo, "-c", "init.defaultBranch=main", "init", "-q")
         git(self.repo, "commit", "--allow-empty", "-q", "-m", "feat: first")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
 
     def cli(self, *args):
         return subprocess.run(
