@@ -52,7 +52,21 @@ with a sentence. A Release that cannot be read (anything but 200 or 404)
 fails, never counting as absent. It prints reuse=<X or empty>. Only the
 candidates' Releases are read, never V's.
 
-Both settings reads take `--deadline <epoch seconds>`, the plan step's one
+`unfinished-release --app A --prefix P --running V --versions L --codes K`
+refuses the settings release behind an unfinished code release, before any
+version is chosen. L is the versions on main above V, newest first, and K
+those of them a code release claimed (wacd-version.py's above= and codes=). It
+reads deploy/<app>:<version> at the push address for each, newest first. The
+first present chart ends the scan: that version published, and a code release
+below it can no longer be re-run anyway (a replay). An absent chart that K
+names exits UNFINISHED_EXIT (5) with UNFINISHED: a settings version above it
+would overtake that claim, and re-running the code release would then be
+refused. An absent chart K does not name is a settings release's claim, which
+the settings plan takes again, and is passed over. At most MAX_EARLIER charts
+are read, and running out of them fails with a sentence. A chart that cannot
+be read fails, never counting as absent. It prints unfinished=none.
+
+All three settings reads take `--deadline <epoch seconds>`, the plan step's one
 wall-clock deadline. The status wait ends DEADLINE_MARGIN seconds before it,
 starts no request with under MIN_READ_SECONDS of that wait left, and bounds
 each read by the time left, so an app that never settles reaches the rollout
@@ -115,12 +129,17 @@ RELEASED_MODES = ("release", "resume", "rollback", "settings")
 REASON_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 ROLLING_OUT_EXIT = 3
 ALREADY_RELEASED_EXIT = 4
+UNFINISHED_EXIT = 5
 MAX_EARLIER = 25
 DEADLINE_MARGIN = 15
 MIN_READ_SECONDS = 2
 ALREADY_RELEASED = (
     "Revision {revision} was released as {earlier}, and {running} runs now after a rollback. To put those "
     "settings on the running code, make them live again in hemi; they are released as a new revision."
+)
+UNFINISHED = (
+    "{tag} was claimed by a code release that never published; re-run that release, or release a new commit, "
+    "before releasing settings."
 )
 STATUS_REFUSED = (
     "The gateway refused the status read (HTTP 403 with no reason), so the running version is unknown "
@@ -218,6 +237,10 @@ class RollingOut(ReleaseError):
 
 class AlreadyReleased(ReleaseError):
     """Rule B: an earlier version above the running one ran with this revision."""
+
+
+class Unfinished(ReleaseError):
+    """A code release above the running version claimed its tag and never published its chart."""
 
 
 class Deadline(ReleaseError):
@@ -551,6 +574,28 @@ def earlier_release(revision, running, versions, claimed, prefix, app):
     return reuse
 
 
+def chart_published(app, version, timeout):
+    """Whether deploy/<app>:<version> is in the registry, read at the push address."""
+    try:
+        return chart.chart_config(chart.PUSH_REGISTRY, app, version, timeout) is not None
+    except chart.ChartError as error:
+        raise ReleaseError(str(error)) from None
+
+
+def unfinished_release(running, versions, codes, prefix, app, deadline):
+    """Refuse while the newest code release above running (versions newest first) never published."""
+    for checked, version in enumerate(versions):
+        if checked == MAX_EARLIER:
+            raise ReleaseError(
+                f"{MAX_EARLIER} versions above {running} were read and none was published, so whether a code "
+                "release is unfinished is unknown; the settings plan stops here and nothing was tagged"
+            )
+        if chart_published(app, version, max(1, min(chart.TIMEOUT, deadline - time.time()))):
+            return
+        if version in codes:
+            raise Unfinished(UNFINISHED.format(tag=prefix + version))
+
+
 def expire(signum, frame):
     raise Deadline("a read did not finish within the settings plan's deadline, so nothing was tagged")
 
@@ -819,6 +864,10 @@ def build_parser():
     for name in ("--app", "--prefix", "--revision", "--running", "--versions", "--claimed"):
         earlier.add_argument(name, required=True)
     earlier.add_argument("--deadline", type=float)
+    unfinished = commands.add_parser("unfinished-release")
+    for name in ("--app", "--prefix", "--running", "--versions", "--codes"):
+        unfinished.add_argument(name, required=True)
+    unfinished.add_argument("--deadline", type=float, required=True)
     gh = commands.add_parser("github-release")
     gh.add_argument("--tag", required=True)
     gh.add_argument("--sha", required=True)
@@ -828,6 +877,19 @@ def build_parser():
 def run(args):
     if args.command == "github-release":
         return github_release(args.tag, args.sha, os.environ)
+    if args.command == "unfinished-release":
+        versions = [v for v in args.versions.split(",") if v]
+        codes = [v for v in args.codes.split(",") if v]
+        if any(not VERSION_PATTERN.fullmatch(v) for v in versions + codes):
+            raise ReleaseError("--versions and --codes must be X.Y.Z")
+        if not set(codes) <= set(versions):
+            raise ReleaseError("--codes must name only versions in --versions")
+        _, previous = arm_deadline(args.deadline)
+        try:
+            unfinished_release(args.running, versions, set(codes), args.prefix, args.app, args.deadline)
+        finally:
+            disarm(previous)
+        return "unfinished=none"
     if args.command == "earlier-release":
         if not chart.DECIMAL.fullmatch(args.revision):
             raise ReleaseError("--revision must be a decimal")
@@ -907,6 +969,8 @@ def main(argv):
         print("wacd release: " + " ".join(str(err).split()), file=sys.stderr)
         if isinstance(err, RollingOut):
             return ROLLING_OUT_EXIT
+        if isinstance(err, Unfinished):
+            return UNFINISHED_EXIT
         return ALREADY_RELEASED_EXIT if isinstance(err, AlreadyReleased) else 1
     except Exception:
         print("wacd release: unexpected failure", file=sys.stderr)

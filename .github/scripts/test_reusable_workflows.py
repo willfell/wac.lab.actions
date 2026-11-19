@@ -946,6 +946,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                 "PROFILE_IMAGES": json.dumps([{"name": "web", "dockerfile": "Dockerfile", "context": "."}]),
                 "GITHUB_TOKEN": "job-token"}, 0)],
             ("plan", "Refuse a settings release while the app is rolling out"): [refusal],
+            ("plan", "Refuse a settings release behind an unfinished code release"): [refusal],
             ("plan", "Refuse a settings release behind a workflow change"): [refusal],
             ("plan", "Plan the version"): [(code, 0), ({**code, "ROLLBACK_VERSION": "1.4.2"}, 0), (settings, 0)],
             ("plan", "Refuse to replay an old version"): [refusal],
@@ -1015,8 +1016,9 @@ class ReusableWorkflowTests(unittest.TestCase):
             "wacd-release.py running": (f"running=1.4.2\ncommit={head}\nimages={json.dumps(running)}\n"
                                         "copy_revision=6\nfleet_commit=" + "f" * 40),
             "wacd-release.py earlier-release": "reuse=",
+            "wacd-release.py unfinished-release": "unfinished=none",
             "wacd-release.py": "Verified",
-            "wacd-version.py --mode settings": "mode=settings\nversion=1.4.3\ntag=v1.4.3\nclaimed=\nabove=",
+            "wacd-version.py --mode settings": "mode=settings\nversion=1.4.3\ntag=v1.4.3\nclaimed=\nabove=\ncodes=",
             "wacd-version.py": "mode=release\nversion=1.4.3\ntag=v1.4.3",
             "wacd-chart.py chart-revision": f"revision={head}",
             "wacd-chart.py chart-images": "images=" + json.dumps(running),
@@ -1367,12 +1369,19 @@ class ReusableWorkflowTests(unittest.TestCase):
         settings = steps[names.index("Plan the settings release")]
         refusal = steps[names.index("Refuse a settings release behind a workflow change")]
         rollout = steps[names.index("Refuse a settings release while the app is rolling out")]
+        unfinished = steps[names.index("Refuse a settings release behind an unfinished code release")]
         self.assertEqual(settings["id"], "settings")
         self.assertEqual(settings["if"], "inputs.settings_revision != ''")
         self.assertEqual(refusal["if"], "${{ steps.settings.outputs.workflow_refused != '' }}")
         self.assertEqual(refusal["env"], {"REASON": "${{ steps.settings.outputs.workflow_refused }}"})
         self.assertEqual(rollout["if"], "${{ steps.settings.outputs.rollout_refused != '' }}")
         self.assertEqual(rollout["env"], {"REASON": "${{ steps.settings.outputs.rollout_refused }}"})
+        self.assertEqual(unfinished["if"], "${{ steps.settings.outputs.unfinished_refused != '' }}")
+        self.assertEqual(unfinished["env"], {"REASON": "${{ steps.settings.outputs.unfinished_refused }}"})
+        for refusal_step in (rollout, unfinished, refusal):
+            with self.subTest(refusal=refusal_step["name"]):
+                self.assertIsInstance(refusal_step["timeout-minutes"], int)
+                self.assertNotIn("continue-on-error", refusal_step, "a refusal fails plan, never a green run")
         self.assertEqual(
             names.index("Read the wacd profile") + 1, names.index("Plan the settings release"),
             "the settings plan reads the copy's profile",
@@ -1382,6 +1391,10 @@ class ReusableWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(
             names.index("Refuse a settings release while the app is rolling out") + 1,
+            names.index("Refuse a settings release behind an unfinished code release"),
+        )
+        self.assertEqual(
+            names.index("Refuse a settings release behind an unfinished code release") + 1,
             names.index("Refuse a settings release behind a workflow change"),
         )
         self.assertEqual(
@@ -1395,14 +1408,19 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(plan["outputs"]["source_images"], "${{ steps.settings.outputs.images }}")
         self.assertEqual(settings["env"]["GITHUB_TOKEN"], "${{ github.token }}", "the GitHub Release read")
         self.assertIn("deadline=$(( $(date +%s) + 120 ))", settings["run"])
-        self.assertEqual(settings["run"].count('--deadline "$deadline"'), 2, "both network reads share the deadline")
+        self.assertEqual(settings["run"].count('--deadline "$deadline"'), 3, "every network read shares the deadline")
         self.assertNotIn("wacd-chart.py", settings["run"], "every registry read happens inside the bounded reads")
         self.assertEqual(plan["permissions"], {"contents": "write", "id-token": "write"}, "no permission was added")
 
     def settings_plan(self, *, running="1.4.2", copy_revision="7", revision="7", source="hemi", charts=None,
                       workflow_change=False, rollback=False, extra_tags=(), claim="pushed", profile_images=None,
-                      running_copy="6", status_exit=0, earlier="reuse=", running_fleet="f" * 40, status_err=None):
-        """Run plan's settings steps against a temp repo, real wacd-version.py and stub gateway and registry reads."""
+                      running_copy="6", status_exit=0, earlier="reuse=", running_fleet="f" * 40, status_err=None,
+                      published=("1.3.9", "1.4.2"), unfinished_err=None):
+        """Run plan's settings steps against a temp repo, real wacd-version.py and stub gateway and registry reads.
+
+        unfinished-release is the real script over a stand-in registry holding the charts in published, where
+        "unreadable" makes every chart read fail.
+        """
         import os
         import shutil
         import subprocess
@@ -1413,6 +1431,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         settings_step = by_name["Plan the settings release"]
         refusal_step = by_name["Refuse a settings release behind a workflow change"]
         rollout_step = by_name["Refuse a settings release while the app is rolling out"]
+        unfinished_step = by_name["Refuse a settings release behind an unfinished code release"]
         version_step = by_name["Plan the version"]
 
         def git(repo, *args):
@@ -1444,7 +1463,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         else:
             git(repo, "commit", "--allow-empty", "-q", "-m", "docs: later")
         for tag, where in extra_tags:
-            git(repo, "tag", tag, {"code": code, "old": old}[where])
+            git(repo, "tag", tag, {"code": code, "old": old, "head": git(repo, "rev-parse", "HEAD")}[where])
         head = git(repo, "rev-parse", "HEAD")
         git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
         source_commit = old if rollback else code
@@ -1462,6 +1481,21 @@ class ReusableWorkflowTests(unittest.TestCase):
             "    sys.exit(print(os.environ['STUB_STATUS_ERR'], end='', file=sys.stderr) or 3)\n"
             "if code == 3:\n"
             "    sys.exit(print('wacd release: app was rolling out 1.4.2 for the whole 120 seconds', file=sys.stderr) or 3)\n"
+            "if sys.argv[1] == 'unfinished-release' and 'STUB_UNFINISHED_ERR' in os.environ:\n"
+            "    sys.exit(print(os.environ['STUB_UNFINISHED_ERR'], end='', file=sys.stderr) or 5)\n"
+            "if sys.argv[1] == 'unfinished-release':\n"
+            "    import importlib.util\n"
+            "    spec = importlib.util.spec_from_file_location('real', os.environ['STUB_REAL_RELEASE'])\n"
+            "    real = importlib.util.module_from_spec(spec)\n"
+            "    spec.loader.exec_module(real)\n"
+            "    published = json.loads(os.environ['STUB_PUBLISHED'])\n"
+            "    def chart_config(registry, app, version, timeout=30):\n"
+            "        assert registry == 'registry.network.svc.cluster.local:5000', registry\n"
+            "        if 'unreadable' in published:\n"
+            "            raise real.chart.ChartError('cannot reach the registry at http://' + registry)\n"
+            "        return {'name': app, 'version': version} if version in published else None\n"
+            "    real.chart.chart_config = chart_config\n"
+            "    sys.exit(real.main(['wacd-release.py', *sys.argv[1:]]))\n"
             "if code:\n"
             "    sys.exit(print('wacd release: the gateway reports an unknown version', file=sys.stderr) or 1)\n"
             "if sys.argv[1] == 'earlier-release':\n"
@@ -1512,9 +1546,12 @@ class ReusableWorkflowTests(unittest.TestCase):
                "SOURCE": source, "COPY_REVISION": copy_revision, "APP": "app", "TAG_PREFIX": "v",
                "PROFILE_IMAGES": json.dumps(profile), "STUB_LOG": str(log), "STUB_RUNNING": running,
                "STUB_CHARTS": json.dumps(charts), "STUB_CLAIM": claim, "STUB_STATUS_EXIT": str(status_exit),
-               "STUB_EARLIER": earlier, "GITHUB_TOKEN": "job-token", "FLEET_COMMIT": "f" * 40}
+               "STUB_EARLIER": earlier, "GITHUB_TOKEN": "job-token", "FLEET_COMMIT": "f" * 40,
+               "STUB_REAL_RELEASE": str(root / "scripts" / "wacd-release.py"), "STUB_PUBLISHED": json.dumps(published)}
         if status_err is not None:
             env["STUB_STATUS_ERR"] = status_err
+        if unfinished_err is not None:
+            env["STUB_UNFINISHED_ERR"] = unfinished_err
         self.assertEqual(set(settings_step["env"]), {"SETTINGS_REVISION", "SOURCE", "COPY_REVISION", "APP",
                                                      "TAG_PREFIX", "PROFILE_IMAGES", "GITHUB_TOKEN"})
 
@@ -1532,6 +1569,12 @@ class ReusableWorkflowTests(unittest.TestCase):
         if settings_outputs.get("rollout_refused"):
             plan["refusal"] = subprocess.run(
                 ["bash", "-c", rollout_step["run"]], env={**env, "REASON": settings_outputs["rollout_refused"]},
+                capture_output=True, text=True,
+            )
+            return plan
+        if settings_outputs.get("unfinished_refused"):
+            plan["refusal"] = subprocess.run(
+                ["bash", "-c", unfinished_step["run"]], env={**env, "REASON": settings_outputs["unfinished_refused"]},
                 capture_output=True, text=True,
             )
             return plan
@@ -1618,6 +1661,81 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertIn(f"::error::wac-cd: {sentence}", refusal.stdout)
         self.assertIn(sentence, plan["summary"].read_text())
         self.assertNotIn("wacd-tag.py", plan["log"].read_text())
+
+    UNFINISHED = ("v1.4.3 was claimed by a code release that never published; re-run that release, or release a "
+                  "new commit, before releasing settings.")
+
+    def unfinished_call(self, plan):
+        return next(line for line in plan["log"].read_text().splitlines() if "unfinished-release" in line)
+
+    def test_wac_cd_settings_release_behind_an_unfinished_code_release_is_refused_by_its_own_step(self):
+        """A code release claimed v1.4.3 on main's head and failed before publishing; a settings release follows."""
+        for label, kw in (("on the running code", {}), ("after a rollback", {"running": "1.3.9", "rollback": True})):
+            with self.subTest(case=label):
+                plan = self.settings_plan(extra_tags=(("v1.4.3", "head"),), **kw)
+                self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+                self.assertEqual(set(plan["settings_outputs"]), {"unfinished_refused"}, "no mode, version or tag is left")
+                refusal = plan["refusal"]
+                self.assertEqual(refusal.returncode, 1)
+                self.assertIn(self.UNFINISHED, refusal.stderr)
+                self.assertIn(f"::error::wac-cd: {self.UNFINISHED}", refusal.stdout)
+                self.assertIn(self.UNFINISHED, plan["summary"].read_text())
+                calls = plan["log"].read_text()
+                self.assertNotIn("wacd-tag.py", calls, "nothing tagged")
+                self.assertNotIn("earlier-release", calls, "refused before the version is chosen")
+                self.assertRegex(self.unfinished_call(plan),
+                                 r"^wacd-release\.py unfinished-release --app app --prefix v --running \S+ "
+                                 r"--versions 1\.4\.3(,1\.4\.2)? --codes 1\.4\.3(,1\.4\.2)? --deadline \d+$")
+        self.assertFalse(self.runs(self.wac_cd()["jobs"]["retag"], ""), "with no mode, nothing is retagged")
+
+    def test_wac_cd_settings_release_above_published_versions_is_not_refused_as_unfinished(self):
+        for label, kw, expected in (
+            ("no version above the running one", {}, "1.4.3"),
+            ("a rollback target's newer release", {"running": "1.3.9", "rollback": True}, "1.4.3"),
+            ("a newer code release that published", {"extra_tags": (("v1.4.3", "head"),),
+                                                       "published": ("1.4.2", "1.4.3")}, "1.4.4"),
+            ("a settings claim on the running code with no chart", {"extra_tags": (("v1.4.3", "code"),),
+                                                                     "earlier": "reuse=1.4.3"}, "1.4.3"),
+        ):
+            with self.subTest(case=label):
+                plan = self.settings_plan(**kw)
+                self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+                self.assertNotIn("unfinished_refused", plan["settings_outputs"])
+                self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+                self.assertEqual((plan["version_outputs"]["mode"], plan["version_outputs"]["version"]),
+                                 ("settings", expected))
+                self.unfinished_call(plan)
+
+    def test_wac_cd_an_unreadable_registry_is_a_fault_never_an_unfinished_release(self):
+        plan = self.settings_plan(extra_tags=(("v1.4.3", "head"),), published=("unreadable",))
+        self.assertEqual(plan["settings"].returncode, 1, plan["settings"].stdout)
+        self.assertIn("::error::wac-cd: wacd release: cannot reach the registry", plan["settings"].stdout)
+        self.assertEqual(plan["settings_outputs"], {})
+        self.assertNotIn("wacd-tag.py", plan["log"].read_text())
+
+    def test_wac_cd_an_unfinished_release_refusal_with_no_sentence_fails_the_planning_step(self):
+        for err in ("", "wacd release: \n"):
+            with self.subTest(stderr=err):
+                plan = self.settings_plan(unfinished_err=err)
+                self.assertEqual(plan["settings"].returncode, 1, plan["settings"].stdout + plan["settings"].stderr)
+                self.assertIn("::error::wac-cd: The settings release was refused behind an unfinished code release, "
+                              "and the refusal gave no reason.", plan["settings"].stdout)
+                self.assertEqual(plan["settings_outputs"], {})
+
+    def test_wac_cd_only_a_settings_run_reaches_the_unfinished_release_check(self):
+        """Push, rollback and deploy: false runs skip Plan the settings release, the only step that reads it."""
+        plan = self.wac_cd()["jobs"]["plan"]
+        holders = [s.get("name") for job in self.wac_cd()["jobs"].values() for s in job["steps"]
+                   if "unfinished" in json.dumps(s)]
+        self.assertEqual(holders, ["Plan the settings release",
+                                   "Refuse a settings release behind an unfinished code release"])
+        steps = {s.get("name"): s for s in plan["steps"]}
+        self.assertEqual(steps["Plan the settings release"]["if"], "inputs.settings_revision != ''")
+        self.assertIn("steps.settings.outputs.", steps["Refuse a settings release behind an unfinished code release"]["if"])
+        trigger = steps["Check the trigger"]["run"]
+        self.assertIn("rollback_version or settings_revision, not both", trigger)
+        self.assertIn("settings_revision cannot be combined with deploy: false", trigger)
+        self.assertIn("settings_revision is accepted only on workflow_dispatch", trigger)
 
     def test_wac_cd_settings_rerun_never_spends_a_second_version_on_one_revision(self):
         live = self.settings_plan(running="1.4.3", running_copy="7", extra_tags=(("v1.4.3", "code"),))
@@ -1912,7 +2030,8 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertNotIn("wacd-release.py release", step.get("run", ""), "only one step patches the cluster")
         plan = [s.get("name") for s in jobs["plan"]["steps"]]
         for name in ("Refuse a settings release behind a workflow change",
-                     "Refuse a settings release while the app is rolling out", "Refuse to replay an old version"):
+                     "Refuse a settings release while the app is rolling out",
+                     "Refuse a settings release behind an unfinished code release", "Refuse to replay an old version"):
             self.assertIn(name, plan)
 
     def test_wac_cd_the_status_read_comes_out_of_plan_s_budget(self):

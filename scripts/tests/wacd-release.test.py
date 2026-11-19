@@ -959,6 +959,111 @@ class EarlierReleaseTests(unittest.TestCase):
             wacd.release_exists("v1.4.4")
 
 
+_CHART_TESTS_SPEC = importlib.util.spec_from_file_location(
+    "wacd_release_chart_tests", Path(__file__).with_name("wacd-chart.test.py")
+)
+_CHART_TESTS = importlib.util.module_from_spec(_CHART_TESTS_SPEC)
+_CHART_TESTS_SPEC.loader.exec_module(_CHART_TESTS)
+Registry = _CHART_TESTS.Registry
+
+
+class UnfinishedReleaseTests(unittest.TestCase):
+    """A settings release waits for the newest code release above the running version to publish its chart."""
+
+    SENTENCE = ("wacd release: {tag} was claimed by a code release that never published; re-run that release, "
+                "or release a new commit, before releasing settings.\n")
+
+    def setUp(self):
+        self.registry = Registry()
+        self.addCleanup(self.registry.close)
+        address = patch.object(wacd.chart, "PUSH_REGISTRY", self.registry.address)
+        address.start()
+        self.addCleanup(address.stop)
+
+    def run_cli(self, versions, codes, published=(), deadline=60.0, prefix="v"):
+        for version in published:
+            self.registry.put_chart("travel", version)
+        self.registry.requests.clear()
+        code, out, err = CliTests.main(
+            self, "unfinished-release", "--app", "travel", "--prefix", prefix, "--running", "1.4.2",
+            "--versions", versions, "--codes", codes, "--deadline", str(time.time() + deadline))
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0), "the backstop is disarmed")
+        read = [path.split("/manifests/")[1] for path, _ in self.registry.requests if "/manifests/" in path]
+        return read, (code, out, err)
+
+    def test_the_newest_code_claim_with_no_chart_refuses_naming_its_tag(self):
+        read, result = self.run_cli("1.4.3", "1.4.3", published=("1.4.2",))
+        self.assertEqual(result, (wacd.UNFINISHED_EXIT, "", self.SENTENCE.format(tag="v1.4.3")))
+        self.assertEqual(read, ["1.4.3"], "only versions above the running one are read")
+        _, result = self.run_cli("2.0.0", "2.0.0", prefix="travel-v")
+        self.assertEqual(result[2], self.SENTENCE.format(tag="travel-v2.0.0"))
+
+    def test_a_published_version_above_ends_the_scan_without_a_refusal(self):
+        for label, versions, codes, published in (
+            ("a rollback target's newer releases", "1.4.4,1.4.3", "1.4.4,1.4.3", ("1.4.4", "1.4.3")),
+            ("a code claim below a published release", "1.4.5,1.4.4,1.4.3", "1.4.5,1.4.3", ("1.4.5", "1.4.4")),
+        ):
+            with self.subTest(case=label):
+                read, result = self.run_cli(versions, codes, published=published)
+                self.assertEqual(result, (0, "unfinished=none\n", ""))
+                self.assertEqual(read, [versions.split(",")[0]], "the newest published version settles it")
+
+    def test_a_settings_claim_with_no_chart_is_passed_over(self):
+        read, result = self.run_cli("1.4.4,1.4.3", "1.4.3")
+        self.assertEqual(result, (wacd.UNFINISHED_EXIT, "", self.SENTENCE.format(tag="v1.4.3")))
+        self.assertEqual(read, ["1.4.4", "1.4.3"])
+        read, result = self.run_cli("1.4.4", "")
+        self.assertEqual(result, (0, "unfinished=none\n", ""), "its own re-run takes that claim again")
+
+    def test_no_versions_above_reads_nothing(self):
+        read, result = self.run_cli("", "")
+        self.assertEqual((read, result), ([], (0, "unfinished=none\n", "")))
+
+    def test_a_registry_that_cannot_be_read_is_a_fault_never_absent(self):
+        self.registry.put_manifest("deploy/travel", "1.4.3", "sha256:" + "b" * 64, "x", status=500)
+        read, (code, out, err) = self.run_cli("1.4.3", "1.4.3")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("the registry answered HTTP 500", err)
+        with patch.object(wacd.chart, "PUSH_REGISTRY", "127.0.0.1:9"):
+            read, (code, out, err) = self.run_cli("1.4.3", "1.4.3")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("cannot reach the registry", err)
+
+    def test_the_count_is_bounded_with_a_sentence(self):
+        versions = ",".join(f"1.5.{n}" for n in range(40, 0, -1))
+        read, (code, out, err) = self.run_cli(versions, "")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(read), wacd.MAX_EARLIER)
+        self.assertIn(f"{wacd.MAX_EARLIER} versions above 1.4.2", err)
+
+    def test_the_arguments_are_checked_before_any_read(self):
+        for versions, codes in (("1.4.3", "1.4.4"), ("v1.4.3", ""), ("1.4.3", "x")):
+            with self.subTest(versions=versions, codes=codes):
+                read, (code, _, err) = self.run_cli(versions, codes)
+                self.assertEqual((code, read), (1, []), err)
+
+    def test_the_reads_end_at_the_deadline(self):
+        class Silent(BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(10)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Silent)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        started = time.monotonic()
+        with patch.object(wacd.chart, "PUSH_REGISTRY", f"127.0.0.1:{server.server_address[1]}"):
+            _, (code, out, err) = self.run_cli("1.4.3", "1.4.3", deadline=2)
+        self.assertEqual((code, out), (1, ""), err)
+        self.assertLess(time.monotonic() - started, 5, "a registry that never answers is cut off at the deadline")
+        _, (code, _, err) = self.run_cli("1.4.3", "1.4.3", deadline=-1)
+        self.assertEqual(code, 1)
+        self.assertIn("deadline had passed", err)
+
+
 class ServedTests(unittest.TestCase):
     def serve(self, *responses, sha=SOURCE, expect_db=True, timeout=1):
         health = Health(*responses)

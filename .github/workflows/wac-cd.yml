@@ -298,6 +298,20 @@ jobs:
           version="$(sed -n 's/^version=//p' <<< "$planned")"
           claimed="$(sed -n 's/^claimed=//p' <<< "$planned")"
           above="$(sed -n 's/^above=//p' <<< "$planned")"
+          codes="$(sed -n 's/^codes=//p' <<< "$planned")"
+          code=0
+          python3 "$WACD_SCRIPTS"/wacd-release.py unfinished-release --app "$APP" --prefix "$TAG_PREFIX" \
+            --running "$running" --versions "$above" --codes "$codes" \
+            --deadline "$deadline" > /dev/null 2> "$RUNNER_TEMP/settings.err" || code=$?
+          if [[ "$code" -eq 5 ]]; then
+            reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
+            [[ -n "$reason" ]] || fail "The settings release was refused behind an unfinished code release, and the refusal gave no reason."
+            printf 'unfinished_refused=%s\n' "$reason" >> "$GITHUB_OUTPUT"
+            echo "wac-cd: settings release refused behind an unfinished code release; the next step reports it"
+            exit 0
+          elif [[ "$code" -ne 0 ]]; then
+            fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/ *$//')"
+          fi
           if [[ "$live" == "$SETTINGS_REVISION" ]]; then
             version="$running"
           else
@@ -340,6 +354,21 @@ jobs:
         shell: bash
         env:
           REASON: ${{ steps.settings.outputs.rollout_refused }}
+        run: |
+          echo "wac-cd: $REASON" >&2
+          echo "::error::wac-cd: $REASON"
+          {
+            echo "### wac-cd plan"
+            echo
+            echo "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - name: Refuse a settings release behind an unfinished code release
+        timeout-minutes: 1
+        if: ${{ steps.settings.outputs.unfinished_refused != '' }}
+        shell: bash
+        env:
+          REASON: ${{ steps.settings.outputs.unfinished_refused }}
         run: |
           echo "wac-cd: $REASON" >&2
           echo "::error::wac-cd: $REASON"

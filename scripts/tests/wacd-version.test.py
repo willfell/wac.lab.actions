@@ -502,13 +502,13 @@ class SettingsTest(unittest.TestCase):
         self.commit("feat: merged, not released yet")
         self.assertEqual(
             self.settings(self.code, "1.4.2"),
-            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": ""},
+            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": "", "codes": ""},
         )
 
     def test_after_a_rollback_it_still_releases_above_the_newest(self):
         self.assertEqual(
             self.settings(self.old, "1.3.9"),
-            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": "1.4.2"},
+            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": "1.4.2", "codes": "1.4.2"},
         )
 
     def test_above_names_every_version_on_main_newer_than_the_running_one_newest_first(self):
@@ -526,11 +526,25 @@ class SettingsTest(unittest.TestCase):
         git(self.repo, "tag", "v1.4.3", self.code)
         self.assertEqual(
             self.settings(self.code, "1.4.2"),
-            {"mode": "settings", "version": "1.4.4", "tag": "v1.4.4", "claimed": "1.4.3", "above": "1.4.3"},
+            {"mode": "settings", "version": "1.4.4", "tag": "v1.4.4", "claimed": "1.4.3", "above": "1.4.3", "codes": ""},
         )
         self.assertEqual(self.settings(self.code, "1.4.3")["claimed"], "", "a running version is not a pending claim")
         git(self.repo, "tag", "v1.4.0", self.old)
         self.assertEqual(self.settings(self.old, "1.3.9")["claimed"], "", "only main's newest tag can be a claim")
+
+    def test_codes_names_the_versions_above_that_a_code_release_claimed(self):
+        """A code release tags a commit no lower tag names; a settings release tags code an earlier version ran."""
+        git(self.repo, "tag", "v1.4.3", self.code)
+        git(self.repo, "tag", "-a", "-m", "settings", "v1.4.4", self.old)
+        self.assertEqual(self.settings(self.code, "1.4.2")["codes"], "", "settings tags, lightweight or annotated")
+        claimed = self.commit("fix: claimed, build failed")
+        git(self.repo, "tag", "v1.4.5", claimed)
+        git(self.repo, "tag", "ui-v0.1.0", claimed)
+        planned = self.settings(self.code, "1.4.2")
+        self.assertEqual((planned["above"], planned["codes"]), ("1.4.5,1.4.4,1.4.3", "1.4.5"))
+        self.assertEqual(self.settings(self.old, "1.3.9")["codes"], "1.4.5,1.4.2",
+                         "after a rollback the newer code releases are named too")
+        self.assertEqual(self.settings(claimed, "1.4.5")["codes"], "", "only versions above the running one")
 
     def test_other_tag_families_do_not_count(self):
         git(self.repo, "tag", "ui-v5.0.0")
@@ -700,7 +714,7 @@ class CliTest(unittest.TestCase):
         result = self.cli("--mode", "settings", "--prefix", "v", "--commit", head, "--running", "1.4.2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            result.stdout.splitlines(), ["mode=settings", "version=1.4.3", "tag=v1.4.3", "claimed=", "above="]
+            result.stdout.splitlines(), ["mode=settings", "version=1.4.3", "tag=v1.4.3", "claimed=", "above=", "codes="]
         )
         for args in (
             ["--commit", head, "--running", "v1.4.2"],

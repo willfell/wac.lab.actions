@@ -429,7 +429,12 @@ commit, which has not been released; push a new commit to release it.` That is
 this sequence: commit c2's run claims `v1.0.1` and fails in build while `v1.0.0`
 (c1) keeps running; a settings release then tags `v1.0.2` on c1, the running
 code; "Re-run all jobs" on c2 is refused with that sentence, and only a new
-commit releases c2's changes, as `v1.0.3`. Git ancestry alone tells the two
+commit releases c2's changes, as `v1.0.3`. From `v1.36.0` that settings
+release is refused instead, by `Refuse a settings release behind an unfinished
+code release` (**Settings-only releases**, rule 5), while c2's chart is
+unpublished, so "Re-run all jobs" on c2 stays the way out; the sentence is left
+for a c2 whose chart was published before its run failed, and for tags a
+settings release placed under an older pin. Git ancestry alone tells the two
 apart, so when c2 had been released and then rolled back before the settings
 release, the sentence still says it was never released.
 An untagged HEAD, or a tagged one that lacks a tag on main, gets `This commit is
@@ -612,8 +617,8 @@ copy as for any run, and then, in `Plan the settings release`:
    fails, since the save has not reached the fleet copy yet.
 2. Reads the running version V from a steady gateway `status`
    (`wacd-release.py running`). The step sets one wall-clock deadline, 120
-   seconds after it starts, and passes it as `--deadline` to both of its
-   network reads, this one and rule 5's. The status wait ends 15 seconds
+   seconds after it starts, and passes it as `--deadline` to each of its
+   three network reads: this one, rule 5's and rule 6's. The status wait ends 15 seconds
    before the deadline, starts no request with under 2 seconds of the wait
    left, and bounds each read by the time left, so an app that never settles
    reaches the rollout refusal with its sentence, unless GitHub's token
@@ -651,7 +656,27 @@ copy as for any run, and then, in `Plan the settings release`:
    which must be on `main`. The tag goes on C, not on `main`'s head, because a
    tagged head counts as released: a settings tag there would make the next
    code release resume onto old images. On C, the next merge versions above V'.
-5. Never spends a second version on one revision, and never undoes a
+5. Refuses the settings release behind an unfinished code release, before
+   rule 6 chooses between V and V' and before anything is tagged or retagged.
+   `wacd-version.py --mode settings` lists the versions on `main` above V
+   (`above=`) and those of them a code release claimed (`codes=`): a code
+   release tags a commit that no `<tag_prefix>X.Y.Z` tag names yet, while a
+   settings release tags code an earlier version already ran, so a version is
+   a code release's when no lower tag with the prefix sits on its commit.
+   `wacd-release.py unfinished-release` then reads `deploy/<app>:<version>` at
+   the push address for each, newest first, within the step's deadline, each
+   read bounded by the time left and the same `SIGALRM` backstop behind it.
+   The first chart present ends the scan: that version published, as a
+   rollback target's newer releases have, and a code release below it could
+   only be replayed. An absent chart of a code release records the refusal for
+   `Refuse a settings release behind an unfinished code release` (below): a
+   settings version above that claim would overtake it, and re-running the
+   code release, the way out, would then be refused. An absent chart of a
+   settings claim is passed over, since rule 6 takes that claim again. A chart
+   that cannot be read fails `plan` with a sentence and never counts as
+   absent, and the scan reads at most 25 charts, failing with a sentence when
+   it runs out of them. With no version above V nothing is read.
+6. Never spends a second version on one revision, and never undoes a
    rollback:
    - when V's chart already carries `settings_revision`, V' is V (a re-run
      after the release went live; releasing it again changes nothing);
@@ -683,7 +708,7 @@ copy as for any run, and then, in `Plan the settings release`:
      chart with an older revision, or with none (charts from before any
      copy); a version with no chart is skipped. It reads at most 25 charts,
      and running out of them fails `plan` with a sentence.
-6. Unless V' is V, compares `.github/workflows` at C with `origin/main`
+7. Unless V' is V, compares `.github/workflows` at C with `origin/main`
    (below). Re-proving the live version claims no new tag, so it needs no
    check.
 
@@ -712,20 +737,32 @@ the health check expects C.
 settings release` records the refusal as a step output and succeeds, setting
 no mode, version or tag, and the named step writes the sentence to stderr, an
 `::error::wac-cd:` annotation and the run summary, and exits 1, before
-anything is tagged or retagged. Both run only in `settings` mode and only
-then, and are skipped in every other run. They sit beside `Refuse to replay an
-old version`; hemi reads all three by job `cd / plan`, step name and
+anything is tagged or retagged. All three run only in `settings` mode and
+only then, and are skipped in every other run: a push, a rollback and a
+`deploy: false` run skip `Plan the settings release`, so none of them reads
+the charts above V or records a settings refusal. They sit beside `Refuse to
+replay an old version`; hemi reads all four by job `cd / plan`, step name and
 conclusion. Do not rename any of them. A refusal whose sentence comes out empty
 (the script printed none) never records an empty output, which would skip its
 step and leave a green run that released nothing: the planning step fails
 itself with a fixed sentence instead, such as `The settings release was refused
-while the app rolls out, and the refusal gave no reason.` or `This run was
-refused as a replay of an old version, and the refusal gave no reason.`
+while the app rolls out, and the refusal gave no reason.`, `The settings
+release was refused behind an unfinished code release, and the refusal gave no
+reason.` or `This run was refused as a replay of an old version, and the
+refusal gave no reason.`
 
 - `Refuse a settings release while the app is rolling out`: the status never
   became steady within the status wait, which ends 15 seconds before the
   step's 120-second deadline. The sentence names V and says no settings
   were released; dispatch again once the app settles.
+- `Refuse a settings release behind an unfinished code release`: a code
+  release claimed a version above V and its chart was never published (rule
+  5), for instance a run that failed in `build`. The step writes `<tag> was
+  claimed by a code release that never published; re-run that release, or
+  release a new commit, before releasing settings.`, naming the tag, such as
+  `v1.0.1`. Re-running that code release releases it; dispatch the settings
+  release again afterwards. After a rollback this holds too: the way out
+  releases that code over the rollback.
 - `Refuse a settings release behind a workflow change`: GitHub refuses a
   `GITHUB_TOKEN` tag push at a commit whose `.github/workflows` differ from the
   default branch's (**Why the tag comes first** below), and C is usually
@@ -734,7 +771,8 @@ refused as a replay of an old version, and the refusal gave no reason.`
   files changed since <V>, so its settings cannot be released on <C short>.`
 
 Every other failure in planning (a fault in the status, a copy that cannot be
-released on its own, an earlier release of the revision, a refused tag claim)
+released on its own, a chart above V that cannot be read, an earlier release of
+the revision, a refused tag claim)
 fails `Plan the settings release` or `Plan the version` itself.
 
 **How hemi reads the outcome.** A settings run released if and only if its
@@ -748,6 +786,7 @@ points at V' whatever happens next.
 | --- | --- | --- | --- | --- | --- |
 | Superseded | `success` | `cd / plan` `success`, and `cd / shadow`, `cd / retag`, `cd / publish`, `cd / deploy` and `cd / github-release` all `skipped`; summary `mode: none (a newer revision is live; its own release follows)` | no | no | no |
 | Behind a workflow change | `failure` | `cd / plan`, step `Refuse a settings release behind a workflow change` `failure` | no | no | no |
+| Behind an unfinished code release | `failure` | `cd / plan`, step `Refuse a settings release behind an unfinished code release` `failure`, sentence `<tag> was claimed by a code release that never published; re-run that release, or release a new commit, before releasing settings.` | no | no | no |
 | Mid-rollout | `failure` | `cd / plan`, step `Refuse a settings release while the app is rolling out` `failure` | no | no | no |
 | Already released, then rolled back | `failure` | `cd / plan`, step `Plan the settings release` `failure`, sentence `Revision <n> was released as <V'old>, and <V> runs now after a rollback. To put those settings on the running code, make them live again in hemi; they are released as a new revision.` | no | no | no |
 | Failed before deploying | `failure` | `cd / plan`, `cd / retag` or `cd / publish` `failure` with `cd / deploy` `skipped` | if `cd / plan` succeeded | if `cd / retag` succeeded | no |
@@ -768,7 +807,7 @@ the release" row reads the app's target instead.
 
 **Re-runs and rollbacks.** "Re-run failed jobs" reuses `plan`, so it releases
 the same V'; the retag finds V' already on the digests and writes nothing, and `publish` finds its chart.
-"Re-run all jobs" plans again and lands on the same V' by rule 5, or refuses
+"Re-run all jobs" plans again and lands on the same V' by rule 6, or refuses
 by it after a rollback. A settings release after a rollback ships the
 rolled-back version's digests on its code, above every published version. A
 re-run of C's own code-release run then sees V' on its HEAD: while V' is the
@@ -780,15 +819,16 @@ anything newer exists, **No replay of an old version** refuses it. When C was
 keeps the revision number is not released: the running version is re-proved
 unchanged. A hand edit must carry a new revision number (hemi's runbook).
 
-**Known limit: a settings release over an unfinished code release.** A
-settings release plans V' above every tag on `main`, so when a code release's
-run claimed its version and failed before releasing it (the c2 sequence under
-**No replay of an old version**), V' overtakes that claim: "Re-run all jobs" on
-the code release is refused, and "Re-run failed jobs" builds and publishes the
-old version and then fails at `deploy`'s downgrade check. Only a new commit
-releases that code. The `v1.36` follow-up is to refuse the settings release
-while a tag above V has no published chart, so a re-run of the code release
-stays the way out.
+**Known limit: a settings release over a published, unreleased code
+release.** Rule 5 refuses a settings release only while the newest code
+release above V never published its chart. A code release whose chart was
+published and whose run then failed (at `deploy`, or with its proof timed out)
+counts as published, so a settings release still plans V' above it: "Re-run
+all jobs" on that code release is then refused with `<tag> was taken by a later
+release (<newest>) that does not contain this commit, which has not been
+released; push a new commit to release it.`, and only a new commit releases
+that code. The same holds for a claim a settings release overtook under a pin
+before `v1.36.0`.
 
 **Known limit: a repository id that changes.** When a repository's id changes
 (a delete and re-create under the same name), hemi starts its revisions at 1
@@ -797,10 +837,10 @@ name, and a chart annotation carries only the revision number, never the
 repository id. After a rollback onto code from before the change, a new
 revision can equal an old chart's number: on V itself it takes the V' = V
 shortcut and ships none of the new settings, and on a version above V with a
-Release it is refused by rule 5, and rule 5's scan can stop early and fail
+Release it is refused by rule 6, and rule 6's scan can stop early and fail
 open: the new lineage's charts read `none` or a number below the old one, so
 the scan stops before an old chart above V that carries the number and has a
-Release, and rule 5 may not refuse. `wac-cd` cannot tell the two lineages
+Release, and rule 6 may not refuse. `wac-cd` cannot tell the two lineages
 apart; the gateway checks the copy's repository at release time, not the old
 chart's. What remains is a re-run of a settings run while its revision is
 still the active one after a rollback, which needs hemi to have neither
