@@ -48,6 +48,16 @@ FETCHED_INSTALLERS = (
     ("curl piped to a shell", re.compile(r"\bcurl\b[^\n]*\|\s*(sudo\s+)?(ba|z|da)?sh\b")),
     ("get-helm", re.compile(r"get-helm")),
 )
+# A token job runs no site or package code either: node and yarn run whatever a
+# package.json or a checkout names.
+SITE_CODE_RUNNERS = (
+    ("yarn", re.compile(r"\byarn\b")),
+    ("node", re.compile(r"\bnode\b")),
+)
+# nextjs-site-deploy's token jobs assume an AWS role, so they may also use the
+# pinned configure-aws-credentials. They check out no caller code at all: only
+# this repository, at the defining commit, for its scripts.
+SITE_TOKEN_ACTIONS = ID_TOKEN_ACTIONS + ("aws-actions/configure-aws-credentials",)
 KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE = ()
 SHA = "${{ job.workflow_sha }}"
 
@@ -124,16 +134,33 @@ def pinned_action_problems(job_name, job, allowed=None):
     return problems
 
 
-def id_token_problems(doc, job_name, job):
-    """What lets code other than wac-cd's own run in a job that can mint a gateway token."""
+def id_token_problems(doc, job_name, job, allowed=ID_TOKEN_ACTIONS):
+    """What lets code other than this repository's own run in a job that can mint a token."""
     problems = []
     if "uses" in job:
         problems.append(f"{job_name}: calls {job['uses']} while holding id-token: write")
-    problems.extend(pinned_action_problems(job_name, job, ID_TOKEN_ACTIONS))
+    problems.extend(pinned_action_problems(job_name, job, allowed))
     for index, step in enumerate(job.get("steps") or []):
-        for label, pattern in FETCHED_INSTALLERS:
+        for label, pattern in FETCHED_INSTALLERS + SITE_CODE_RUNNERS:
             if pattern.search(str(step.get("run", ""))):
                 problems.append(f"{job_name} steps[{index}]: runs {label}")
+    return problems
+
+
+def site_token_job_problems(doc, job_name, job):
+    """A nextjs-site-deploy job that can mint an AWS role: no caller checkout, no site code, no python."""
+    problems = id_token_problems(doc, job_name, job, SITE_TOKEN_ACTIONS)
+    if (job.get("env") or {}).get("PYTHONSAFEPATH") != "1":
+        problems.append(f"{job_name}: env does not set PYTHONSAFEPATH to 1")
+    for index, step in enumerate(job.get("steps") or []):
+        where = f"{job_name} steps[{index}]"
+        if str(step.get("uses", "")).startswith("actions/checkout@"):
+            with_ = step.get("with") or {}
+            if (str(with_.get("repository") or "").lower() != module.SHARED_REPOSITORY
+                    or with_.get("ref") != SHA):
+                problems.append(f"{where}: checks out the calling repository's code")
+        if re.search(r"\bpython3?\b", str(step.get("run", ""))):
+            problems.append(f"{where}: runs python3, which the planted-repository test does not cover here")
     return problems
 
 
@@ -822,6 +849,8 @@ class ReusableWorkflowTests(unittest.TestCase):
             ("pip3", {"run": "python3 -m pip3 install x"}, "pip"),
             ("npm", {"run": "npm ci"}, "npm"),
             ("npx", {"run": "npx something"}, "npx"),
+            ("yarn", {"run": "yarn build"}, "yarn"),
+            ("node", {"run": "node scripts/x.js"}, "node"),
             ("uvx", {"run": "uvx mkdocs build"}, "uvx"),
             ("curl to sh", {"run": "curl -fsSL https://example.invalid/i | sh"}, "curl"),
             ("curl to sudo bash", {"run": "curl -fsSL https://example.invalid/i | sudo bash -s"}, "curl"),
@@ -865,9 +894,12 @@ class ReusableWorkflowTests(unittest.TestCase):
                      "nextjs-site-check.yml", "nextjs-site-deploy.yml"):
             self.assertIn(name, reusable)
         for expected in (("wac-cd.yml", "publish"), ("wac-cd.yml", "github-release"), ("wac-cd.yml", "plan"),
-                         ("wac-ci.yml", "contract"), ("nextjs-site-deploy.yml", "build-and-deploy")):
+                         ("wac-ci.yml", "contract"), ("nextjs-site-deploy.yml", "image-cache"),
+                         ("nextjs-site-deploy.yml", "deploy")):
             self.assertIn(expected, writers)
-        self.assertIn(("nextjs-site-deploy.yml", "build-and-deploy"), id_token)
+        self.assertIn(("nextjs-site-deploy.yml", "image-cache"), id_token)
+        self.assertIn(("nextjs-site-deploy.yml", "deploy"), id_token)
+        self.assertNotIn(("nextjs-site-deploy.yml", "build"), id_token)
 
     def test_reusable_workflows_are_found_whichever_form_on_takes(self):
         jobs = {"gate": {"runs-on": "${{ inputs.runner || vars.CI_RUNNER_SMALL }}", "steps": [{"run": "true"}]}}
@@ -941,6 +973,196 @@ class ReusableWorkflowTests(unittest.TestCase):
         ):
             with self.subTest(permissions=label):
                 self.assertIs(holds_write(doc, job), expected)
+
+    def nextjs_deploy(self):
+        import yaml
+
+        return yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "nextjs-site-deploy.yml").read_text())
+
+    def test_nextjs_site_deploy_holds_a_token_only_where_no_site_code_runs(self):
+        doc = self.nextjs_deploy()
+        jobs = doc["jobs"]
+        self.assertEqual(sorted(jobs), ["build", "deploy", "image-cache"])
+        self.assertEqual(doc["permissions"], {"contents": "read"})
+        self.assertNotIn("needs", jobs["image-cache"])
+        self.assertEqual(jobs["build"]["needs"], "image-cache")
+        self.assertEqual(jobs["deploy"]["needs"], "build")
+        self.assertEqual(jobs["build"]["permissions"], {"contents": "read"})
+        self.assertFalse(holds_id_token(doc, jobs["build"]))
+        text = json.dumps(jobs["build"])
+        for reach in ("secrets.", "aws-actions/", "aws s3", "aws cloudfront", "role_arn"):
+            self.assertNotIn(reach, text, f"build, which runs the site's code, reaches {reach}")
+        for name in ("image-cache", "deploy"):
+            with self.subTest(job=name):
+                self.assertEqual(jobs[name]["permissions"], {"contents": "read", "id-token": "write"})
+                self.assertEqual(site_token_job_problems(doc, name, jobs[name]), [])
+                checkouts = [step for step in jobs[name]["steps"] if "actions/checkout" in str(step.get("uses"))]
+                self.assertEqual([step["with"]["repository"] for step in checkouts], ["willfell/wac.lab.actions"])
+
+    def test_the_site_token_rule_names_each_way_in(self):
+        pinned = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        shared = {"name": "Check out the shared scripts (actions/checkout v7.0.1)", "uses": pinned,
+                  "with": {"repository": "willfell/wac.lab.actions", "ref": SHA, "path": ".lab-actions",
+                           "persist-credentials": False}}
+        credentials = {"name": "x (aws-actions/configure-aws-credentials v6.3.0)",
+                       "uses": "aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd"}
+        safe = {"PYTHONSAFEPATH": "1"}
+        node = {"name": "x (actions/setup-node v7.1.0)", "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"}
+        cases = (
+            ("the caller's checkout", safe, {"name": "Check out (actions/checkout v7.0.1)", "uses": pinned}, "calling"),
+            ("another repository's checkout", safe,
+             {**shared, "with": {"repository": "someone/site", "ref": SHA}}, "calling"),
+            ("this repository at a branch", safe, {**shared, "with": {**shared["with"], "ref": "main"}}, "calling"),
+            ("setup-node", safe, node, "allowlist"),
+            ("yarn", safe, {"run": "yarn images:optimize"}, "yarn"),
+            ("node", safe, {"run": "node out/x.js"}, "node"),
+            ("a global npm install", safe, {"run": "sudo npm install -g corepack"}, "npm"),
+            ("python3", safe, {"run": "python3 -I -c 'print(1)'"}, "python3"),
+            ("no PYTHONSAFEPATH", {}, {"run": "true"}, "PYTHONSAFEPATH"),
+        )
+        for label, env, step, expected in cases:
+            with self.subTest(case=label):
+                problems = site_token_job_problems({}, "job", {"env": env, "steps": [shared, credentials, step]})
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(expected, problems[0])
+        self.assertEqual(site_token_job_problems({}, "job", {"env": safe, "steps": [shared, credentials]}), [])
+
+    def test_nextjs_site_deploy_hands_the_build_two_artifacts_and_deploy_only_data(self):
+        jobs = self.nextjs_deploy()["jobs"]
+
+        def uses(job, action):
+            return [step for step in jobs[job]["steps"] if str(step.get("uses", "")).startswith(action + "@")]
+
+        cache_up, = uses("image-cache", "actions/upload-artifact")
+        self.assertEqual(cache_up["if"], "steps.cache.outputs.cached == 'true'")
+        self.assertEqual(jobs["image-cache"]["outputs"], {"cached": "${{ steps.cache.outputs.cached }}"})
+        cache_down, = uses("build", "actions/download-artifact")
+        self.assertEqual(cache_down["if"], "needs.image-cache.outputs.cached == 'true'")
+        self.assertIs(cache_down.get("continue-on-error"), True, "a cache that cannot be downloaded is no cache")
+        self.assertEqual(cache_down["with"], {"name": "nextjs-image-cache", "path": "${{ inputs.app_dir }}/public/images"})
+        site_up, = uses("build", "actions/upload-artifact")
+        site_down, = uses("deploy", "actions/download-artifact")
+        self.assertEqual(site_down["with"], {"name": "nextjs-site-out", "path": "${{ runner.temp }}/site-out"})
+        for step, name, path in ((cache_up, "nextjs-image-cache", "${{ runner.temp }}/image-cache"),
+                                 (site_up, "nextjs-site-out", "${{ inputs.app_dir }}/out")):
+            with self.subTest(artifact=name):
+                self.assertEqual(step["with"], {"name": name, "path": path, "retention-days": 1,
+                                                "include-hidden-files": True, "if-no-files-found": "error"})
+        build = [step.get("name") or step.get("run") for step in jobs["build"]["steps"]]
+        self.assertLess(build.index("${{ inputs.install_command }}"), build.index(cache_down["name"]))
+        self.assertLess(build.index(cache_down["name"]), build.index("yarn images:validate"))
+        self.assertLess(build.index("Verify the export directory exists"), build.index(site_up["name"]))
+
+        steps = jobs["deploy"]["steps"]
+        names = [step.get("name") for step in steps]
+        check = names.index("Refuse anything in the export but plain files and directories")
+        credentials = next(i for i, step in enumerate(steps) if "configure-aws-credentials" in str(step.get("uses")))
+        aws = [i for i, step in enumerate(steps) if re.search(r"^\s*aws (s3|cloudfront) ", str(step.get("run", "")), re.M)]
+        self.assertEqual(len(aws), 3)
+        self.assertLess(names.index(site_down["name"]), check)
+        self.assertLess(check, credentials)
+        self.assertLess(credentials, min(aws))
+        for step in steps:
+            self.assertNotIn("working-directory", step)
+            for line in str(step.get("run", "")).splitlines():
+                if "SITE_OUT" in line:
+                    with self.subTest(line=line):
+                        self.assertRegex(line.strip(), r'^(bash "\$LAB_ACTIONS_SCRIPTS/check-site-export\.sh" "\$SITE_OUT"'
+                                                        r'|aws s3 sync "\$SITE_OUT/images" |args=\("\$SITE_OUT" )')
+        for index in aws[:2]:
+            self.assertIn("--no-follow-symlinks", steps[index]["run"])
+
+    def test_nextjs_site_deploy_refuses_an_export_that_is_not_plain_files(self):
+        import os
+        import shutil
+        import subprocess
+
+        step = next(step for step in self.nextjs_deploy()["jobs"]["deploy"]["steps"]
+                    if step.get("name") == "Refuse anything in the export but plain files and directories")
+        self.assertEqual(step["env"], {"SITE_OUT": "${{ runner.temp }}/site-out"})
+        scripts = Path(__file__).resolve().parents[2] / "scripts"
+        tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, tmp)
+        outside = tmp / "outside"
+        outside.mkdir()
+        (outside / "credentials").write_text("secret\n")
+
+        def tree(name, plant=None):
+            root = tmp / name
+            for path, body in (("index.html", "<html>"), ("_next/static/a.js", "x"), ("images/a.webp", "w"),
+                               ("images/.image-manifest.json", "{}"), ("a dir/a page.html", "p")):
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+                (root / path).write_text(body)
+            if plant:
+                plant(root)
+            return root
+
+        def run(root):
+            env = {"PATH": os.environ["PATH"], "LAB_ACTIONS_SCRIPTS": str(scripts), "SITE_OUT": str(root)}
+            return subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+
+        result = run(tree("clean"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        refusal = "deploy syncs only plain files and directories, so nothing was synced"
+        cases = (
+            ("a link inside the export", lambda r: (r / "about.html").symlink_to("index.html"),
+             "about.html is a symbolic link to index.html.", False),
+            ("a link to a directory outside", lambda r: (r / "leak").symlink_to(outside),
+             f"leak is a symbolic link to {outside}, which resolves outside the export.", True),
+            ("a nested link to a file outside", lambda r: (r / "images" / "b.avif").symlink_to(outside / "credentials"),
+             f"images/b.avif is a symbolic link to {outside / 'credentials'}, which resolves outside the export.", True),
+            ("a relative link that climbs out", lambda r: (r / "images" / "up").symlink_to("../../outside"),
+             "images/up is a symbolic link to ../../outside, which resolves outside the export.", True),
+            ("a dangling link", lambda r: (r / "gone").symlink_to("missing.html"),
+             "gone is a symbolic link to missing.html.", False),
+            ("a named pipe", lambda r: os.mkfifo(r / "pipe"), "pipe is neither a regular file nor a directory.", False),
+        )
+        for label, plant, said, escapes in cases:
+            with self.subTest(case=label):
+                result = run(tree(label.replace(" ", "-"), plant))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"::error::nextjs-site-deploy: {said}", result.stdout)
+                self.assertEqual("outside the export" in result.stdout, escapes)
+                self.assertIn(f"::error::nextjs-site-deploy: the site export holds 1 entry that is not a plain file "
+                              f"or directory; {refusal}.", result.stdout)
+        linked = tmp / "linked-export"
+        linked.symlink_to(tree("real-export"))
+        result = run(linked)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("is not a directory of its own", result.stdout)
+
+    def test_nextjs_image_cache_treats_an_empty_or_missing_cache_as_none(self):
+        import os
+        import shutil
+        import subprocess
+
+        steps = {step.get("name"): step for step in self.nextjs_deploy()["jobs"]["image-cache"]["steps"]}
+        download = steps["Download cached optimized images from S3"]
+        count = steps["Count the cached images"]
+        self.assertIs(download.get("continue-on-error"), True)
+        self.assertEqual(count["id"], "cache")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "aws").write_text('#!/bin/bash\necho "$*" >> "$AWS_LOG"\n'
+                                     'if [ "$AWS_MODE" = files ]; then mkdir -p "$4"; : > "$4/.image-manifest.json"; '
+                                     ': > "$4/a.webp"; fi\n'
+                                     '[ "$AWS_MODE" != missing ]\n')
+        (bin_dir / "aws").chmod(0o755)
+        for mode, cached in (("missing", "false"), ("empty", "false"), ("files", "true")):
+            with self.subTest(cache=mode):
+                runner = tmp / mode
+                runner.mkdir()
+                env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": str(runner), "S3_BUCKET": "site-bucket",
+                       "GITHUB_OUTPUT": str(runner / "out"), "AWS_LOG": str(runner / "aws.log"), "AWS_MODE": mode}
+                result = subprocess.run(["bash", "-e", "-c", download["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue((runner / "aws.log").read_text().startswith(
+                    f"s3 sync s3://site-bucket/images {runner}/image-cache --exclude * --include *.webp"))
+                result = subprocess.run(["bash", "-e", "-c", count["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((runner / "out").read_text(), f"cached={cached}\n")
 
     def token_step_env(self, head):
         """The env each run step of a token job gets in the planted-repository run, keyed by job and step."""

@@ -22,7 +22,7 @@ baton's `deploy.yml` was deleted at its cutover, so none of them has such rows;
 on 2026-11-17, and `wac.lab` then to `v1.29.0` (wacwini/wac.lab#549).
 `wac.fantasy` took its bump (wacwini/wac.fantasy#2) after wacwini/wac.fantasy#3
 fixed its nav for the `techdocs / gate`. jack-creek-patch's default branch is `dev`, which is
-what this table records. `sauce` lives at `wacwini/sauce` and still pins
+what this table records. The three `nextjs-site-deploy` callers (fellhoelter-consulting, will-fell and jack-creek-patch, read on 2026-11-19 UTC from `main`, `main` and `dev`) pass nothing the bump to `v1.36.0` changes: its inputs, secrets and the caller job's `id-token: write` and `contents: read` stay as they are. `sauce` lives at `wacwini/sauce` and still pins
 `v1.10.5`; the personal `willfell` repositories (`ero-copilot-iac`,
 `homebrew-sauce`, `mac-config`) pin older tags and are listed as they are.
 

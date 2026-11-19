@@ -34,6 +34,7 @@ python3 scripts/tests/schema-api-proxy.test.py  # lab-kubeconform's schema fallb
 bash scripts/tests/validate-kustomize.test.sh  # lab-kubeconform end to end; needs kustomize and kubeconform
 bash scripts/tests/helm-install.test.sh  # install-tools.sh's helm path, against a fake curl
 bash scripts/tests/install-helm.test.sh  # install-helm.sh, wac-cd's pinned Helm install, against a fake curl
+bash scripts/tests/install-awscli.test.sh  # install-awscli.sh, nextjs-site-deploy's pinned AWS CLI install, against a fake curl and throwaway keys; needs gpg
 uv run --with pyyaml python scripts/tests/ci-release.test.py  # lab-release's client and the names wac-cd and wac.lab load from it
 python3 scripts/tests/runner-policy.test.py  # actionlint's fleet runner policy
 python3 scripts/tests/lab-route.test.py  # lab-route, against a stub Prometheus
@@ -76,7 +77,7 @@ inputs, outputs and the incident history behind its design.
 | `actionlint` | `.github/workflows/actionlint.yml`, `scripts/runner-policy.py` | `docs/reference/actionlint.md` |
 | `techdocs` | `.github/workflows/techdocs.yml`, `scripts/check-docs-nav.sh` | `docs/reference/techdocs.md` |
 | `agents-md` | `.github/workflows/agents-md.yml`, `scripts/agents-md.py`, `agents-md/fleet-rules.md` | `docs/reference/agents-md.md` |
-| `nextjs-site-check`, `nextjs-site-deploy` | `.github/workflows/nextjs-site-*.yml` | `docs/reference/nextjs-site.md` |
+| `nextjs-site-check`, `nextjs-site-deploy` | `.github/workflows/nextjs-site-*.yml`, `scripts/install-awscli.sh`, `scripts/check-site-export.sh` | `docs/reference/nextjs-site.md` |
 | `wac-ci`, `wac-cd` | `.github/workflows/wac-c[id].yml`, `scripts/wacd-*.py` | `docs/reference/wacd-profile.md`, then `wac-ci.md` or `wac-cd.md` |
 | A reusable workflow's checkout of this repo | the shared-checkout steps | `docs/architecture/shared-checkout.md` |
 | Anything, then releasing it | `CHANGELOG.md` | `docs/guides/releasing.md` |

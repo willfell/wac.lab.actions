@@ -47,17 +47,17 @@ permissions:
   contents: read
 
 jobs:
-  build-and-deploy:
+  image-cache:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    env:
+      PYTHONSAFEPATH: "1"
     permissions:
-      id-token: write
       contents: read
-    defaults:
-      run:
-        working-directory: ${{ inputs.app_dir }}
+      id-token: write
+    outputs:
+      cached: ${{ steps.cache.outputs.cached }}
     steps:
       - name: Require a bucket
-        working-directory: .
         env:
           BUCKET: ${{ inputs.bucket || secrets.s3_bucket }}
         run: |
@@ -66,6 +66,79 @@ jobs:
             echo "::error::neither the bucket input nor the s3_bucket secret was supplied" >&2
             exit 1
           fi
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .lab-actions
+          persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/lab-actions"
+          mv .lab-actions "$RUNNER_TEMP/lab-actions"
+          echo "LAB_ACTIONS_SCRIPTS=$RUNNER_TEMP/lab-actions/scripts" >> "$GITHUB_ENV"
+      - name: Provide the aws CLI
+        run: |
+          set -euo pipefail
+          if command -v aws >/dev/null 2>&1; then
+            aws --version
+          else
+            bash "$LAB_ACTIONS_SCRIPTS/install-awscli.sh"
+          fi
+      - name: Configure AWS credentials (aws-actions/configure-aws-credentials v6.3.0)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+      - name: Download cached optimized images from S3
+        continue-on-error: true
+        env:
+          S3_BUCKET: ${{ inputs.bucket || secrets.s3_bucket }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/image-cache"
+          aws s3 sync "s3://${S3_BUCKET}/images" "$RUNNER_TEMP/image-cache" \
+            --exclude "*" \
+            --include "*.webp" \
+            --include "*.avif" \
+            --include ".image-manifest.json" \
+            --only-show-errors || echo "no cached images found"
+      - name: Count the cached images
+        id: cache
+        run: |
+          set -euo pipefail
+          cache="$RUNNER_TEMP/image-cache"
+          mkdir -p "$cache"
+          find "$cache" \( -name "*.webp" -o -name "*.avif" \) | wc -l
+          if [ -n "$(find "$cache" -type f -print -quit)" ]; then
+            echo "cached=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cached=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Hand the cache to the build (actions/upload-artifact v7.0.2)
+        if: steps.cache.outputs.cached == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: nextjs-image-cache
+          path: ${{ runner.temp }}/image-cache
+          retention-days: 1
+          include-hidden-files: true
+          if-no-files-found: error
+
+  build:
+    needs: image-cache
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.app_dir }}
+    steps:
       - name: Check out the repository (actions/checkout v7.0.1)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Provide the yarn setup-node's cache probe shells out to
@@ -84,18 +157,6 @@ jobs:
             fi
           fi
           command -v yarn >/dev/null 2>&1 || sudo npm install -g yarn
-      - name: Provide the aws CLI the sync and invalidation steps shell out to
-        working-directory: .
-        run: |
-          set -eu
-          if ! command -v aws >/dev/null 2>&1; then
-            tmp="$(mktemp -d)"
-            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "$tmp/awscliv2.zip"
-            unzip -q "$tmp/awscliv2.zip" -d "$tmp"
-            sudo "$tmp/aws/install"
-            rm -rf "$tmp"
-          fi
-          aws --version
       - name: Set up Node (actions/setup-node v7.1.0)
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
@@ -103,23 +164,15 @@ jobs:
           cache: yarn
           cache-dependency-path: ${{ inputs.app_dir }}/yarn.lock
       - run: ${{ inputs.install_command }}
-      - name: Configure AWS credentials (aws-actions/configure-aws-credentials v6.3.0)
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
-        with:
-          role-to-assume: ${{ inputs.role_arn }}
-          aws-region: ${{ inputs.aws_region }}
-      - name: Download cached optimized images from S3
+      - name: Restore the cached optimized images (actions/download-artifact v8.0.2)
+        if: needs.image-cache.outputs.cached == 'true'
         continue-on-error: true
-        env:
-          S3_BUCKET: ${{ inputs.bucket || secrets.s3_bucket }}
-        run: |
-          aws s3 sync "s3://${S3_BUCKET}/images" ./public/images \
-            --exclude "*" \
-            --include "*.webp" \
-            --include "*.avif" \
-            --include ".image-manifest.json" \
-            --only-show-errors || echo "no cached images found"
-          find ./public/images \( -name "*.webp" -o -name "*.avif" \) 2>/dev/null | wc -l
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: nextjs-image-cache
+          path: ${{ inputs.app_dir }}/public/images
+      - name: Count the restored images
+        run: find ./public/images \( -name "*.webp" -o -name "*.avif" \) 2>/dev/null | wc -l
       - run: yarn images:validate
       - run: yarn images:optimize
       - name: Build
@@ -142,19 +195,79 @@ jobs:
             exit 1
           fi
           ls -la out
+      - name: Hand the export to the deploy (actions/upload-artifact v7.0.2)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: nextjs-site-out
+          path: ${{ inputs.app_dir }}/out
+          retention-days: 1
+          include-hidden-files: true
+          if-no-files-found: error
+
+  deploy:
+    needs: build
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    env:
+      PYTHONSAFEPATH: "1"
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Require the defining workflow commit
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .lab-actions
+          persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/lab-actions"
+          mv .lab-actions "$RUNNER_TEMP/lab-actions"
+          echo "LAB_ACTIONS_SCRIPTS=$RUNNER_TEMP/lab-actions/scripts" >> "$GITHUB_ENV"
+      - name: Download the site export (actions/download-artifact v8.0.2)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: nextjs-site-out
+          path: ${{ runner.temp }}/site-out
+      - name: Refuse anything in the export but plain files and directories
+        env:
+          SITE_OUT: ${{ runner.temp }}/site-out
+        run: bash "$LAB_ACTIONS_SCRIPTS/check-site-export.sh" "$SITE_OUT"
+      - name: Provide the aws CLI
+        run: |
+          set -euo pipefail
+          if command -v aws >/dev/null 2>&1; then
+            aws --version
+          else
+            bash "$LAB_ACTIONS_SCRIPTS/install-awscli.sh"
+          fi
+      - name: Configure AWS credentials (aws-actions/configure-aws-credentials v6.3.0)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.aws_region }}
       - name: Sync images to S3 with immutable cache headers
         env:
           S3_BUCKET: ${{ inputs.bucket || secrets.s3_bucket }}
+          SITE_OUT: ${{ runner.temp }}/site-out
         run: |
-          aws s3 sync out/images "s3://${S3_BUCKET}/images" \
-            --cache-control "public, max-age=31536000, immutable"
+          aws s3 sync "$SITE_OUT/images" "s3://${S3_BUCKET}/images" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --no-follow-symlinks
       - name: Sync app files to S3
         env:
           S3_BUCKET: ${{ inputs.bucket || secrets.s3_bucket }}
           APP_CACHE_CONTROL: ${{ inputs.app_cache_control }}
+          SITE_OUT: ${{ runner.temp }}/site-out
         run: |
           set -euo pipefail
-          args=(out "s3://${S3_BUCKET}" --exclude "images/*" --delete)
+          args=("$SITE_OUT" "s3://${S3_BUCKET}" --exclude "images/*" --delete --no-follow-symlinks)
           if [ -n "$APP_CACHE_CONTROL" ]; then
             args+=(--cache-control "$APP_CACHE_CONTROL")
           fi
