@@ -893,6 +893,61 @@ class DeadlineTests(unittest.TestCase):
         self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
 
+    def test_a_slow_mint_then_a_slow_gateway_still_ends_the_read_within_the_wait(self):
+        """The mint takes two seconds of the last pass, then the gateway takes longer than the pass has left.
+
+        Each read, its token mint included, is bounded by the time left in the wait, so the request gets only
+        what the mint left of it and the step decides before the deadline's backstop, never with its sentence.
+        """
+        seen = []
+
+        class Slow(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append(time.monotonic())
+                if len(seen) > 2:
+                    time.sleep(8)
+                raw = json.dumps(unsteady(UNSTEADY["out of sync"])).encode()
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        mints = []
+
+        def token_endpoint(request, context, timeout):
+            mints.append(timeout)
+            if len(mints) > 2:
+                time.sleep(2)
+            return 200, {"value": TOKEN}
+
+        grant = {"ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.actions.githubusercontent.com/token",
+                 "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "runner-bearer"}
+        started = time.monotonic()
+        with patch.object(wacd, "trust_context", lambda: None), \
+                patch.object(wacd.ci, "URL", f"http://127.0.0.1:{server.server_address[1]}/v1/release"), \
+                patch.object(wacd.ci, "fetch", token_endpoint), \
+                patch.object(wacd, "read_release", lambda app, version, timeout=30: RELEASE), \
+                patch.object(wacd, "DEADLINE_MARGIN", 1), patch.object(wacd, "POLL_SECONDS", 0.2), \
+                patch.dict(os.environ, grant):
+            code, out, err = CliTests.main(
+                self, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", str(time.time() + 5))
+        self.assertEqual((code, out), (1, ""), err)
+        self.assertEqual(len(seen), 3, "the app was seen rolling out twice before the slow pass")
+        self.assertNotIn("deadline", err)
+        self.assertLess(time.monotonic() - started, 4.8, "decided within the wait, before the backstop")
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
 class EarlierReleaseTests(unittest.TestCase):
     """Rule B: an earlier version above the running one counts as released only if its GitHub Release exists."""
 
@@ -1509,6 +1564,17 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(self.err, "wacd release: " + wacd.RESEND_LOST.format(version=VERSION) + "\n")
         self.assertEqual(self.silent["reset"].bodies, [wacd.RELEASE_BODY(VERSION)] * 2)
         self.assertEqual(len(self.attempts), 5)
+        self.assertIsNone(self.receipt)
+
+    def test_a_release_dropped_with_its_status_unreadable_until_the_deadline_says_so(self):
+        gateway = self.gateway((200, running("0.0.9")), (503, {}))
+        code = self.deploy(gateway, [None, "reset"], timeout="20")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.err, "wacd release: " + wacd.DROPPED_UNREAD.format(version=VERSION) + "\n")
+        self.assertEqual(self.silent["reset"].bodies, [wacd.RELEASE_BODY(VERSION)], "never sent again blind")
+        self.assertGreater(len(gateway.seen), 2)
+        self.assertEqual({json.dumps(body) for _, body in gateway.seen}, {json.dumps(wacd.STATUS_BODY())})
+        self.assertLessEqual(self.clock.now - 1000.0, 20.1)
         self.assertIsNone(self.receipt)
 
     def test_a_tls_failure_still_fails_at_once(self):

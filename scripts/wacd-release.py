@@ -375,16 +375,21 @@ def post(body, trust, timeout, mint_timeout=None):
     """One POST to the gateway with a token minted for it: (status, JSON or None, token).
 
     The mint waits ci-release's own OIDC_TIMEOUT unless mint_timeout bounds
-    it. A mint that fails raises Unminted, with ci.oidc_token()'s message; a
-    transport failure raises Unreachable. Whatever the status, the parsed body
-    is returned to the caller, which keeps only what it needs from it.
+    it; then timeout bounds the mint and the request together, so the request
+    gets only what the mint left of it. A mint that fails raises Unminted,
+    with ci.oidc_token()'s message; a transport failure raises Unreachable.
+    Whatever the status, the parsed body is returned to the caller, which
+    keeps only what it needs from it.
     """
+    minting = time.monotonic()
     try:
         token = ci.oidc_token() if mint_timeout is None else ci.oidc_token(mint_timeout)
     except Deadline:
         raise
     except ReleaseError as error:
         raise Unminted(str(error)) from None
+    if mint_timeout is not None:
+        timeout = max(1, timeout - (time.monotonic() - minting))
     request = urllib.request.Request(
         ci.URL,
         data=json.dumps(body).encode(),
