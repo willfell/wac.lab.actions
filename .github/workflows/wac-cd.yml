@@ -70,7 +70,7 @@ concurrency:
 jobs:
   plan:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
-    timeout-minutes: 68
+    timeout-minutes: 72
     env:
       PYTHONSAFEPATH: "1"
     permissions:
@@ -406,7 +406,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
       - name: Plan the version
-        timeout-minutes: 6
+        timeout-minutes: 9
         id: version
         shell: bash
         env:
@@ -423,6 +423,9 @@ jobs:
           SETTINGS_COMMIT: ${{ steps.settings.outputs.commit }}
           SETTINGS_SUMMARY: ${{ steps.settings.outputs.summary }}
           SETTINGS_UNFINISHED: ${{ steps.settings.outputs.unfinished_left }}
+          EVENT_NAME: ${{ github.event_name }}
+          DOCS_PATHS: ${{ steps.profile.outputs.docs_paths }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           registry=registry.network.svc.cluster.local:5000
@@ -481,21 +484,35 @@ jobs:
               version="$(sed -n 's/^version=//p' <<< "$planned")"
               tag="$(sed -n 's/^tag=//p' <<< "$planned")"
             }
-            plan_version unknown
-            if [[ "$mode" == resume || ( "$mode" == none && -n "$version" ) ]]; then
-              if ! state="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-state --registry "$registry" \
-                --app "$APP" --version "$version" --source-sha "$GITHUB_SHA" 2> "$RUNNER_TEMP/chart-state.err")"; then
-                echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/chart-state.err")"
-                exit 1
+            if [[ "${EVENT_NAME:-}" == push && "$VERSION_SOURCE" == commits ]]; then
+              scope="$(python3 -I "$WACD_SCRIPTS"/wacd-docs.py release-scope --prefix "$TAG_PREFIX" 2> /dev/null || true)"
+              if [[ "$(sed -n 's/^docs_only=//p' <<< "$scope")" == true ]]; then
+                docs_since="$(sed -n 's/^since=//p' <<< "$scope")"
+              else
+                echo "wac-cd: a release, since $(sed -n 's/^reason=//p' <<< "$scope")"
               fi
-              case "$state" in
-                state=present) plan_version true ;;
-                state=absent) plan_version false ;;
-                *)
-                  echo "::error::wac-cd: unexpected chart state for deploy/$APP:$version: $state"
+            fi
+            if [[ -n "${docs_since:-}" ]]; then
+              mode=none
+              version=""
+              tag=""
+            else
+              plan_version unknown
+              if [[ "$mode" == resume || ( "$mode" == none && -n "$version" ) ]]; then
+                if ! state="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-state --registry "$registry" \
+                  --app "$APP" --version "$version" --source-sha "$GITHUB_SHA" 2> "$RUNNER_TEMP/chart-state.err")"; then
+                  echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/chart-state.err")"
                   exit 1
-                  ;;
-              esac
+                fi
+                case "$state" in
+                  state=present) plan_version true ;;
+                  state=absent) plan_version false ;;
+                  *)
+                    echo "::error::wac-cd: unexpected chart state for deploy/$APP:$version: $state"
+                    exit 1
+                    ;;
+                esac
+              fi
             fi
             expected_sha="$GITHUB_SHA"
           fi
@@ -547,6 +564,9 @@ jobs:
             echo "version=$version"
             echo "tag=$tag"
             echo "expected_sha=$expected_sha"
+            if [[ -n "${docs_since:-}" ]]; then
+              echo "docs_since=$docs_since"
+            fi
           } | tee -a "$GITHUB_OUTPUT"
           {
             echo "### wac-cd plan"
@@ -561,6 +581,10 @@ jobs:
             if [[ -n "$resumed" ]]; then
               echo
               echo "$resumed"
+            fi
+            if [[ -n "${docs_since:-}" ]]; then
+              echo
+              echo "nothing to release: only documentation changed since $docs_since."
             fi
             if [[ -n "${SETTINGS_REVISION:-}" && "$mode" == settings ]]; then
               echo
@@ -591,6 +615,14 @@ jobs:
             echo "$REASON"
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
+      - name: "Nothing to release: only documentation changed"
+        timeout-minutes: 1
+        if: ${{ steps.version.outputs.docs_since != '' }}
+        shell: bash
+        env:
+          SINCE: ${{ steps.version.outputs.docs_since }}
+        run: |
+          echo "::notice::wac-cd: nothing to release: only documentation changed since $SINCE."
 
   shadow:
     needs: plan

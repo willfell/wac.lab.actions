@@ -1282,5 +1282,67 @@ class PullRequestTests(PullRequestCase):
         self.assertEqual(contract.shadow.AUDIENCE, "wacwini:hemi")
 
 
+DEFAULT_DOCS = '["docs/**","mkdocs.yml","*.md"]'
+
+
+def profile_with(**ci):
+    data = json.loads(FILES[PROFILE])
+    data["ci"].update(ci)
+    return {PROFILE: json.dumps(data), VALUES: FILES[VALUES]}
+
+
+class DocsPathsTests(PullRequestCase):
+    """`docs_paths` is the scope job's only source of patterns: the list the settings this run uses hold.
+
+    It is the effective list, the default when the key is absent, from hemi's copy when the source is hemi
+    and from the merge commit's .github/wacd.json when it is the files; empty whenever that list cannot be
+    read or is refused, which the scope job reads as "run the checks".
+    """
+
+    def docs_paths(self, code, source):
+        self.assertSource(code, source)
+        return self.outputs()["docs_paths"]
+
+    def copy_with(self, **delivery):
+        value = fixture_copy("hemi")
+        value["delivery"].update(delivery)
+        return 200, value
+
+    def test_hemi_source_reads_the_copys_list_and_keeps_absent_apart_from_empty(self):
+        for label, answer, expected in (
+            ("absent", self.hemi_answer(), DEFAULT_DOCS),
+            ("empty", self.copy_with(docsPaths=[]), "[]"),
+            ("a list", self.copy_with(docsPaths=["docs/guides/**", "*.md"]), '["docs/guides/**","*.md"]'),
+        ):
+            with self.subTest(docs_paths=label):
+                self.assertEqual(self.docs_paths(self.run_pr(answer, main={}, head={}), "hemi"), expected)
+
+    def test_a_copys_refused_list_leaves_the_output_empty_and_the_contract_job_green(self):
+        for label, docs in (("code", ["src/**"]), ("null", None), ("a gate's path", ["docs/**"])):
+            with self.subTest(docs_paths=label):
+                answer = self.copy_with(docsPaths=docs)
+                if label == "a gate's path":
+                    answer[1]["gates"][0]["commands"].append("node scripts/check.mjs docs/llc.md")
+                self.assertEqual(self.docs_paths(self.run_pr(answer, main={}, head={}), "hemi"), "")
+
+    def test_files_source_reads_the_merge_commits_profile(self):
+        for label, head, expected in (
+            ("absent", FILES, DEFAULT_DOCS),
+            ("empty", profile_with(docs_paths=[]), "[]"),
+            ("a list", profile_with(docs_paths=["docs/**"]), '["docs/**"]'),
+            ("refused", profile_with(docs_paths=["**"]), ""),
+            ("unreadable", {PROFILE: "{not json", VALUES: FILES[VALUES]}, ""),
+            ("removed", {}, ""),
+        ):
+            with self.subTest(head=label):
+                self.summary.unlink(missing_ok=True)
+                code = self.run_pr(self.hemi_answer("files"), main=FILES, head=head)
+                self.assertEqual(self.docs_paths(code, "files"), expected)
+
+    def test_files_source_without_hemi_still_names_the_list(self):
+        code = self.run_pr("drop", "drop", "drop", main=FILES, head=profile_with(docs_paths=["docs/**"]))
+        self.assertEqual(self.docs_paths(code, "files"), '["docs/**"]')
+
+
 if __name__ == "__main__":
     unittest.main()

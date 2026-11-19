@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).parents[1] / "wacd-profile.py"
+DOCS = Path(__file__).parents[1] / "wacd-docs.py"
 SPEC = importlib.util.spec_from_file_location("wacd_profile", SCRIPT)
 profile = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(profile)
@@ -76,7 +77,9 @@ class ProfileTest(unittest.TestCase):
 CASES = Path(__file__).parents[1] / "fixtures" / "wacd-profile-cases.json"
 CASE_NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 CASE_INPUT = {"profile": ".github/wacd.json", "contract": ".wacd-contract/contract.json"}
+MATCH = "docs-path-match"
 PREFIX = "wacd profile: "
+MATCH_PREFIX = "wacd docs: "
 
 # Functions whose refusals no case can express, and why. The test fails if one
 # of them stops refusing, so the list cannot outlive the code it excuses.
@@ -88,6 +91,10 @@ NOT_A_CASE = {
 # Refusals only a copy reaches; every other refusal is reachable from a profile
 # file and needs a profile case of its own.
 CONTRACT_ONLY = {"from_contract", "contract_object", "contract_field"}
+# wacd-docs.py's refusals that only its match command and the scope steps make,
+# with the field path `pattern` or `docs_paths`; every other one is a profile's.
+MATCH_ONLY = {"check_grammar"}
+SCOPE_ONLY = {"read_patterns"}
 
 
 def text_pattern(node, what):
@@ -163,8 +170,15 @@ class CaseTableTest(unittest.TestCase):
                 self.assertIsInstance(case["name"], str)
                 self.assertTrue(CASE_NAME.fullmatch(case["name"]), "kebab-case name")
                 self.assertTrue({"name", "kind", "input", "expect"} <= set(case) <= {"name", "kind", "input", "files", "expect"})
-                self.assertIn(case["kind"], CASE_INPUT)
+                self.assertIn(case["kind"], (*CASE_INPUT, MATCH))
                 expect = case["expect"]
+                if case["kind"] == MATCH:
+                    self.assertNotIn("files", case)
+                    self.assertEqual(set(case["input"]), {"pattern", "path"})
+                    self.assertTrue(all(isinstance(value, str) for value in case["input"].values()))
+                    self.assertIn(set(expect), ({"match"}, {"refused"}))
+                    self.assertIsInstance(expect.get("match", expect.get("refused")), (bool, str))
+                    continue
                 if "refused" in expect:
                     self.assertEqual(set(expect), {"refused"})
                     self.assertIsInstance(expect["refused"], str)
@@ -180,6 +194,11 @@ class CaseTableTest(unittest.TestCase):
                     self.assertNotIn(path, CASE_INPUT.values())
 
     def run_case(self, case):
+        if case["kind"] == MATCH:
+            return subprocess.run(
+                [sys.executable, "-I", str(DOCS), "match", case["input"]["pattern"], case["input"]["path"]],
+                capture_output=True, text=True, check=False,
+            )
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             for relative, content in case.get("files", {}).items():
@@ -198,9 +217,13 @@ class CaseTableTest(unittest.TestCase):
             with self.subTest(case=case["name"]):
                 result = self.run_case(case)
                 expect = case["expect"]
+                prefix = MATCH_PREFIX if case["kind"] == MATCH else PREFIX
                 if "refused" in expect:
                     self.assertEqual((result.returncode, result.stdout), (1, ""))
-                    self.assertEqual(result.stderr, f"{PREFIX}{expect['refused']}\n")
+                    self.assertEqual(result.stderr, f"{prefix}{expect['refused']}\n")
+                elif case["kind"] == MATCH:
+                    self.assertEqual((result.returncode, result.stderr), (0, ""))
+                    self.assertEqual(result.stdout, f"match={'true' if expect['match'] else 'false'}\n")
                 else:
                     self.assertEqual((result.returncode, result.stderr), (0, ""))
                     printed = parse_github_output(result.stdout)
@@ -211,12 +234,29 @@ class CaseTableTest(unittest.TestCase):
         templates, excused = refusal_templates(SCRIPT.read_text())
         self.assertTrue(templates, "found no refusals in the script")
         self.assertEqual(excused, set(NOT_A_CASE), "every excused function still refuses")
-        refused = {kind: [c["expect"]["refused"] for c in self.cases if c["kind"] == kind and "refused" in c["expect"]] for kind in CASE_INPUT}
+        docs_templates, docs_excused = refusal_templates(DOCS.read_text())
+        self.assertTrue(docs_templates, "found no refusals in wacd-docs.py")
+        self.assertEqual(docs_excused, set())
+        refused = {kind: [c["expect"]["refused"] for c in self.cases if c["kind"] == kind and "refused" in c["expect"]]
+                   for kind in (*CASE_INPUT, MATCH)}
         missing = []
         for function, line, regex in templates:
             kind = "contract" if function in CONTRACT_ONLY else "profile"
             if not any(regex.fullmatch(sentence) for sentence in refused[kind]):
                 missing.append(f"line {line} in {function}: no {kind} case matches {regex.pattern}")
+        for function, line, regex in docs_templates:
+            if function in SCOPE_ONLY:
+                continue
+            kinds = (MATCH, "profile", "contract") if function in MATCH_ONLY else ("profile", "contract")
+            for kind in kinds:
+                sentences = refused[kind]
+                if kind == MATCH:
+                    sentences = [s.removeprefix("pattern: ") for s in sentences]
+                else:
+                    sentences = [s.split(": ", 1)[1] for s in sentences if s.startswith("ci.docs_paths")]
+                message = regex.pattern.split(re.escape(": "), 1)[1]
+                if not any(re.fullmatch(message, sentence) for sentence in sentences):
+                    missing.append(f"line {line} in wacd-docs.py {function}: no {kind} case matches {message}")
         self.assertEqual(missing, [])
 
 

@@ -1018,6 +1018,530 @@
       "kind": "contract",
       "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["make", "make"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
       "expect": {"refused": "ci.apt_packages[1]: duplicate package 'make'"}
+    },
+    {
+      "name": "profile-docs-paths-absent",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"ok": true, "outputs": {"docs_paths": "[\"docs/**\",\"mkdocs.yml\",\"*.md\"]", "ci": "{\"stack\":\"node\",\"node_version\":\"22\",\"commands\":[\"npm run lint\",\"npm run typecheck\",\"npm test\",\"npm run build\"]}"}}
+    },
+    {
+      "name": "profile-docs-paths-empty",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": []}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"ok": true, "outputs": {"docs_paths": "[]", "ci": "{\"stack\":\"node\",\"node_version\":\"22\",\"commands\":[\"npm run lint\",\"npm run typecheck\",\"npm test\",\"npm run build\"],\"docs_paths\":[]}"}}
+    },
+    {
+      "name": "profile-docs-paths-list",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/**", "mkdocs.yml", "*.md", "**/*.rst", "guides/*.adoc", "CHANGELOG.md", "doc/**", "documentation/api/**", "notes/**/*.txt", "intro.mdx"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"ok": true, "outputs": {"docs_paths": "[\"docs/**\",\"mkdocs.yml\",\"*.md\",\"**/*.rst\",\"guides/*.adoc\",\"CHANGELOG.md\",\"doc/**\",\"documentation/api/**\",\"notes/**/*.txt\",\"intro.mdx\"]"}}
+    },
+    {
+      "name": "profile-docs-paths-null",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": null}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths: must be a list of patterns, or [] for none"}
+    },
+    {
+      "name": "profile-docs-paths-string",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": "docs/**"}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths: must be a list of patterns, or [] for none"}
+    },
+    {
+      "name": "profile-docs-paths-object",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": {"docs/**": true}}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths: must be a list of patterns, or [] for none"}
+    },
+    {
+      "name": "profile-docs-paths-entry-not-a-string",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/**", 1]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[1]: must be a non-empty string"}
+    },
+    {
+      "name": "profile-docs-paths-entry-null",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": [null]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: must be a non-empty string"}
+    },
+    {
+      "name": "profile-docs-paths-entry-empty",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": [""]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: must be a non-empty string"}
+    },
+    {
+      "name": "profile-docs-paths-leading-slash",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["/docs/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: '/docs/**' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-dot-slash",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["./docs/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: './docs/**' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-parent-segment",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/../src/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/../src/**' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-empty-segment",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs//a.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs//a.md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-trailing-slash",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-backslash",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs\\a.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs\\\\a.md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-question-mark",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/?.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/?.md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-bracket",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/[ab].md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/[ab].md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-brace",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/{a,b}.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/{a,b}.md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-space",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/a b.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/a b.md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-negation",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["!docs/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: '!docs/**' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-non-ascii",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/caf\u00e9.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/caf\u00e9.md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-line-feed",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/a.md\nsrc/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/a.md\\nsrc/**' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "profile-docs-paths-double-star-in-segment",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/**.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/**.md' may use ** only as a whole segment"}
+    },
+    {
+      "name": "profile-docs-paths-triple-star",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/***"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/***' may use ** only as a whole segment"}
+    },
+    {
+      "name": "profile-docs-paths-everything",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: '**' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-star",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["*"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: '*' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-source",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["src/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'src/**' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-json",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["*.json"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: '*.json' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-uppercase-extension",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["*.MD"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: '*.MD' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-star-in-earlier-segment",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["guides*/*.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'guides*/*.md' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-star-in-directory-name",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["*/README.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: '*/README.md' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-docs-directory-not-first",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["src/docs/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'src/docs/**' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-mkdocs-yml-not-at-the-root",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["site/mkdocs.yml"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'site/mkdocs.yml' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-yaml",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["notes.yaml"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'notes.yaml' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-star-before-extension-suffix",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["*.md.ts"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: '*.md.ts' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-github",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": [".github/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: '.github/**' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-second-entry-refused",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/**", "src/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[1]: 'src/**' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "profile-docs-paths-matches-the-values-file",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "docs/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/**"]}},
+      "files": {"docs/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/**' matches docs/values.yaml, which the checks or the release read, so it is not documentation"}
+    },
+    {
+      "name": "profile-docs-paths-matches-a-dockerfile",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}, {"name": "docs-site", "dockerfile": "docs/Dockerfile", "context": "."}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/**' matches docs/Dockerfile, which the checks or the release read, so it is not documentation"}
+    },
+    {
+      "name": "profile-docs-paths-matches-an-image-contexts-package-file",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}, {"name": "docs-site", "dockerfile": "site.Dockerfile", "context": "docs/site"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build"], "docs_paths": ["docs/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/**' matches docs/site/package.json, which the checks or the release read, so it is not documentation"}
+    },
+    {
+      "name": "profile-docs-paths-matches-a-gate-commands-path",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build", "node scripts/check-ledger.mjs docs/llc.md"], "docs_paths": ["docs/**"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/**' matches docs/llc.md, which the checks or the release read, so it is not documentation"}
+    },
+    {
+      "name": "profile-docs-paths-matches-a-quoted-gate-path",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build", "grep -q wacd './README.md'"], "docs_paths": ["docs/**", "*.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths[1]: '*.md' matches README.md, which the checks or the release read, so it is not documentation"}
+    },
+    {
+      "name": "profile-docs-paths-default-matches-a-gate-commands-path",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build", "uvx mkdocs build --strict --config-file mkdocs.yml"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"refused": "ci.docs_paths: the default pattern 'mkdocs.yml' matches mkdocs.yml, which the checks or the release read; set ci.docs_paths without it"}
+    },
+    {
+      "name": "profile-docs-paths-narrowed-around-a-gate-commands-path",
+      "kind": "profile",
+      "input": {"schema_version": 1, "app": "travel", "chart_version": "1.0.0", "values_file": "deploy/values.yaml", "tag_prefix": "v", "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health", "images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"}], "ci": {"stack": "node", "node_version": "22", "commands": ["npm run lint", "npm run typecheck", "npm test", "npm run build", "node scripts/check-ledger.mjs docs/llc.md"], "docs_paths": ["docs/guides/**", "*.md"]}},
+      "files": {"deploy/values.yaml": "name: travel-app\nimage: travel-app\nreplicas: 1\n"},
+      "expect": {"ok": true, "outputs": {"docs_paths": "[\"docs/guides/**\",\"*.md\"]"}}
+    },
+    {
+      "name": "contract-docs-paths-absent",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"ok": true, "outputs": {"docs_paths": "[\"docs/**\",\"mkdocs.yml\",\"*.md\"]", "ci": "{\"stack\":\"node\",\"node_version\":\"22\",\"commands\":[\"npm run lint\",\"npm test\"],\"apt_packages\":[\"python3\",\"g++\"]}"}}
+    },
+    {
+      "name": "contract-docs-paths-empty",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": []}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"ok": true, "outputs": {"docs_paths": "[]", "ci": "{\"stack\":\"node\",\"node_version\":\"22\",\"commands\":[\"npm run lint\",\"npm test\"],\"docs_paths\":[],\"apt_packages\":[\"python3\",\"g++\"]}"}}
+    },
+    {
+      "name": "contract-docs-paths-list",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": ["docs/**", "mkdocs.yml", "*.md", "**/*.rst", "guides/*.adoc", "CHANGELOG.md", "doc/**", "documentation/api/**", "notes/**/*.txt", "intro.mdx"]}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"ok": true, "outputs": {"docs_paths": "[\"docs/**\",\"mkdocs.yml\",\"*.md\",\"**/*.rst\",\"guides/*.adoc\",\"CHANGELOG.md\",\"doc/**\",\"documentation/api/**\",\"notes/**/*.txt\",\"intro.mdx\"]"}}
+    },
+    {
+      "name": "contract-docs-paths-null",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": null}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"refused": "ci.docs_paths: must be a list of patterns, or [] for none"}
+    },
+    {
+      "name": "contract-docs-paths-string",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": "docs/**"}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"refused": "ci.docs_paths: must be a list of patterns, or [] for none"}
+    },
+    {
+      "name": "contract-docs-paths-entry-empty",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": [""]}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"refused": "ci.docs_paths[0]: must be a non-empty string"}
+    },
+    {
+      "name": "contract-docs-paths-question-mark",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": ["docs/?.md"]}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/?.md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "contract-docs-paths-double-star-in-segment",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": ["docs/**.md"]}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/**.md' may use ** only as a whole segment"}
+    },
+    {
+      "name": "contract-docs-paths-source",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": ["src/**"]}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"refused": "ci.docs_paths[0]: 'src/**' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments"}
+    },
+    {
+      "name": "contract-docs-paths-matches-a-gate-commands-path",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": ["docs/**"]}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test", "node scripts/check-ledger.mjs docs/llc.md"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/**' matches docs/llc.md, which the checks or the release read, so it is not documentation"}
+    },
+    {
+      "name": "contract-docs-paths-matches-the-values-file",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "docs/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false, "docsPaths": ["docs/**"]}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"refused": "ci.docs_paths[0]: 'docs/**' matches docs/values.yaml, which the checks or the release read, so it is not documentation"}
+    },
+    {
+      "name": "contract-docs-paths-default-matches-a-gate-commands-path",
+      "kind": "contract",
+      "input": {"version": 1, "identity": {"repositoryId": "987654321", "repository": "wacwini/wac.app.travel", "app": "travel", "repoType": "cluster-app", "revision": 7, "sourceSha": "1111111111111111111111111111111111111111"}, "delivery": {"kind": "cluster-app", "application": "travel", "namespace": "travel", "project": "travel", "chart": "deploy/travel", "chartVersion": "1.0.0", "tagPrefix": "v", "valuesFile": "deploy/values.yaml", "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health", "healthExpectDbOk": false}, "build": {"images": [{"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"}, {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}], "stack": "node", "nodeVersion": "22", "aptPackages": ["python3", "g++"]}, "gates": [{"name": "checks", "commands": ["npm run lint", "npm test", "uvx mkdocs build --strict --config-file mkdocs.yml"], "required": true}], "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}}, "flags": {"source": "hemi"}},
+      "expect": {"refused": "ci.docs_paths: the default pattern 'mkdocs.yml' matches mkdocs.yml, which the checks or the release read; set ci.docs_paths without it"}
+    },
+    {
+      "name": "docs-match-star-within-a-segment",
+      "kind": "docs-path-match",
+      "input": {"pattern": "*.md", "path": "README.md"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-star-matches-no-characters",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/a*.md", "path": "docs/a.md"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-star-matches-a-leading-dot",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/*.md", "path": "docs/.hidden.md"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-star-never-crosses-a-slash",
+      "kind": "docs-path-match",
+      "input": {"pattern": "*.md", "path": "docs/a.md"},
+      "expect": {"match": false}
+    },
+    {
+      "name": "docs-match-star-segment-matches-one-segment",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/*/index.md", "path": "docs/guides/index.md"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-star-segment-needs-a-segment",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/*/index.md", "path": "docs/index.md"},
+      "expect": {"match": false}
+    },
+    {
+      "name": "docs-match-double-star-at-the-start",
+      "kind": "docs-path-match",
+      "input": {"pattern": "**/*.md", "path": "a/b/c.md"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-double-star-at-the-start-matches-zero-segments",
+      "kind": "docs-path-match",
+      "input": {"pattern": "**/*.md", "path": "c.md"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-double-star-in-the-middle",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/**/guide.md", "path": "docs/a/b/guide.md"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-double-star-in-the-middle-matches-zero-segments",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/**/guide.md", "path": "docs/guide.md"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-double-star-at-the-end",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/**", "path": "docs/a/b.png"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-double-star-at-the-end-matches-zero-segments",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/**", "path": "docs"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-a-prefix-is-not-a-segment",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/**", "path": "docsite/index.md"},
+      "expect": {"match": false}
+    },
+    {
+      "name": "docs-match-exact-path",
+      "kind": "docs-path-match",
+      "input": {"pattern": "mkdocs.yml", "path": "mkdocs.yml"},
+      "expect": {"match": true}
+    },
+    {
+      "name": "docs-match-exact-path-only-at-the-root",
+      "kind": "docs-path-match",
+      "input": {"pattern": "mkdocs.yml", "path": "site/mkdocs.yml"},
+      "expect": {"match": false}
+    },
+    {
+      "name": "docs-match-a-longer-pattern-does-not-match-a-shorter-path",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/a/b.md", "path": "docs/a"},
+      "expect": {"match": false}
+    },
+    {
+      "name": "docs-match-dot-is-literal",
+      "kind": "docs-path-match",
+      "input": {"pattern": "a.md", "path": "axmd"},
+      "expect": {"match": false}
+    },
+    {
+      "name": "docs-match-is-case-sensitive-in-a-directory",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/**", "path": "Docs/a.md"},
+      "expect": {"match": false}
+    },
+    {
+      "name": "docs-match-is-case-sensitive-in-an-extension",
+      "kind": "docs-path-match",
+      "input": {"pattern": "*.md", "path": "README.MD"},
+      "expect": {"match": false}
+    },
+    {
+      "name": "docs-match-question-mark-is-refused",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/?.md", "path": "docs/?.md"},
+      "expect": {"refused": "pattern: 'docs/?.md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "docs-match-bracket-is-refused",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/[ab].md", "path": "docs/a.md"},
+      "expect": {"refused": "pattern: 'docs/[ab].md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "docs-match-brace-is-refused",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/{a,b}.md", "path": "docs/a.md"},
+      "expect": {"refused": "pattern: 'docs/{a,b}.md' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "docs-match-leading-slash-is-refused",
+      "kind": "docs-path-match",
+      "input": {"pattern": "/docs/**", "path": "docs/a.md"},
+      "expect": {"refused": "pattern: '/docs/**' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment"}
+    },
+    {
+      "name": "docs-match-double-star-inside-a-segment-is-refused",
+      "kind": "docs-path-match",
+      "input": {"pattern": "docs/**.md", "path": "docs/a.md"},
+      "expect": {"refused": "pattern: 'docs/**.md' may use ** only as a whole segment"}
     }
   ]
 }

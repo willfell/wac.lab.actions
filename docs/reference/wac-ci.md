@@ -30,7 +30,7 @@ Callers' obligations from `v1.35.0`:
 
 - The calling job grants `id-token: write`, as above.
 - The calling job's id is `wacd-ci`, with no `name:`. It is load-bearing:
-  the jobs show as `wacd-ci / contract`, `wacd-ci / checks` and the rest, and
+  the jobs show as `wacd-ci / contract`, `wacd-ci / scope`, `wacd-ci / checks` and the rest, and
   hemi and the organization ruleset read the required check
   `wacd-ci / contract` by that name. A renamed job leaves the required check
   unreported, and every merge waits for it.
@@ -51,9 +51,12 @@ Callers' obligations from `v1.35.0`:
 | --- | --- |
 | `npm_token` | optional token for private npm packages; empty uses the job's GitHub token |
 
-It runs six jobs. `contract` runs first and decides where `checks` and
+It runs seven jobs, whose names are stable: `contract`, `scope`, `checks`,
+`render`, `lint`, `techdocs` and `agents-md`. `contract` runs first and decides where `checks` and
 `render` read their settings (below); those two need it, while `lint`,
-`techdocs` and `agents-md` read no settings and start at once. `checks` sets up node or go for `ci.stack` and runs
+`techdocs` and `agents-md` read no settings and start at once. `scope` runs
+after `contract` and decides whether `checks` runs at all: a pull request that
+changes only documentation skips it (**The scope job**, below). `checks` sets up node or go for `ci.stack` and runs
 `ci.commands` in order, each in its own log group. For `stack: node` it runs
 `npm ci` first, but only when the repo has a root `package.json`; a repo
 without one, such as finance, lists `npm ci --prefix <dir>` in `ci.commands`
@@ -83,8 +86,9 @@ It builds no image and pushes nothing.
 app's dependencies, runs its tests and builds it. `render`, `lint`, `techdocs`
 and `agents-md` peak under 400Mi and run for seconds to a minute. A caller
 that passes `build_runner: ${{ vars.CI_RUNNER_STANDARD }}` and no `runner`
-sends `checks` there and leaves the other five jobs on its `CI_RUNNER_SMALL`;
-`contract`, the sixth, reads two shallow trees and makes one request.
+sends `checks` there and leaves the other six jobs on its `CI_RUNNER_SMALL`;
+`contract` reads two shallow trees and makes one request, and `scope` makes
+one request and runs no repository code.
 Passing only `runner` still puts every job on that runner, as before
 `build_runner` existed. `render` pulls `wac-app` from the in-cluster registry, so this
 split fits only a caller whose `CI_RUNNER_SMALL` is a Lab pool. A repository
@@ -150,6 +154,84 @@ list must keep at least one command, and a repository whose own tests require
 the probe commands (wac.hemi's `deploy-contract.test.ts` does) changes those
 tests in the same pull request. Nothing breaks if the commands stay: each
 then runs twice.
+
+## The scope job
+
+From `v1.36.0` a pull request that changes only documentation takes no build
+runner: `checks` is skipped, and `contract`, `render`, `lint`, `techdocs` and
+`agents-md` run as before. The standard runners `checks` takes are the
+fleet's bottleneck; a documentation change has nothing for them to build or
+test.
+
+`scope` needs `contract` and runs under `if: ${{ !cancelled() }}` on
+`runner`, or the caller's `CI_RUNNER_SMALL`. It holds `contents: read` and
+nothing else: no `id-token`, no secret, and no checkout of the pull request,
+only this repository at `job.workflow_sha` for its script, through the
+commit-pinned checkout, moved out of the workspace. It sets
+`PYTHONSAFEPATH=1` and runs `python3 -I "$WACD_SCRIPTS"/wacd-docs.py
+pr-scope`, which needs no `actions/setup-python`. Its one output is `heavy`,
+and `checks` runs under
+`if: ${{ !cancelled() && needs.scope.outputs.heavy != 'false' }}`: only the
+literal `false` skips it, so a `scope` that failed, was skipped or wrote
+nothing leaves the checks running. A skipped `checks` reports `skipped`; the
+required check is `wacd-ci / contract`, which still runs.
+
+The patterns are the settings the run uses: `contract`'s new output
+`docs_paths`, the effective `ci.docs_paths` of hemi's copy
+(`delivery.docsPaths`) when the source is `hemi`, or of the merge commit's
+`.github/wacd.json`, read with `git cat-file` as data, when the source is the
+files ([The wacd profile](wacd-profile.md), **Documentation paths**). It is
+empty when that list cannot be read or is refused, and the `checks` job then
+refuses it with its sentence. So the skip needs no token of its own, and
+reads no settings `checks` would not read.
+
+`heavy` is `false` only when every one of these holds:
+
+- the event is `pull_request`, read from the runner's `GITHUB_EVENT_NAME`;
+- its base, read from the runner's event file (`GITHUB_EVENT_PATH`), is the
+  repository's default branch: a stacked pull request runs the checks;
+- `contract` succeeded and its `docs_paths` is a non-empty list the matcher
+  accepts;
+- `GET /repos/{repository}/compare/{base.sha}...{head.sha}`, read with the
+  job's `GITHUB_TOKEN` within 20 seconds and 32 MiB and with redirects
+  refused, is complete: a `files` list of fewer than 300 entries, and as many
+  `commits` as its `total_commits`;
+- it lists at least one file, no `filename` or `previous_filename` is under
+  `.github/`, and every one matches a pattern.
+
+Anything else runs the checks: a `merge_group` or any other event, an API
+error or timeout, a list that may be truncated, patterns that are missing,
+refused or `[]`, and any failure of the script itself.
+
+`scope` writes `### wac-ci scope` to the run summary every time, with one
+sentence. When it skips: `Only documentation changed, so the checks that build
+and test the app did not run.`, which is also a `::notice::` annotation. When
+it runs: `The checks ran because: <reason>`, where the reason is one of these
+fixed phrases:
+
+| reason | when |
+| --- | --- |
+| `this is not a pull request into the default branch` | any other event, a base that is not the default branch, or an event file that cannot be read |
+| `the documentation paths could not be read` | `contract` did not succeed, or its `docs_paths` is empty |
+| `a documentation path was refused` | `docs_paths` is not a list of patterns the matcher accepts |
+| `this repository sets no documentation paths` | `docs_paths` is `[]` |
+| `the changed files could not be read` | any status but 200, a redirect, a timeout, an answer over 32 MiB or not JSON, a file entry with no name, or a failure of the script |
+| `the list of changed files may be incomplete` | 300 or more files, fewer commits listed than counted, or no `files` list |
+| `the comparison lists no changed file` | an empty `files` list |
+| `a file under .github/ changed: <paths>` | a name under `.github/`, even one a pattern would match |
+| `a file outside the documentation paths changed: <paths>` | a name no pattern matches |
+
+`<paths>` is the first three offending names, comma-separated, then
+`, and <n> more` when there are more; each name is escaped as workflow-command
+data (`%` as `%25`, a carriage return as `%0D`, a line feed as `%0A`), so a
+file name cannot end the output line or start a command. `scope` reads the
+base branch only to tell a pull request into the default branch; whether a
+repository is cut over is still main's to say (below).
+
+A repository whose `ci.commands` read a default path must set
+`ci.docs_paths` before its pin moves to `v1.36.0`, or a documentation-only
+pull request skips the checks that read it; `CONSUMERS.md` lists what each
+consumer needs.
 
 ## The contract job
 

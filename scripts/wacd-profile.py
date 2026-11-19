@@ -15,14 +15,31 @@ are the copy's `runtime`, so the repository need not hold that file.
 `root_package=true|false` (whether wac-ci's implicit root `npm ci` applies)
 and a `lockfiles` multi-line block of every package-lock.json for the npm
 cache, empty when there are none.
+
+`ci.docs_paths` (hemi's `delivery.docsPaths`) is checked by wacd-docs.py's
+check_docs_paths(), the one matcher wac-ci and wac-cd share, and its refusals
+are this script's: ProfileError is that module's class. The `docs_paths` line
+is the effective list, wacd-docs.py's DEFAULT when the key is absent, while
+`ci` keeps the key as written, so an absent list and `[]` stay apart.
 """
 
+import importlib.util
 import json
 import os
 import re
 import sys
 import uuid
 from pathlib import Path
+
+
+def _load_docs():
+    spec = importlib.util.spec_from_file_location("wacd_profile_docs", Path(__file__).with_name("wacd-docs.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+docs = _load_docs()
 
 APP = re.compile(r"[a-z][a-z0-9-]{0,39}")
 SEMVER = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
@@ -49,7 +66,7 @@ TOP_OPTIONAL = ("health_expect_db_ok",)
 IMAGE_REQUIRED = ("name", "dockerfile", "context")
 IMAGE_OPTIONAL = ("sha_build_arg",)
 CI_REQUIRED = ("stack", "commands")
-CI_OPTIONAL = ("node_version", "go_version", "go_version_file", "apt_packages")
+CI_OPTIONAL = ("node_version", "go_version", "go_version_file", "apt_packages", "docs_paths")
 
 CONTRACT_DIR = ".wacd-contract"
 DERIVED_VALUES = f"{CONTRACT_DIR}/values.json"
@@ -60,8 +77,7 @@ CONTRACT_IMAGE_REQUIRED = ("name", "dockerfile", "context")
 CONTRACT_IMAGE_OPTIONAL = ("shaBuildArg",)
 
 
-class ProfileError(Exception):
-    """A profile problem; the message starts with the dotted field path."""
+ProfileError = docs.ProfileError
 
 
 def fail(path, message):
@@ -205,6 +221,7 @@ def validate(data, repo_root, values_in_repo=True):
         fail("health_expect_db_ok", "must be a JSON boolean")
     check_images(data["images"], "images")
     check_ci(data["ci"], "ci", repo_root)
+    docs.check_docs_paths(data["ci"], "ci", data)
 
 
 def load(path):
@@ -236,7 +253,8 @@ def from_contract(contract, values_file):
     refused rather than dropped, so a setting the copy carries is never
     silently ignored. An aptPackages of [] is left out, as the profile writes
     it; any other value goes on to ci.apt_packages and its check, so 0, null
-    and "" are refused there rather than dropped.
+    and "" are refused there rather than dropped. delivery.docsPaths, when
+    present, goes on to ci.docs_paths as it is, `[]` and null included.
     """
     contract_object(contract, "contract")
     version = contract_field(contract, "version", "contract")
@@ -279,6 +297,8 @@ def from_contract(contract, values_file):
         if source in build:
             ci[target] = build[source]
     ci["commands"] = commands
+    if "docsPaths" in delivery:
+        ci["docs_paths"] = delivery["docsPaths"]
     if "aptPackages" in build and build["aptPackages"] != []:
         ci["apt_packages"] = build["aptPackages"]
     return {
@@ -335,6 +355,7 @@ def outputs(data):
         f"images={json.dumps(data['images'], **compact)}",
         f"ci={json.dumps(data['ci'], **compact)}",
         f"apt_packages={' '.join(data['ci'].get('apt_packages', []))}",
+        f"docs_paths={json.dumps(data['ci'].get('docs_paths', list(docs.DEFAULT)), **compact)}",
     ]
 
 

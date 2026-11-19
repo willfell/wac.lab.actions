@@ -110,6 +110,37 @@ wacwini/wac.lab `.github/workflows/warehouse-image.yml` and
 | `wac-ci` | wacwini/wac.app.wealth | `.github/workflows/ci.yml` | `v1.34.0` |
 | `wac-ci` | wacwini/wac.hemi | `.github/workflows/ci.yml` | `v1.34.0` |
 
+## Documentation paths before the `v1.36.0` bump
+
+From `v1.36.0` a pull request that changes only documentation skips
+`wac-ci`'s `checks`, and such a push releases nothing (`docs/reference/wacd-profile.md`,
+**Documentation paths**). The default patterns are `docs/**`, `mkdocs.yml`
+and `*.md`, so a repository whose gates read one of those paths must narrow
+`ci.docs_paths` (hemi's `delivery.docsPaths` for a cut-over app), or set
+`[]`, before its pin moves to `v1.36.0`; otherwise a documentation-only pull
+request skips the checks that read it. A cut-over app sets it in hemi's copy,
+which needs hemi to accept the key first.
+
+Surveyed on 2026-11-19 UTC from each repository's default branch, read-only
+through `gh api` (the tree, each tarball, and for the cut-over apps their
+`contracts/<repository id>/active.json` in `wacwini/wac.fleet`): the gate
+commands, every test and script they run, the lint and format configs, and
+the Dockerfiles. Every live copy, and wac.hemi.test's profile, passes the new
+rules with the default and with the value below.
+
+| Repository | Settings | What reads a default path | Required `docs_paths` |
+|---|---|---|---|
+| wacwini/wac | hemi | `npm run check:emoji` (`scripts/check-no-emoji.mjs`) scans every `.md` from the root, `AGENTS.md`, `DISTRIBUTION.md` and `docs/` included; `scripts/sync-kit-docs.test.mjs` (in `npm test`) reads `docs/kit/*.md` against `packages/ui/README.md`, `packages/ui/CHANGELOG.md` and `DISTRIBUTION.md` | `[]` (nothing reads `mkdocs.yml`, so `["mkdocs.yml"]` is the most it could skip on) |
+| wacwini/wac.hemi | hemi | nothing: its tests read `src/`, `.github/workflows/`, `deploy/`, `scripts/`, the package files, `.gitignore`, `.dockerignore` and `next.config.ts`; docs paths appear in `release-paths.test.ts`, `view.test.ts`, `cutover-preflight.test.ts` and `deploy-contract.test.ts` only as string fixtures; `check:emoji` scans `src`, `scripts` and `deploy` | the default (leave it absent) |
+| wacwini/mcp.argo | hemi | nothing: `make lint` is `gofmt -l .` and `go vet`, `make test` reads `__toolsnaps__/` and `testdata/` | the default |
+| wacwini/wac.app.finance | hemi | `node scripts/check-no-emoji.mjs` scans `docs/llc.md`; `app/tests/api/llc-snapshot-contract.test.ts` and the ledger's `doc`, `snapshot` and `paid` tests read `docs/llc.md`; `app/tests/ui/payday.test.tsx` and `tokens.test.ts` read `docs/ui.md`; `app/tests/db/schema.test.ts` reads `docs/data-and-api.md`; `app/tests/ui/payday-summary.test.tsx` reads `docs/superpowers/specs/2026-08-10-cash-on-hand-design.md` | `["mkdocs.yml", "*.md", "docs/guides/**", "docs/handoffs/**", "docs/llc-research-2026-09/**", "docs/proposals/**", "docs/superpowers/plans/**"]` |
+| wacwini/wac.app.travel | hemi | nothing: `check:emoji` scans `src`, `scripts` and `deploy`, and no test reads `docs/` or a root `.md` | the default |
+| wacwini/wac.app.wealth | hemi | `src/lib/__tests__/docs-invariants.test.ts` reads `mkdocs.yml` and every page under `docs/`; `body-docs.test.ts` reads `docs/` and `AGENTS.md`; `close-docs`, `data-docs`, `gratitude-coffee`, `today-redirects` and `week-redirect` tests read `docs/tasks.md`, `docs/design.md` and others | `[]` |
+| wacwini/wac.hemi.test | files | nothing: `compileall src tests` and `unittest discover -s tests` | the default |
+
+No image copies `docs/` or a root `.md` into what it serves: the Next.js
+images ship only their standalone output, and the others copy named sources.
+
 ## Consumers that are not maintained here
 
 | Component | Repo | File | Pin | Why it is listed separately |

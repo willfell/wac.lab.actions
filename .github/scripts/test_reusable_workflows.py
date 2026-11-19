@@ -570,7 +570,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertIsInstance(refusal["timeout-minutes"], int)
         self.assertNotIn("continue-on-error", refusal, "a refusal fails plan, never a green run")
         self.assertNotIn("continue-on-error", doc["jobs"]["plan"], "a refusal fails plan, never a green run")
-        self.assertEqual(names[-1], refusal["name"], "nothing runs between the planning step and the refusal")
+        self.assertEqual(names[names.index("Plan the version") + 2:], ["Nothing to release: only documentation changed"],
+                         "after the refusal only the documentation-only report follows")
 
         def git(repo, *args):
             return subprocess.run(
@@ -687,6 +688,158 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertNotIn("always()", condition)
                 if "cancelled()" in condition:
                     self.assertIn("!failure()", condition)
+
+    def docs_plan(self, after, released=("0.2.0",), docs_paths='["docs/**","mkdocs.yml","*.md"]', event="push"):
+        """Run plan's `Plan the version` on a push in a temp repository with real tags, the real scripts and a bare
+        origin, against stand-in GitHub Releases for the versions in released ("unreadable": every read is a 502).
+
+        main starts with C, tagged v0.2.0, holding src/app.ts, src/notes.md and docs/guide.md; each item of after
+        is one more commit: docs (docs/ and README.md), docs-rename (a page renamed within docs/), code (src/app.ts),
+        claim (a code commit tagged v0.2.1, as a release that claimed its tag and never finished leaves it), rename
+        (src/notes.md into docs/), github (a workflow file) or github-doc (a Markdown file under .github/). The step's last commit is HEAD, as a push leaves it.
+        """
+        import os
+        import shutil
+        import subprocess
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        root = Path(__file__).resolve().parents[2]
+        steps = self.wac_cd()["jobs"]["plan"]["steps"]
+        by_name = {s.get("name"): s for s in steps}
+        step, report = by_name["Plan the version"], by_name["Nothing to release: only documentation changed"]
+
+        def git(repo, *args):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                                   "-c", "tag.gpgsign=false", *args], cwd=repo, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+
+        reads = []
+
+        class Releases(BaseHTTPRequestHandler):
+            def do_GET(self):
+                reads.append((self.path, self.headers.get("Authorization")))
+                tag = self.path.rsplit("/", 1)[-1]
+                code = 502 if "unreadable" in released else 200 if tag[1:] in released else 404
+                self.send_response(code)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Releases)
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        repo, bare = tmp / "repo", tmp / "origin.git"
+        repo.mkdir()
+        git(tmp, "init", "-q", "--bare", str(bare))
+        git(repo, "-c", "init.defaultBranch=main", "init", "-q")
+        for path, text in (("src/app.ts", "one\n"), ("src/notes.md", "notes\n"), ("docs/guide.md", "guide\n"),
+                           (".github/workflows/ci.yml", "on: pull_request\n")):
+            (repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (repo / path).write_text(text)
+        git(repo, "add", ".")
+        git(repo, "commit", "-q", "-m", "feat: first")
+        git(repo, "tag", "v0.2.0")
+        for n, kind in enumerate(after):
+            if kind == "docs":
+                (repo / "docs" / "guide.md").write_text(f"guide {n}\n")
+                (repo / "README.md").write_text(f"readme {n}\n")
+            elif kind in ("code", "claim"):
+                (repo / "src" / "app.ts").write_text(f"code {n}\n")
+            elif kind == "rename":
+                git(repo, "mv", "src/notes.md", "docs/notes.md")
+            elif kind == "docs-rename":
+                git(repo, "mv", "docs/guide.md", "docs/intro.md")
+            elif kind == "github":
+                (repo / ".github" / "workflows" / "ci.yml").write_text(f"on: [pull_request] # {n}\n")
+            elif kind == "github-doc":
+                (repo / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text(f"template {n}\n")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", f"{'docs' if kind == 'docs' else 'fix'}: {kind} {n}")
+            if kind == "claim":
+                git(repo, "tag", "v0.2.1")
+        git(repo, "remote", "add", "origin", str(bare))
+        git(repo, "push", "-q", "origin", "main", "refs/tags/*")
+        head = git(repo, "rev-parse", "HEAD")
+        before = set(git(bare, "for-each-ref", "--format=%(refname)").splitlines())
+        out, summary = tmp / "out", tmp / "summary"
+        env = {**{k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "PYTHON"))},
+               "PYTHONSAFEPATH": "1", "WACD_SCRIPTS": str(root / "scripts"), "RUNNER_TEMP": str(tmp),
+               "GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_SHA": head,
+               "GITHUB_API_URL": f"http://127.0.0.1:{server.server_address[1]}", "GITHUB_REPOSITORY": "wacwini/app"}
+        step_env = {"ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "", "DEPLOY": "true",
+                    "APP": "app", "TAG_PREFIX": "v", "SETTINGS_REVISION": "", "SETTINGS_MODE": "",
+                    "SETTINGS_VERSION": "", "SETTINGS_TAG": "", "SETTINGS_COMMIT": "", "SETTINGS_SUMMARY": "",
+                    "SETTINGS_UNFINISHED": "", "EVENT_NAME": event, "DOCS_PATHS": docs_paths,
+                    "GITHUB_TOKEN": "job-token"}
+        self.assertEqual(set(step_env), set(step["env"]))
+        result = subprocess.run(["bash", "-c", step["run"]], env={**env, **step_env}, cwd=repo,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
+        pushed = sorted(set(git(bare, "for-each-ref", "--format=%(refname)").splitlines()) - before)
+        plan = {"outputs": outputs, "pushed": pushed, "summary": summary.read_text(), "head": head, "reads": reads,
+                "log": result.stdout + result.stderr}
+        self.assertEqual(report["if"], "${{ steps.version.outputs.docs_since != '' }}")
+        self.assertEqual(report["env"], {"SINCE": "${{ steps.version.outputs.docs_since }}"})
+        if outputs.get("docs_since"):
+            plan["report"] = subprocess.run(["bash", "-c", report["run"]], env={**env, "SINCE": outputs["docs_since"]},
+                                            capture_output=True, text=True)
+        return plan
+
+    def assertReleases(self, plan, version):
+        self.assertEqual({k: plan["outputs"][k] for k in ("mode", "version", "tag")},
+                         {"mode": "release", "version": version, "tag": f"v{version}"}, plan["log"])
+        self.assertEqual(plan["pushed"], [f"refs/tags/v{version}"])
+        self.assertNotIn("docs_since", plan["outputs"])
+        self.assertNotIn("nothing to release", plan["summary"])
+
+    def test_wac_cd_a_documentation_only_push_after_a_released_version_releases_nothing(self):
+        for after in (("docs",), ("docs", "docs"), ("docs-rename",), ("docs",) * 3):
+            with self.subTest(after=after):
+                plan = self.docs_plan(after)
+                self.assertEqual(plan["outputs"], {"mode": "none", "version": "", "tag": "",
+                                                   "expected_sha": plan["head"], "docs_since": "v0.2.0"}, plan["log"])
+                self.assertEqual(plan["pushed"], [], "no tag is claimed")
+                self.assertIn("\nnothing to release: only documentation changed since v0.2.0.\n", plan["summary"])
+                self.assertIn("| none | - | - |", plan["summary"])
+                self.assertEqual(plan["report"].returncode, 0)
+                self.assertIn("::notice::wac-cd: nothing to release: only documentation changed since v0.2.0.",
+                              plan["report"].stdout)
+                self.assertEqual(plan["reads"], [("/repos/wacwini/app/releases/tags/v0.2.0", "Bearer job-token")])
+
+    def test_wac_cd_a_code_change_since_the_released_version_releases(self):
+        for after, version in ((("code",), "0.2.1"), (("docs", "code"), "0.2.1"), (("rename",), "0.2.1"),
+                               (("github",), "0.2.1"), (("docs", "github"), "0.2.1")):
+            with self.subTest(after=after):
+                self.assertReleases(self.docs_plan(after), version)
+        with self.subTest(after="a .github/ file a pattern matches"):
+            self.assertReleases(self.docs_plan(("github-doc",), docs_paths='["docs/**","**/*.md"]'), "0.2.1")
+
+    def test_wac_cd_documentation_after_an_unfinished_code_release_releases_it(self):
+        """v0.2.1 claimed its tag and never got a Release: the base is v0.2.0, so its code is still unreleased."""
+        plan = self.docs_plan(("claim", "docs"))
+        self.assertReleases(plan, "0.2.2")
+        self.assertEqual([path for path, _ in plan["reads"]],
+                         ["/repos/wacwini/app/releases/tags/v0.2.1", "/repos/wacwini/app/releases/tags/v0.2.0"])
+
+    def test_wac_cd_documentation_with_no_release_to_measure_from_releases_as_before(self):
+        for label, kwargs in (
+            ("no Release yet", {"released": ()}),
+            ("Releases unreadable", {"released": ("unreadable",)}),
+            ("no documentation paths", {"docs_paths": "[]"}),
+            ("no patterns read", {"docs_paths": ""}),
+            ("a refused pattern", {"docs_paths": '["src/**"]'}),
+            ("not a push", {"event": "workflow_dispatch"}),
+        ):
+            with self.subTest(case=label):
+                self.assertReleases(self.docs_plan(("docs",), **kwargs), "0.2.1")
 
     def test_wac_cd_shadow_observes_and_never_holds_a_release(self):
         """A hemi outage must not fail or delay a release: the shadow job is off the release path."""
@@ -1257,7 +1410,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         guard = {"SHARED_WORKFLOW_SHA": sha}
         code = {"ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "", "DEPLOY": "true",
                 "APP": "app", "TAG_PREFIX": "v", "SETTINGS_REVISION": "", "SETTINGS_MODE": "", "SETTINGS_VERSION": "",
-                "SETTINGS_TAG": "", "SETTINGS_COMMIT": "", "SETTINGS_SUMMARY": "", "SETTINGS_UNFINISHED": ""}
+                "SETTINGS_TAG": "", "SETTINGS_COMMIT": "", "SETTINGS_SUMMARY": "", "SETTINGS_UNFINISHED": "",
+                "EVENT_NAME": "push", "DOCS_PATHS": '["docs/**","mkdocs.yml","*.md"]', "GITHUB_TOKEN": "job-token"}
         settings = {**code, "SETTINGS_REVISION": "7", "SETTINGS_MODE": "settings", "SETTINGS_VERSION": "1.4.3",
                     "SETTINGS_TAG": "v1.4.3", "SETTINGS_COMMIT": head, "SETTINGS_SUMMARY": "settings revision 7"}
         refusal = ({"REASON": "a refusal"}, 1)
@@ -1278,6 +1432,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             ("plan", "Refuse a settings release behind a workflow change"): [refusal],
             ("plan", "Plan the version"): [(code, 0), ({**code, "ROLLBACK_VERSION": "1.4.2"}, 0), (settings, 0)],
             ("plan", "Refuse to replay an old version"): [refusal],
+            ("plan", "Nothing to release: only documentation changed"): [({"SINCE": "v1.4.2"}, 0)],
             ("shadow", "Start the clock"): [({}, 0)],
             ("shadow", "Require the runner's python3 3.12 or later"): [(runner, 0)],
             ("shadow", "Require the defining workflow commit"): [(guard, 0)],
@@ -1384,6 +1539,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             "wacd-chart.py": "state=absent",
             "wacd-tag.py": "claim=pushed",
             "wacd-shadow.py": "",
+            "wacd-docs.py": "docs_only=false\nreason=r",
         }
         stub = (
             "import json, os, socket, ssl, sys\n"
@@ -1393,7 +1549,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             "print(answers[max((key for key in answers if line.startswith(key)), key=len)])\n"
         )
         for name in ("wacd-contract.py", "wacd-profile.py", "wacd-release.py", "wacd-version.py", "wacd-chart.py",
-                     "wacd-tag.py", "wacd-shadow.py"):
+                     "wacd-tag.py", "wacd-shadow.py", "wacd-docs.py"):
             (scripts / name).write_text(stub)
         (scripts / "install-helm.sh").write_text("exit 0\n")
         python_log, stub_log = tmp / "python.log", tmp / "stub.log"
@@ -1541,7 +1697,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         scripts = Path(__file__).resolve().parents[2] / "scripts"
         imported = set()
         for name in ("wacd-contract", "wacd-release", "ci-release", "wacd-chart", "wacd-shadow", "wacd-profile",
-                     "wacd-tag", "wacd-version"):
+                     "wacd-tag", "wacd-version", "wacd-docs"):
             for node in ast.walk(ast.parse((scripts / f"{name}.py").read_text())):
                 if isinstance(node, ast.Import):
                     imported.update(alias.name for alias in node.names)
@@ -1845,7 +2001,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                                 "a capped wait still ends inside the job, with its summary line")
 
     def test_wac_cd_plan_ends_inside_its_job_bound_even_when_every_step_uses_its_own(self):
-        """35 + 1 + 32 = 68: the gateway wait's cap, a minute for its last request, and every other step's bound.
+        """35 + 1 + 36 = 72: the gateway wait's cap, a minute for its last request, and every other step's bound.
 
         The gateway wait has no kill switch of its own: it ends PLAN_WAIT_CAP seconds after it starts,
         plus one last request (a token mint and a connection), allowed a minute. Every other step stops at
@@ -1862,12 +2018,12 @@ class ReusableWorkflowTests(unittest.TestCase):
         spec.loader.exec_module(contract)
         wait = math.ceil(contract.PLAN_WAIT_CAP / 60) + 1
         others = sum(step["timeout-minutes"] for step in plan["steps"] if step.get("id") != "contract")
-        self.assertEqual((wait, others, plan["timeout-minutes"]), (36, 32, 68),
+        self.assertEqual((wait, others, plan["timeout-minutes"]), (36, 36, 72),
                          "the sum the docstring and docs/reference/wac-cd.md state")
         self.assertEqual(wait + others, plan["timeout-minutes"], f"{wait} + {others} is plan's bound")
 
     def test_wac_cd_plan_bounds_every_step_but_the_gateway_wait(self):
-        """With 68 minutes for the job, a stalled checkout or git push must not use them all."""
+        """With 72 minutes for the job, a stalled checkout or git push must not use them all."""
         steps = self.wac_cd()["jobs"]["plan"]["steps"]
         for step in steps:
             name = step.get("name") or step.get("uses")
@@ -1876,7 +2032,8 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertNotIn("timeout-minutes", step, "the wait is bounded by --wait-timeout")
                     continue
                 self.assertIsInstance(step.get("timeout-minutes"), int)
-                self.assertLessEqual(step["timeout-minutes"], 6)
+                self.assertLessEqual(step["timeout-minutes"], 9 if name == "Plan the version" else 6,
+                                     "Plan the version also holds the documentation-only read's 150 seconds")
 
     def test_wac_cd_plan_checks_the_trigger_before_asking_the_gateway(self):
         """A malformed dispatch must not wait out a gateway outage before saying so."""
@@ -2703,7 +2860,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         plan = [s.get("name") for s in jobs["plan"]["steps"]]
         for name in ("Refuse a settings release behind a workflow change",
                      "Refuse a settings release while the app is rolling out",
-                     "Refuse a settings release behind an unfinished code release", "Refuse to replay an old version"):
+                     "Refuse a settings release behind an unfinished code release", "Refuse to replay an old version",
+                     "Nothing to release: only documentation changed"):
             self.assertIn(name, plan)
 
     def test_wac_cd_the_status_read_comes_out_of_plan_s_budget(self):
@@ -2753,23 +2911,91 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(sorted(name for name, job in jobs.items() if holds_id_token(doc, job)), ["contract"])
         self.assertEqual(jobs["contract"]["permissions"], {"contents": "read", "id-token": "write"})
         self.assertNotIn("needs", jobs["contract"])
-        self.assertEqual(jobs["contract"]["outputs"], {"source": "${{ steps.contract.outputs.source }}"})
+        self.assertEqual(jobs["contract"]["outputs"], {"source": "${{ steps.contract.outputs.source }}",
+                                                       "docs_paths": "${{ steps.contract.outputs.docs_paths }}"})
         others = [name for name in jobs if name != "contract"]
-        self.assertEqual(sorted(others), ["agents-md", "checks", "lint", "render", "techdocs"])
+        self.assertEqual(sorted(others), ["agents-md", "checks", "lint", "render", "scope", "techdocs"])
         for name in ("lint", "techdocs", "agents-md"):
             with self.subTest(job=name):
                 self.assertNotIn("needs", jobs[name])
                 self.assertNotIn("if", jobs[name])
                 self.assertNotIn("needs.contract", json.dumps(jobs[name]))
+        conditions = {"checks": "${{ !cancelled() && needs.scope.outputs.heavy != 'false' }}",
+                      "render": "${{ !cancelled() }}"}
         for name in ("checks", "render"):
             job = jobs[name]
             with self.subTest(job=name):
                 needs = job.get("needs")
                 self.assertIn("contract", [needs] if isinstance(needs, str) else needs or [])
-                self.assertEqual(job.get("if"), "${{ !cancelled() }}")
+                self.assertEqual(job.get("if"), conditions[name])
                 first = job["steps"][0]
                 self.assertEqual(first["name"], "Require the contract job's success")
                 self.assertEqual(first["env"], {"CONTRACT_RESULT": "${{ needs.contract.result }}"})
+
+    def test_wac_ci_skips_checks_only_when_scope_said_documentation_only(self):
+        """`scope` decides for `checks` alone; an unknown, failed or skipped scope runs the checks.
+
+        GitHub reads a missing output as '', so only the literal 'false' skips: a scope job that failed,
+        was skipped or never wrote its output leaves the checks running.
+        """
+        jobs = self.wac_ci()["jobs"]
+        self.assertEqual(sorted(jobs["checks"]["needs"]), ["contract", "scope"])
+        condition = re.fullmatch(r"\$\{\{ (.*) \}\}", jobs["checks"]["if"]).group(1)
+        self.assertEqual(condition, "!cancelled() && needs.scope.outputs.heavy != 'false'")
+        for name in ("render", "lint", "techdocs", "agents-md", "contract"):
+            with self.subTest(job=name):
+                self.assertNotIn("scope", json.dumps(jobs[name]), "only checks waits for scope")
+        scope = jobs["scope"]
+        self.assertEqual(scope["needs"], "contract", "the patterns are the contract job's output")
+        self.assertEqual(scope["if"], "${{ !cancelled() }}", "a failed contract job still gets a scope decision")
+        self.assertEqual(scope["outputs"], {"heavy": "${{ steps.scope.outputs.heavy }}"})
+
+    def test_wac_ci_scope_holds_no_job_token_and_runs_no_caller_code(self):
+        doc = self.wac_ci()
+        scope = doc["jobs"]["scope"]
+        self.assertEqual(scope["permissions"], {"contents": "read"})
+        self.assertFalse(holds_id_token(doc, scope))
+        self.assertEqual(scope["runs-on"], "${{ inputs.runner || vars.CI_RUNNER_SMALL }}")
+        self.assertEqual(scope["env"], {"PYTHONSAFEPATH": "1"})
+        self.assertNotIn("name", scope, "the job's check is named wacd-ci / scope")
+        self.assertEqual(pinned_action_problems("scope", scope, ID_TOKEN_ACTIONS), [])
+        for index, step in enumerate(scope["steps"]):
+            with self.subTest(step=step.get("name", index)):
+                self.assertIsInstance(step.get("timeout-minutes"), int)
+                if "uses" in step:
+                    self.assertEqual(step["with"], {"repository": "willfell/wac.lab.actions", "ref": SHA,
+                                                    "path": ".wacd", "persist-credentials": False},
+                                     "only this repository is checked out")
+                run = str(step.get("run", ""))
+                self.assertEqual([m for m in re.findall(r"\bpython3?\b(?: -\w+)*", run) if " -I" not in m], [])
+        decide = next(s for s in scope["steps"] if s.get("id") == "scope")
+        self.assertEqual(decide["name"], "Decide whether the checks need to run")
+        self.assertEqual(decide["env"], {"DOCS_PATHS": "${{ needs.contract.outputs.docs_paths }}",
+                                         "CONTRACT_RESULT": "${{ needs.contract.result }}",
+                                         "GITHUB_TOKEN": "${{ github.token }}"})
+
+    def test_wac_ci_scope_step_runs_the_checks_whenever_its_script_cannot_decide(self):
+        import os
+        import subprocess
+
+        step = next(s for s in self.wac_ci()["jobs"]["scope"]["steps"] if s.get("id") == "scope")
+        root = Path(__file__).resolve().parents[2]
+        for label, scripts, extra in (
+            ("no scripts", None, {}),
+            ("a push", root / "scripts", {"GITHUB_EVENT_NAME": "push"}),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                out, summary = tmp / "out", tmp / "summary"
+                env = {"PATH": os.environ["PATH"], "PYTHONSAFEPATH": "1", "RUNNER_TEMP": str(tmp),
+                       "WACD_SCRIPTS": str(scripts or tmp / "missing"), "GITHUB_OUTPUT": str(out),
+                       "GITHUB_STEP_SUMMARY": str(summary), "DOCS_PATHS": '["docs/**"]',
+                       "CONTRACT_RESULT": "success", "GITHUB_TOKEN": "job-token", **extra}
+                result = subprocess.run(["bash", "-c", step["run"]], env=env, cwd=tmp, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
+                self.assertEqual(outputs["heavy"], "true")
+                self.assertIn("The checks ran because: ", summary.read_text())
 
     def test_wac_ci_contract_job_runs_on_the_callers_runner(self):
         def runs_on(expression, inputs, variables):

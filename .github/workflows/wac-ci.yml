@@ -34,6 +34,7 @@ jobs:
       id-token: write
     outputs:
       source: ${{ steps.contract.outputs.source }}
+      docs_paths: ${{ steps.contract.outputs.docs_paths }}
     steps:
       - name: Require the runner's python3 3.12 or later
         timeout-minutes: 1
@@ -137,9 +138,62 @@ jobs:
           overwrite: true
           retention-days: 1
 
-  checks:
+  scope:
     needs: contract
     if: ${{ !cancelled() }}
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 5
+    env:
+      PYTHONSAFEPATH: "1"
+    permissions:
+      contents: read
+    outputs:
+      heavy: ${{ steps.scope.outputs.heavy }}
+    steps:
+      - name: Require the defining workflow commit
+        timeout-minutes: 1
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        timeout-minutes: 3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+      - name: Decide whether the checks need to run
+        id: scope
+        timeout-minutes: 2
+        shell: bash
+        env:
+          DOCS_PATHS: ${{ needs.contract.outputs.docs_paths }}
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if python3 -I "$WACD_SCRIPTS"/wacd-docs.py pr-scope > "$RUNNER_TEMP/scope.out" 2> "$RUNNER_TEMP/scope.err"; then
+            cat "$RUNNER_TEMP/scope.err"
+            cat "$RUNNER_TEMP/scope.out" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "heavy=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "### wac-ci scope"
+            echo
+            echo "The checks ran because: the changed files could not be read"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  checks:
+    needs: [contract, scope]
+    if: ${{ !cancelled() && needs.scope.outputs.heavy != 'false' }}
     runs-on: ${{ inputs.build_runner || inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 30
     permissions:

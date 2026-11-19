@@ -259,13 +259,14 @@ seconds (default `2100`), the bound `deploy` gives a `release`, passed to the
 script as `--wait-timeout` and parsed by the same function `deploy` uses, so
 both jobs accept exactly the same values. `plan`'s wait is capped at 2100
 seconds (35 minutes) whatever the input, while `deploy` honours the full
-`wait_timeout`: `plan` has `timeout-minutes: 68` (GitHub expressions have no
+`wait_timeout`: `plan` has `timeout-minutes: 72` (GitHub expressions have no
 arithmetic, so it cannot be sized from the input), and the cap makes a long
-outage end in `plan`'s own summary line rather than the job timeout. The 68 is
+outage end in `plan`'s own summary line rather than the job timeout. The 72 is
 a strict sum: 35 minutes for the capped wait, one for its last request (a token
-mint and a connection), and 32 for every other step's own kill switch (one to
-six minutes each; `Plan the settings release`'s six hold the status read's 120
-seconds), so even a run in which every step uses its whole bound ends at a
+mint and a connection), and 36 for every other step's own kill switch (one to
+nine minutes each; `Plan the settings release`'s six hold the status read's 120
+seconds, and `Plan the version`'s nine hold the documentation-only read's 150
+seconds; before `v1.36.0` they were six and the sum 68), so even a run in which every step uses its whole bound ends at a
 step's kill switch, never at the job's.
 `.github/scripts/test_reusable_workflows.py` holds the sum. A push release is
 unaffected unless a step hangs. The interval starts at 5 seconds and
@@ -326,8 +327,8 @@ final, and `wait_timeout` still bounds it all. When the release waited out a
 restart, the run summary gains one line after the `### wac-cd deploy` table:
 `The gateway was restarting; the release waited <n> s for it.`
 
-Every other `plan` step has its own `timeout-minutes` (one to six minutes), so
-only the gateway wait can use most of the job's 68 minutes: a stalled checkout,
+Every other `plan` step has its own `timeout-minutes` (one to nine minutes), so
+only the gateway wait can use most of the job's 72 minutes: a stalled checkout,
 upload or tag push fails within minutes instead. `wacd-tag.py` bounds each
 call that reaches the remote (`ls-remote`, `push`) at 60 seconds and kills git
 and its transport helpers when it passes, and lets go of git's output 5 seconds
@@ -418,7 +419,8 @@ gateway answered, as in the table above.
 HEAD and reads the commits since it: any breaking change (`type!:` or a
 `BREAKING CHANGE:` footer) is a major, any `feat` is a minor, and anything else
 is a patch. A repo with no such tag releases `0.1.0`. Every merge to `main`
-releases. The one version is the image tag, the deploy chart version, the git
+releases, except one that changes only documentation (**Documentation-only
+merges** below). The one version is the image tag, the deploy chart version, the git
 tag suffix and the GitHub Release name. Baton keeps its own version rules, so
 it passes `version_source: caller` and its computed `version`; an empty
 `version` there is a `none` run that ends green. A computed tag that already
@@ -438,6 +440,7 @@ exists on another commit fails the plan.
 | `none` | `workflow_dispatch` with `settings_revision` when hemi's copy already holds a newer revision | nothing |
 | `none` | `version_source: caller` with no version, or a tagged HEAD whose chart is published, with `deploy: false` | nothing |
 | `none` | a `release` or `publish` run whose tag push was refused after `main` moved on: superseded | nothing |
+| `none` | a push whose every change since the newest version with a GitHub Release is documentation (**Documentation-only merges** below) | nothing |
 
 Every run lists all of `plan`, `build`, `retag`, `shadow`, `publish`,
 `deploy` and `github-release`, and a job a mode does not use is listed with the
@@ -457,6 +460,42 @@ with the columns `mode`, `version`, `tag` and `expected sha` and one row, and,
 once the served build matches, the line
 `Release proved by gateway status and served sha`; its `Prove the served
 build` step logs `Verified served build: <the merge commit>`.
+
+**Documentation-only merges.** From `v1.36.0` a push that changes only
+documentation releases nothing, so it takes no build runner. On a `push`
+with `version_source: commits`, before a version is chosen, `Plan the
+version` runs `python3 -I "$WACD_SCRIPTS"/wacd-docs.py release-scope`. Its
+base B is the commit of the newest `<tag_prefix>X.Y.Z` tag merged into HEAD
+that has a GitHub Release, read newest first with rule B's reader
+(`release_exists()`, the job's `GITHUB_TOKEN`) for at most ten tags: the
+newest version that ran, never merely the newest tag. When HEAD carries no tag
+with the prefix and every path of `git diff --name-status -M B HEAD`, both
+names of a rename, matches the profile's documentation paths (the
+`docs_paths` line of `Read the wacd profile`, [The wacd profile](wacd-profile.md),
+**Documentation paths**) and none is under `.github/`, the run is `mode:
+none` with an empty version and tag, no tag is claimed, the step `Nothing to
+release: only documentation changed` concludes `success` with the annotation
+`wac-cd: nothing to release: only documentation changed since <tag>.` (it is
+`skipped` in every other run), and the `### wac-cd plan` summary gains the
+line `nothing to release: only documentation changed since <tag>.`.
+
+Anything unknown releases as before: no version with a Release yet, a Release
+that cannot be read, a diff that fails, lists nothing or more than 3000 paths,
+documentation paths that are missing, refused or `[]`, a HEAD already tagged
+(a resume), a decision not reached within 150 seconds, and a dispatch or a
+`version_source: caller` run. Settings, rollback and resume dispatches are
+untouched.
+
+- For a cut-over app, settings changes cannot travel this way: they are
+  released only as `settings_revision` dispatches, never by a push.
+- For an app on its files, `.github/wacd.json` and the values file are
+  protected paths, which no documentation pattern may match, and are under
+  `.github/` or named by the profile, so a change to either always releases.
+- The next code release carries the documentation commits: its version is
+  bumped from the commits since the newest tag, documentation ones included.
+- `Refuse a settings release behind an unfinished code release` never counts
+  a documentation commit as an unfinished release: it reads only tags, and a
+  documentation-only push claims none.
 
 `deploy: false` is publish-only, used for cutover step 1: the old route still
 deploys while `wac-cd` publishes the first deploy chart. From `v1.35.0` Lab's
@@ -907,7 +946,9 @@ claim) fails `Plan the settings release` or `Plan the version` itself.
 **How hemi reads the outcome.** A settings run released if and only if its
 `cd / retag` and `cd / deploy` jobs concluded `success`. The run summary says
 `mode: settings` or `mode: none (<reason>)`. A green run that released
-nothing means exactly one thing, superseded. `wac-cd` never undoes the
+nothing means exactly one thing, superseded; a push that released nothing
+because only documentation changed is told apart by its `Nothing to release:
+only documentation changed` step, the last row below. `wac-cd` never undoes the
 gateway's patch: after `Release through the gateway` succeeds the Application
 points at V' whatever happens next.
 
@@ -925,6 +966,7 @@ points at V' whatever happens next.
 | Failed at another deploy step | `failure` | `cd / deploy` `failure` at a step other than `Release through the gateway` and `Prove the served build`, keyed on where it sits: before `Release through the gateway` (the python3 check, the shared checkout, `Read the published images`, `Summarize the release`), so `Release through the gateway` is `skipped`, is failed before deploying; `Upload the release receipt`, after `Release through the gateway` `success` and with `Prove the served build` `skipped`, is failed after deploying, patched and not proved; `Record the proof`, after `Prove the served build` `success`, is patched and proved, with `cd / github-release` `skipped` | yes | yes | no before `Release through the gateway`; yes after it, and it stays |
 | Cancelled | `cancelled` | the run's conclusion; `cd / deploy` `success` or its step `Release through the gateway` `success` says the patch landed | if `cd / plan` succeeded | if `cd / retag` succeeded | only if `Release through the gateway` succeeded |
 | Released | `success` | `cd / retag` `success` and `cd / deploy` `success` | yes | yes | yes |
+| Nothing to release: only documentation changed (a push, never a settings run) | `success` | `cd / plan` `success` with its step `Nothing to release: only documentation changed` `success`, and `cd / shadow`, `cd / build`, `cd / retag`, `cd / publish`, `cd / deploy` and `cd / github-release` all `skipped`; summary `nothing to release: only documentation changed since <tag>.` | no | no | no |
 
 `Release through the gateway` asks for the release and then waits, within
 `wait_timeout`, for the gateway's proof that it rolled out. A refused release

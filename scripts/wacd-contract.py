@@ -105,7 +105,11 @@ No answer (a connection closed or reset after the request, or an answer
 shorter than its Content-Length), a 5xx and an address that does not resolve are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
 apart; each attempt, token mint included, is bounded at PR_ATTEMPT_SECONDS by
 a worker thread, so a reply that trickles in counts as silence. On success it prints
-`source=hemi|files` and `revision=<n>|`, and with source `hemi` leaves
+`source=hemi|files`, `revision=<n>|` and `docs_paths=<JSON list>|` (wacd-docs.py's
+effective documentation patterns of the settings the run uses: hemi's copy, or
+with source `files` the merge commit's `.github/wacd.json`; empty when that
+list cannot be read or is refused, which wac-ci's `scope` job reads as "run
+the checks", and the `checks` job then refuses it with its sentence), and with source `hemi` leaves
 `contract.json`, `profile.json` and `values.json` under `<out>` as `fetch`
 does; otherwise `<out>` is removed. A failure prints one `wacd contract:`
 line to stderr and exits 1. Either way the job summary says why, naming hemi's
@@ -149,7 +153,7 @@ CONTRACT_BODY = {"operation": "contract"}
 FIRST_POLL_SECONDS = 5
 MAX_POLL_SECONDS = 30
 MAX_WAIT = release.MAX_WAIT
-# plan's job timeout (68 minutes) is sized for this wait plus its other steps,
+# plan's job timeout (72 minutes) is sized for this wait plus its other steps,
 # and a workflow test ties the two. A larger wait_timeout still bounds deploy,
 # but plan stops here so it fails with its summary line, not the job timeout.
 PLAN_WAIT_CAP = 2100
@@ -753,8 +757,29 @@ def files_answer(copy):
     return app, chart.revision_annotation(revision)
 
 
+def effective_docs_paths(data):
+    """The compact JSON of a profile's effective documentation patterns, or "" when unreadable or refused."""
+    if not isinstance(data, dict) or not isinstance(data.get("ci"), dict):
+        return ""
+    try:
+        patterns = profile.docs.check_docs_paths(data["ci"], "ci", data)
+    except profile.ProfileError:
+        return ""
+    return json.dumps(patterns, separators=(",", ":"))
+
+
+def head_docs_paths(head):
+    """effective_docs_paths of the merge commit's .github/wacd.json, read as data."""
+    try:
+        raw = git(head, ["cat-file", "blob", f"HEAD:{FILES_PROFILE.as_posix()}"], "pull request's tree")
+        data = json.loads(raw)
+    except (Refusal, ValueError):
+        return ""
+    return effective_docs_paths(data)
+
+
 def pull_request(out, main, head):
-    """Decide a pull request's settings source; returns (source, revision, sentences)."""
+    """Decide a pull request's settings source; returns (source, revision, sentences, docs_paths)."""
     clear(out)
     profile_path = FILES_PROFILE.as_posix()
     on_main = tree_entries(main, [profile_path], "default branch's tree")
@@ -778,7 +803,8 @@ def pull_request(out, main, head):
                     cause = refused if answer in (401, 403) else "status"
                 raise Refusal(PR_SENTENCES["removed_" + cause].format(
                     app=app, status=answer, runner=runner_name(), event=event))
-            return "files", "", [PR_SENTENCES[f"{outcome}_files"].format(status=answer, runner=runner_name())]
+            return "files", "", [PR_SENTENCES[f"{outcome}_files"].format(status=answer, runner=runner_name())], \
+                head_docs_paths(head)
         if outcome == "status":
             key = "status"
             if unknown_app:
@@ -792,10 +818,12 @@ def pull_request(out, main, head):
         app, revision = files_answer(copy)
         if files_on_main:
             key = "files" if revision else "new"
-            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)]
+            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)], \
+                head_docs_paths(head)
         if profile_path in tree_entries(head, [profile_path], "pull request's tree"):
             key = "restore" if revision else "new"
-            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)]
+            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)], \
+                head_docs_paths(head)
         raise Refusal(PR_SENTENCES["returning" if revision else "new_nothing"].format(app=app))
     app, revision = copy["identity"]["app"], chart.revision_annotation(copy["identity"]["revision"])
     paths.append(copy["delivery"]["valuesFile"])
@@ -815,7 +843,7 @@ def pull_request(out, main, head):
     derived = profile.from_contract(copy, profile.DERIVED_VALUES)
     write(out, {"contract.json": copy, "profile.json": derived, "values.json": copy["runtime"]})
     notes = [PR_SENTENCES["still_on_main"].format(path=path) for path in kept]
-    return "hemi", revision, [PR_SENTENCES["hemi"].format(revision=revision), *notes]
+    return "hemi", revision, [PR_SENTENCES["hemi"].format(revision=revision), *notes], effective_docs_paths(derived)
 
 
 def summarize(source, revision, commit, sentence):
@@ -874,7 +902,7 @@ def build_parser():
 def main_pr(args):
     out = Path(args.out)
     try:
-        source, revision, sentences = pull_request(out, Path(args.main), Path(args.head))
+        source, revision, sentences, docs_paths = pull_request(out, Path(args.main), Path(args.head))
     except Exception as error:
         sentence = str(error) if isinstance(error, Refusal) else PR_SENTENCES["unexpected"]
         try:
@@ -884,7 +912,7 @@ def main_pr(args):
         summarize_pr(None, None, [sentence])
         print("wacd contract: " + sentence, file=sys.stderr)
         return 1
-    print(f"source={source}\nrevision={revision}")
+    print(f"source={source}\nrevision={revision}\ndocs_paths={docs_paths}")
     summarize_pr(source, revision, sentences)
     return 0
 
