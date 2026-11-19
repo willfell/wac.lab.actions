@@ -1339,6 +1339,13 @@ class DocsPathsTests(PullRequestCase):
                     answer[1]["gates"][0]["commands"].append("node scripts/check.mjs docs/llc.md")
                 self.assertEqual(self.docs_paths(self.run_pr(answer, main={}, head={}), "hemi"), "")
 
+    def test_a_copys_values_file_is_protected_by_the_path_the_copy_names(self):
+        """The copy's delivery.valuesFile is the values path checks and plan protect, not .wacd-contract/values.json."""
+        answer = self.copy_with(valuesFile="docs/values.yaml", docsPaths=["docs/**"])
+        self.assertEqual(self.docs_paths(self.run_pr(answer, main={}, head={}), "hemi"), "")
+        answer = self.copy_with(valuesFile="docs/values.yaml", docsPaths=["docs/guides/**"])
+        self.assertEqual(self.docs_paths(self.run_pr(answer, main={}, head={}), "hemi"), '["docs/guides/**"]')
+
     def test_files_source_reads_the_merge_commits_profile(self):
         for label, head, expected in (
             ("absent", FILES, DEFAULT_DOCS),

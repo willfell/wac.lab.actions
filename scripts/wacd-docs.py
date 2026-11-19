@@ -22,7 +22,9 @@ is an exact path (no `*`) that is `mkdocs.yml` or ends in one of
 DOC_EXTENSIONS; or its last segment is `*.<ext>` with ext one of
 DOC_EXTENSIONS and every earlier segment literal or `**`. `.txt` is not one:
 `requirements.txt`, `CMakeLists.txt` and a served `robots.txt` are code or
-content the release ships. It is also refused
+content the release ships. Nor is `.mdx`, which is compiled JSX with imports:
+`src/app/page.mdx` is a Next.js page. What lies under a docs directory is the
+repository's call: `docs/**` accepts any file there. It is also refused
 when it matches a path the checks or the release read (protected_paths()).
 
 `match <pattern> <path>` checks the pattern's grammar and prints `match=true`
@@ -31,8 +33,16 @@ or `match=false`; the case table's `docs-path-match` cases run through it.
 `pr-scope` reads the pull request from the runner's own GITHUB_EVENT_NAME and
 GITHUB_EVENT_PATH (the event's base ref and sha, head sha and the
 repository's default branch, at most MAX_EVENT bytes), the contract job's
-DOCS_PATHS and CONTRACT_RESULT, and GITHUB_API_URL, GITHUB_REPOSITORY and
-GITHUB_TOKEN, and the changed files from `GET /repos/{repo}/compare/{base}...{head}`, under
+DOCS_PATHS and CONTRACT_RESULT, and GITHUB_API_URL, GITHUB_REPOSITORY,
+GITHUB_TOKEN and GITHUB_SHA, the merge commit a pull_request run (and so
+`checks`) tests. It judges that commit, never the head: GitHub's comparison
+is three-dot, against one merge base, and in a criss-cross history the head
+can show only documentation against it while the merge GitHub builds changes
+code. So `GET /repos/{repo}/commits/{GITHUB_SHA}` must name the event's base
+sha as the merge's first parent, and the changed files come from
+`GET /repos/{repo}/compare/{base}...{GITHUB_SHA}`, whose merge_base_commit
+must be that base sha too, which makes them exactly the tree difference
+between the base and what is tested. Both reads are under
 COMPARE_TIMEOUT and MAX_COMPARE bytes, with redirects refused so the token
 never goes to another host. It prints `heavy=false` only for a pull_request
 into the default branch whose comparison is complete (a `files` list of fewer
@@ -75,7 +85,7 @@ from pathlib import Path
 
 DEFAULT = ("docs/**", "mkdocs.yml", "*.md")
 DOC_DIRS = ("docs", "doc", "documentation")
-DOC_EXTENSIONS = ("md", "mdx", "rst", "adoc")
+DOC_EXTENSIONS = ("md", "rst", "adoc")
 ALLOWED = re.compile(r"[A-Za-z0-9._*/-]+")
 PACKAGE_FILES = ("package.json", "package-lock.json", "go.mod", "go.sum")
 PROFILE_FILE = ".github/wacd.json"
@@ -101,6 +111,9 @@ REASONS = {
     "refused_paths": "a documentation path was refused",
     "never": "this repository sets no documentation paths",
     "unreadable": "the changed files could not be read",
+    "merge_unread": "the merge commit could not be read",
+    "not_on_base": "the merge commit is not made on the pull request's base",
+    "merge_base": "the comparison's merge base is not the pull request's base",
     "incomplete": "the list of changed files may be incomplete",
     "nothing": "the comparison lists no changed file",
     "github": "a file under .github/ changed: {paths}",
@@ -163,8 +176,8 @@ def is_documentation(pattern):
 def check_documentation(pattern, path):
     if not is_documentation(pattern):
         fail(path, f"{pattern!r} could match a file that is not documentation; a pattern must start with "
-             "docs/, doc/ or documentation/, name one .md, .mdx, .rst or .adoc file or mkdocs.yml, "
-             "or end in *.md, *.mdx, *.rst or *.adoc below literal or ** segments")
+             "docs/, doc/ or documentation/, name one .md, .rst or .adoc file or mkdocs.yml, "
+             "or end in *.md, *.rst or *.adoc below literal or ** segments")
 
 
 def segment_matches(pattern, segment):
@@ -292,16 +305,16 @@ class Unread(Exception):
     """The comparison could not be read; the key names why."""
 
 
-def compare(base, head):
-    """GitHub's comparison of base...head, as JSON, or Unread."""
+def github_get(path, unread="unreadable"):
+    """GET /repos/<repository>/<path> from GitHub's API, as JSON, or Unread(unread)."""
     api = os.environ.get("GITHUB_API_URL", "").rstrip("/")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     token = os.environ.get("GITHUB_TOKEN", "")
     parsed = urllib.parse.urlsplit(api)
     if parsed.scheme not in ("http", "https") or not parsed.hostname or not REPOSITORY.fullmatch(repository) \
             or not token:
-        raise Unread("unreadable")
-    request = urllib.request.Request(f"{api}/repos/{repository}/compare/{base}...{head}", method="GET")
+        raise Unread(unread)
+    request = urllib.request.Request(f"{api}/repos/{repository}/{path}", method="GET")
     request.add_header("Authorization", f"Bearer {token}")
     request.add_header("Accept", "application/vnd.github+json")
     request.add_header("X-GitHub-Api-Version", "2022-11-28")
@@ -312,19 +325,29 @@ def compare(base, head):
             status = response.status
     except urllib.error.HTTPError as error:
         error.close()
-        raise Unread("unreadable") from None
+        raise Unread(unread) from None
     except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
-        raise Unread("unreadable") from None
+        raise Unread(unread) from None
     if status != 200 or len(body) > MAX_COMPARE:
-        raise Unread("unreadable")
+        raise Unread(unread)
     try:
         return json.loads(body)
     except ValueError:
-        raise Unread("unreadable") from None
+        raise Unread(unread) from None
 
 
-def changed_files(answer):
-    """Every filename and previous_filename of a complete comparison, or Unread."""
+def first_parent(merge):
+    """The first parent of the merge commit, read from GitHub, or Unread("merge_unread")."""
+    commit = github_get(f"commits/{merge}", "merge_unread")
+    parents = commit.get("parents") if isinstance(commit, dict) else None
+    if not isinstance(parents, list):
+        raise Unread("merge_unread")
+    first = parents[0] if parents else None
+    return first.get("sha") if isinstance(first, dict) else None
+
+
+def changed_files(answer, base):
+    """Every filename and previous_filename of a complete comparison made from base, or Unread."""
     if not isinstance(answer, dict):
         raise Unread("unreadable")
     files, commits, total = answer.get("files"), answer.get("commits"), answer.get("total_commits")
@@ -332,6 +355,9 @@ def changed_files(answer):
         raise Unread("incomplete")
     if len(files) >= MAX_COMPARE_FILES or total != len(commits):
         raise Unread("incomplete")
+    merge_base = answer.get("merge_base_commit")
+    if not isinstance(merge_base, dict) or merge_base.get("sha") != base:
+        raise Unread("merge_base")
     paths = []
     for entry in files:
         if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str) or not entry["filename"]:
@@ -377,10 +403,13 @@ def pr_decision(environ):
         return True, REASONS["refused_paths"]
     if not patterns:
         return True, REASONS["never"]
-    if not SHA40.fullmatch(base) or not SHA40.fullmatch(head):
+    merge = environ.get("GITHUB_SHA", "")
+    if not SHA40.fullmatch(base) or not SHA40.fullmatch(head) or not SHA40.fullmatch(merge):
         return True, REASONS["unreadable"]
     try:
-        paths = changed_files(compare(base, head))
+        if first_parent(merge) != base:
+            return True, REASONS["not_on_base"]
+        paths = changed_files(github_get(f"compare/{base}...{merge}"), base)
     except Unread as error:
         return True, REASONS[str(error)]
     if not paths:

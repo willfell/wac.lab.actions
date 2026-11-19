@@ -125,16 +125,25 @@ by name**, one of:
 - its first segment is literally `docs`, `doc` or `documentation`, whatever
   follows: `docs/**`, `doc/api/*`;
 - an exact path, with no `*`, that is `mkdocs.yml` at the root or ends in
-  `.md`, `.mdx`, `.rst` or `.adoc`: `README.md`, `guides/intro.rst`;
-- a last segment `*.md`, `*.mdx`, `*.rst` or `*.adoc` below segments
+  `.md`, `.rst` or `.adoc`: `README.md`, `guides/intro.rst`;
+- a last segment `*.md`, `*.rst` or `*.adoc` below segments
   that are literal or `**`: `*.md`, `**/*.md`, `guides/*.adoc`.
 
 Everything else is refused, `**`, `*`, `src/**`, `*.json`, `*.MD` and
 `guides*/*.md` included. `.txt` is not a documentation extension, so
 `*.txt`, `**/*.txt` and `requirements.txt` are refused too: a `.txt` file is
 as often a dependency list (`requirements.txt`), a build file
-(`CMakeLists.txt`) or content the app serves (`public/robots.txt`). It is also refused when it matches a path the checks
-or the release read, in this order: `.github/wacd.json`; the values file;
+(`CMakeLists.txt`) or content the app serves (`public/robots.txt`). Nor is
+`.mdx`: it is compiled JSX with imports, and `src/app/page.mdx` is a Next.js
+page, so `**/*.mdx` and an exact `.mdx` path are refused.
+
+What lies under `docs/`, `doc/` or `documentation/` is the repository's
+call: `docs/**` accepts any file there, a `docs/conf.py`, a mkdocs hook or a
+`docs/**/x.test.ts` a test runner collects included. A repository that builds,
+runs or tests code from its docs directory sets `ci.docs_paths` without that
+directory, or with only the subdirectories that hold nothing but documentation. It is also refused when it matches a path the checks
+or the release read, in this order: `.github/wacd.json`; the values file (for a copy, the path its
+`delivery.valuesFile` names, wherever the check runs);
 each image's `dockerfile`; `package.json`, `package-lock.json`, `go.mod` and
 `go.sum` at the root and in each image's `context`; and every path-like token
 of `ci.commands` (hemi's gates' commands): a word, split at whitespace and
@@ -158,7 +167,7 @@ Each refusal is one sentence, `<field>: <message>`, where the field is
 | an entry that is not a string, or empty | `ci.docs_paths[<i>]: must be a non-empty string` |
 | a leading `/` or `./`, a `..` or empty segment, a trailing `/`, a backslash, or any character but letters, digits and `. _ - / *` | `ci.docs_paths[<i>]: '<pattern>' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment` |
 | `**` inside a segment (`docs/**.md`, `***`) | `ci.docs_paths[<i>]: '<pattern>' may use ** only as a whole segment` |
-| a pattern that could match code | `ci.docs_paths[<i>]: '<pattern>' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst or *.adoc below literal or ** segments` |
+| a pattern that could match code | `ci.docs_paths[<i>]: '<pattern>' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .rst or .adoc file or mkdocs.yml, or end in *.md, *.rst or *.adoc below literal or ** segments` |
 | a pattern that matches a protected path | `ci.docs_paths[<i>]: '<pattern>' matches <path>, which the checks or the release read, so it is not documentation` |
 | a default pattern that matches a protected path | `ci.docs_paths: the default pattern '<pattern>' matches <path>, which the checks or the release read; set ci.docs_paths without it` |
 

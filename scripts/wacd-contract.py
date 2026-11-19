@@ -107,7 +107,9 @@ shorter than its Content-Length), a 5xx and an address that does not resolve are
 apart; each attempt, token mint included, is bounded at PR_ATTEMPT_SECONDS by
 a worker thread, so a reply that trickles in counts as silence. On success it prints
 `source=hemi|files`, `revision=<n>|` and `docs_paths=<JSON list>|` (wacd-docs.py's
-effective documentation patterns of the settings the run uses: hemi's copy, or
+effective documentation patterns of the settings the run uses: hemi's copy,
+checked against the values path its `delivery.valuesFile` names as
+`--contract` and wac-cd's plan check it, or
 with source `files` the merge commit's `.github/wacd.json`; empty when that
 list cannot be read or is refused, which wac-ci's `scope` job reads as "run
 the checks", and the `checks` job then refuses it with its sentence), and with source `hemi` leaves
@@ -860,7 +862,8 @@ def pull_request(out, main, head):
     derived = profile.from_contract(copy, profile.DERIVED_VALUES)
     write(out, {"contract.json": copy, "profile.json": derived, "values.json": copy["runtime"]})
     notes = [PR_SENTENCES["still_on_main"].format(path=path) for path in kept]
-    return "hemi", revision, [PR_SENTENCES["hemi"].format(revision=revision), *notes], effective_docs_paths(derived)
+    as_released = profile.from_contract(copy, copy["delivery"]["valuesFile"])
+    return "hemi", revision, [PR_SENTENCES["hemi"].format(revision=revision), *notes], effective_docs_paths(as_released)
 
 
 def summarize(source, revision, commit, sentence):

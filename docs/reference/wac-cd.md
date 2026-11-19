@@ -491,10 +491,23 @@ line `nothing to release: only documentation changed since <tag>.`.
 
 Anything unknown releases as before: no version with a Release yet, a Release
 that cannot be read, a diff that fails, lists nothing or more than 3000 paths,
-documentation paths that are missing, refused or `[]`, a HEAD already tagged
-(a resume), a decision not reached within 150 seconds, and a dispatch or a
+documentation paths that are missing or `[]`, a HEAD already tagged (a
+resume), a decision not reached within 150 seconds, and a dispatch or a
 `version_source: caller` run. Settings, rollback and resume dispatches are
-untouched.
+untouched. Refused documentation paths never reach this decision: a refused
+`ci.docs_paths` (or `delivery.docsPaths`) fails `Read the wacd profile` with
+its `wacd profile: ci.docs_paths...` sentence, as any refused profile setting
+does, so `plan` fails, nothing is tagged, built or released, and every run of
+the app, a settings or rollback dispatch included, fails there until the
+list is fixed in the file or in hemi's copy.
+
+A documentation-only run of an older commit, such as "Re-run all jobs" on an
+old push run after `main` gained a newer tag, now ends green with `mode:
+none` and nothing released, because the decision comes before
+`wacd-version.py` and its replay check: it used to fail at `Refuse to replay
+an old version` (**No replay of an old version** below). Nothing is released
+either way; hemi reads the run as "nothing to release" rather than as a
+refused replay.
 
 - For a cut-over app, settings changes cannot travel this way: they are
   released only as `settings_revision` dispatches, never by a push.
@@ -646,7 +659,10 @@ contained in HEAD), proceed as before; a commit carrying several tags counts by
 its highest. What is running changes by a rollback or a new release, never by
 replaying an old build. A rollback is not refused: it names its version and does
 not consult this rule. A `deploy: false` run is not refused either, since it
-never deploys.
+never deploys. A run whose changes since the newest Released version are
+only documentation is not refused either: it ends `mode: none` before this
+check (**Documentation-only merges** above), releasing nothing, as the
+refusal would have.
 
 **The refusal is its own step.** `Plan the version` records a refused replay
 as the step output `replay_refused` and succeeds, setting no mode, version, tag

@@ -173,8 +173,14 @@ pr-scope`, which needs no `actions/setup-python`. Its one output is `heavy`,
 and `checks` runs under
 `if: ${{ !cancelled() && needs.scope.outputs.heavy != 'false' }}`: only the
 literal `false` skips it, so a `scope` that failed, was skipped or wrote
-nothing leaves the checks running. A skipped `checks` reports `skipped`; the
-required check is `wacd-ci / contract`, which still runs.
+nothing leaves the checks running. The skip rests on how GitHub counts a
+required check: a job skipped by its `if` concludes `skipped`, and a ruleset
+counts a skipped required check as passing. The rulesets of wac, wac.hemi,
+wac.app.wealth and wac.app.finance require `wacd-ci / checks` as well as
+`wacd-ci / contract`, `wacd-ci / render` and the gates, so a documentation-only
+pull request merges with `checks` skipped, while `contract` and `render`
+still run and still block on failure. Hemi reads a skipped `checks` as
+passing too.
 
 The patterns are the settings the run uses: `contract`'s new output
 `docs_paths`, the effective `ci.docs_paths` of hemi's copy
@@ -192,10 +198,17 @@ reads no settings `checks` would not read.
   repository's default branch: a stacked pull request runs the checks;
 - `contract` succeeded and its `docs_paths` is a non-empty list the matcher
   accepts;
-- `GET /repos/{repository}/compare/{base.sha}...{head.sha}`, read with the
-  job's `GITHUB_TOKEN` within 20 seconds and 32 MiB and with redirects
-  refused, is complete: a `files` list of fewer than 300 entries, and as many
-  `commits` as its `total_commits`;
+- the commit `checks` tests is judged, never the head: `GITHUB_SHA`, the
+  merge commit a `pull_request` run checks out. `GET
+  /repos/{repository}/commits/{GITHUB_SHA}` must name the event's `base.sha`
+  as its first parent;
+- `GET /repos/{repository}/compare/{base.sha}...{GITHUB_SHA}` is complete: a
+  `files` list of fewer than 300 entries, as many `commits` as its
+  `total_commits`, and a `merge_base_commit.sha` equal to `base.sha`. Both
+  reads use the job's `GITHUB_TOKEN`, within 20 seconds and 32 MiB each and
+  with redirects refused. With the first parent and the merge base both the
+  base, the files are exactly the tree difference between the base and what
+  `checks` would test;
 - it lists at least one file, no `filename` or `previous_filename` is under
   `.github/`, and every one matches a pattern.
 
@@ -215,11 +228,23 @@ fixed phrases:
 | `the documentation paths could not be read` | `contract` did not succeed, or its `docs_paths` is empty |
 | `a documentation path was refused` | `docs_paths` is not a list of patterns the matcher accepts |
 | `this repository sets no documentation paths` | `docs_paths` is `[]` |
-| `the changed files could not be read` | any status but 200, a redirect, a timeout, an answer over 32 MiB or not JSON, a file entry with no name, or a failure of the script |
+| `the merge commit could not be read` | the commit read answered anything but 200 with a `parents` list, or not JSON |
+| `the merge commit is not made on the pull request's base` | the merge commit's first parent is not `base.sha`, or it has none |
+| `the comparison's merge base is not the pull request's base` | the comparison's `merge_base_commit.sha` is missing or is not `base.sha` |
+| `the changed files could not be read` | any status but 200, a redirect, a timeout, an answer over 32 MiB or not JSON, a file entry with no name, a `GITHUB_SHA` that is not 40 hex characters, or a failure of the script |
 | `the list of changed files may be incomplete` | 300 or more files, fewer commits listed than counted, or no `files` list |
 | `the comparison lists no changed file` | an empty `files` list |
 | `a file under .github/ changed: <paths>` | a name under `.github/`, even one a pattern would match |
 | `a file outside the documentation paths changed: <paths>` | a name no pattern matches |
+
+Why the merge commit and not the head: GitHub's comparison is three-dot, one
+merge base of the two against the second. In a criss-cross history (both
+branches merged the same two commits, the pull request resolving them
+differently) the head can show only documentation against that base while
+the merge GitHub builds, with a recursive merge over both bases, changes
+code; GitHub's own "Files changed" shows the same three-dot diff.
+`scripts/tests/wacd-docs.test.py` builds that history with git and holds the
+rule.
 
 `<paths>` is the first three offending names, comma-separated, then
 `, and <n> more` when there are more; each name is escaped as workflow-command
