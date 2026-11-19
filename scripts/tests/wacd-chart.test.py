@@ -246,6 +246,20 @@ class RegistryReadTests(RegistryCase):
         self.assertEqual((bad.returncode, bad.stdout), (1, ""))
         self.assertTrue(bad.stderr.startswith("wacd chart: wacwini.com/revision must be a decimal"), bad.stderr)
 
+    def test_chart_release_names_the_manifest_digest_the_gateway_released(self):
+        refs = chart.image_refs(IMAGES)
+        self.registry.put_chart("travel", "0.1.0", images=refs)
+        _, _, manifest = self.registry.routes["/v2/deploy/travel/manifests/0.1.0"]
+        self.assertEqual(
+            chart.chart_release(self.address, "travel", "0.1.0"),
+            {"digest": digest_of(manifest), "revision": SHA, "images": IMAGES},
+        )
+        self.assertIsNone(chart.chart_release(self.address, "travel", "0.2.0"))
+        self.registry.put_chart("travel", "0.3.0")
+        with self.assertRaises(chart.ChartError) as ctx:
+            chart.chart_release(self.address, "travel", "0.3.0")
+        self.assertIn("wacwini.com/images", str(ctx.exception))
+
     def test_wrong_config_media_type_is_an_error(self):
         self.registry.put_chart("travel", "0.1.0", config_type="application/json")
         with self.assertRaises(chart.ChartError) as ctx:

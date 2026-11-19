@@ -346,6 +346,12 @@ def parse_json(body, what):
 
 def manifest_state(registry, repo, ref, timeout=TIMEOUT):
     """The parsed manifest, or None when the registry has no such reference."""
+    found = manifest_with_digest(registry, repo, ref, timeout)
+    return None if found is None else found[1]
+
+
+def manifest_with_digest(registry, repo, ref, timeout=TIMEOUT):
+    """(sha256 digest of the manifest bytes, parsed manifest), or None when absent."""
     check(registry, REGISTRY, "registry")
     url = f"http://{registry}/v2/{repo}/manifests/{ref}"
     status, body = http_get(url, MANIFEST_ACCEPT, timeout)
@@ -353,7 +359,7 @@ def manifest_state(registry, repo, ref, timeout=TIMEOUT):
         return None
     if status != 200:
         raise ChartError(f"the registry answered HTTP {status} for {repo}:{ref}")
-    return parse_json(body, f"the manifest of {repo}:{ref}")
+    return "sha256:" + hashlib.sha256(body).hexdigest(), parse_json(body, f"the manifest of {repo}:{ref}")
 
 
 def blob(registry, repo, digest, timeout=TIMEOUT):
@@ -377,12 +383,19 @@ def config_digest(manifest, repo, ref):
 
 def chart_config(registry, app, version, timeout=TIMEOUT):
     """The Helm config blob (Chart.yaml as JSON) of deploy/<app>:<version>, or None."""
+    found = chart_with_digest(registry, app, version, timeout)
+    return None if found is None else found[1]
+
+
+def chart_with_digest(registry, app, version, timeout=TIMEOUT):
+    """(manifest digest, Helm config blob) of deploy/<app>:<version>, or None."""
     check(app, APP, "app")
     check(version, RELEASE_VERSION, "version")
     repo = f"{DEPLOY_REPO}/{app}"
-    manifest = manifest_state(registry, repo, version, timeout)
-    if manifest is None:
+    found = manifest_with_digest(registry, repo, version, timeout)
+    if found is None:
         return None
+    digest, manifest = found
     config = config_digest(manifest, repo, version)
     if config.get("mediaType") != HELM_CONFIG_TYPE:
         raise ChartError(
@@ -396,7 +409,7 @@ def chart_config(registry, app, version, timeout=TIMEOUT):
             f"{repo}:{version} holds chart {parsed.get('name')!r} {parsed.get('version')!r}, "
             f"not {app!r} {version!r}"
         )
-    return parsed
+    return digest, parsed
 
 
 def chart_annotations(config):
@@ -424,6 +437,27 @@ def chart_images(registry, app, version):
     if not isinstance(text, str):
         raise ChartError(f"{DEPLOY_REPO}/{app}:{version} has no {IMAGES_ANNOTATION} annotation")
     return parse_image_refs(text)
+
+
+def chart_release(registry, app, version):
+    """What the gateway released as <version>: manifest digest, source revision and images.
+
+    None when deploy/<app>:<version> is not in the registry. wac-cd's settings
+    plan holds the gateway's status to it: the status's chart_digest must be
+    this digest, and every running image one of these.
+    """
+    found = chart_with_digest(registry, app, version)
+    if found is None:
+        return None
+    digest, config = found
+    annotations = chart_annotations(config)
+    revision = annotations.get(REVISION_ANNOTATION)
+    if not isinstance(revision, str) or not SHA40.fullmatch(revision):
+        raise ChartError(f"{DEPLOY_REPO}/{app}:{version} has no 40-hex {REVISION_ANNOTATION} annotation")
+    text = annotations.get(IMAGES_ANNOTATION)
+    if not isinstance(text, str):
+        raise ChartError(f"{DEPLOY_REPO}/{app}:{version} has no {IMAGES_ANNOTATION} annotation")
+    return {"digest": digest, "revision": revision, "images": parse_image_refs(text)}
 
 
 def chart_copy_revision(registry, app, version):

@@ -17,12 +17,21 @@ sentence is the error line and a job summary line. The body is never printed.
 wacd-contract.py uses the same post() and map for the gateway's contract
 operation.
 
-`running --wait-timeout N` is plan's one gateway read in `settings` mode: one
-`status` request (503 retried within N seconds, a refusal mapped as for a
-release) and `running=<X.Y.Z>`, the version the app runs now, which is what a
-settings release re-releases, a rolled-back version included. A running
-version that is not a strict X.Y.Z (the bootstrap tag before the first
-release) fails, since there is no released code to put the settings on.
+`running --app A --wait-timeout N` is plan's gateway read in `settings` mode:
+the version the app runs now, which is what a settings release re-releases, a
+rolled-back version included. The status's `version` is the version the
+gateway last pointed the Application at, not proof that it runs, so the read
+is taken only from a steady status (steady() below): Synced at its
+chart_digest and Healthy, every Deployment rolled out, and every running image
+one of that version's chart images by repository and digest, with at least
+one. That chart is read from the push address (wacd-chart.py's constant), and
+chart_digest must be its manifest digest. An unsteady status is read again
+until N seconds pass, then the read exits ROLLING_OUT_EXIT (3) so plan can
+report the rollout from its own step. A version that is not a bare X.Y.Z, a
+chart_digest that is not the registry's, or a chart the registry lacks is a
+fault and exits 1 at once. A 503 (the gateway cannot read Kubernetes) is
+retried within N; a 403 without a reason means the app is not onboarded. It
+prints running=, commit= (the chart's source) and images= (its images).
 
 The gateway contract (Plan 2, "Chart releases (wac-cd)") is isolated in
 RELEASE_BODY, STATUS_BODY and ready(). After the proof, github-release creates
@@ -53,6 +62,12 @@ _SPEC.loader.exec_module(ci)
 
 ReleaseError = ci.ReleaseError
 
+_CHART_SPEC = importlib.util.spec_from_file_location(
+    "wacd_release_chart", Path(__file__).with_name("wacd-chart.py")
+)
+chart = importlib.util.module_from_spec(_CHART_SPEC)
+_CHART_SPEC.loader.exec_module(chart)
+
 PULL_REGISTRY = "localhost:30500"
 VERSION_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -65,6 +80,11 @@ TAG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 RELEASED_MODES = ("release", "resume", "rollback", "settings")
 REASON_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+ROLLING_OUT_EXIT = 3
+NOT_ONBOARDED = (
+    "The gateway does not know this app (its status was refused without a reason), so it is not "
+    "onboarded and there is no running version to release settings on."
+)
 
 # The gateway's closed list of refusal codes, each with the sentence a run
 # summary shows. The contract operation can return only the three fleet_copy_*
@@ -120,6 +140,10 @@ def no_connection(error):
     if isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError):
         error = error.reason
     return isinstance(error, (ConnectionRefusedError, ConnectionResetError))
+
+
+class RollingOut(ReleaseError):
+    """The status never settled within the wait: the app is mid-rollout."""
 
 
 class Refused(ReleaseError):
@@ -379,29 +403,90 @@ def proved(version, images, wait_timeout, request=None, mode=None):
     raise ReleaseError("release evidence deadline exceeded")
 
 
-def running_version(wait_timeout, request=None):
-    """The X.Y.Z the gateway's status says is running, retrying 503 within wait_timeout."""
+def read_release(app, version):
+    """deploy/<app>:<version> as the registry holds it, at the push address."""
+    try:
+        return chart.chart_release(chart.PUSH_REGISTRY, app, version)
+    except chart.ChartError as error:
+        raise ReleaseError(str(error)) from None
+
+
+def image_digest(ref):
+    return ref.split("@", 1)[1] if "@" in ref else None
+
+
+def steady(value, release):
+    """Whether a status proves release runs: synced, healthy, rolled out, and only its images."""
+    sync = value.get("sync")
+    health = value.get("health")
+    if (
+        not isinstance(sync, dict)
+        or sync.get("status") != "Synced"
+        or sync.get("revision") != value.get("chart_digest")
+        or not isinstance(health, dict)
+        or health.get("status") != "Healthy"
+    ):
+        return False
+    deployments = value.get("deployments")
+    if not isinstance(deployments, list) or not deployments:
+        return False
+    wanted = {(spec["repository"], spec["digest"]) for spec in release["images"].values()}
+    seen = 0
+    for deployment in deployments:
+        if not isinstance(deployment, dict) or not rolled_out(deployment):
+            return False
+        refs = deployment.get("images")
+        if not isinstance(refs, list):
+            return False
+        for ref in refs:
+            if not isinstance(ref, str) or (image_repository(ref), image_digest(ref)) not in wanted:
+                return False
+            seen += 1
+    return seen > 0
+
+
+def running_release(app, wait_timeout, request=None):
+    """(version, release) from the first steady status within wait_timeout seconds."""
     if request is None:
         request = transport
         trust = trust_context()
     else:
         trust = None
     deadline = time.monotonic() + wait_timeout
+    seen = None
     while time.monotonic() < deadline:
         code, value = request(STATUS_BODY(), trust, max(1, deadline - time.monotonic()))
         if code == 200:
-            found = value.get("version")
-            if semver(found) is None:
-                shown = found[:40] if isinstance(found, str) else type(found).__name__
+            version = value.get("version")
+            if semver(version) is None:
+                shown = version[:40] if isinstance(version, str) else type(version).__name__
                 raise ReleaseError(
-                    f"the gateway reports {shown!r} running, which is not a released X.Y.Z, so there "
-                    "is no running code to release settings on"
+                    f"the gateway reports {shown!r} running, which is not a released X.Y.Z (an unknown "
+                    "chart digest or a lost ledger), so there is no running code to release settings on"
                 )
-            return found
-        if code != 503:
+            release = read_release(app, version)
+            if release is None:
+                raise ReleaseError(f"deploy/{app}:{version}, which the gateway reports running, is not in the registry")
+            if value.get("chart_digest") != release["digest"]:
+                raise ReleaseError(
+                    f"the gateway's chart for {version} is not the chart the registry holds as "
+                    f"deploy/{app}:{version}"
+                )
+            if steady(value, release):
+                return version, release
+            seen = version
+        elif code == 403 and value.get("reason") is None:
+            raise ReleaseError(NOT_ONBOARDED)
+        elif code != 503:
             raise rejected("status request", code, value)
         time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
-    raise ReleaseError("status deadline exceeded; the gateway stayed unavailable")
+    if seen is not None:
+        raise RollingOut(
+            f"{app} was rolling out {seen} for the whole {wait_timeout} seconds: the gateway never "
+            "reported it synced, healthy and fully rolled out with only its own images, so no settings "
+            "were released; dispatch again once it settles"
+        )
+    raise ReleaseError("status deadline exceeded; the gateway could not read the cluster")
 
 
 def probe(url, timeout):
@@ -562,6 +647,7 @@ def build_parser():
     health.add_argument("--expect-db", required=True, choices=["true", "false"])
     health.add_argument("--wait-timeout", required=True)
     running = commands.add_parser("running")
+    running.add_argument("--app", required=True)
     running.add_argument("--wait-timeout", required=True)
     gh = commands.add_parser("github-release")
     gh.add_argument("--tag", required=True)
@@ -574,7 +660,9 @@ def run(args):
         return github_release(args.tag, args.sha, os.environ)
     timeout = wait_bound(args.wait_timeout)
     if args.command == "running":
-        return "running=" + running_version(timeout)
+        version, release = running_release(args.app, timeout)
+        images = json.dumps(release["images"], separators=(",", ":"), sort_keys=True)
+        return f"running={version}\ncommit={release['revision']}\nimages={images}"
     if args.command == "health":
         if not SHA_PATTERN.fullmatch(args.sha):
             raise ReleaseError("--sha must be 40 lowercase hex characters")
@@ -617,7 +705,7 @@ def main(argv):
         if isinstance(err, Refused):
             summarize_refusal(err.sentence)
         print("wacd release: " + " ".join(str(err).split()), file=sys.stderr)
-        return 1
+        return ROLLING_OUT_EXIT if isinstance(err, RollingOut) else 1
     except Exception:
         print("wacd release: unexpected failure", file=sys.stderr)
         return 1

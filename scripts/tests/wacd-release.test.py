@@ -544,59 +544,143 @@ class SettingsModeTests(unittest.TestCase):
             self.assertEqual(json.loads(Path(receipt).read_text())["wac_cd"], plan)
 
 
-class RunningTests(unittest.TestCase):
-    """plan reads the version the gateway says is running, the one a settings release re-releases."""
+RELEASE = {"digest": CHART_DIGEST, "revision": SOURCE, "images": IMAGES}
 
-    def run_cli(self, *responses, timeout="240"):
+
+def unsteady(change):
+    value = evidence()
+    change(value)
+    return value
+
+
+UNSTEADY = {
+    "out of sync": lambda v: v["sync"].update(status="OutOfSync"),
+    "synced at another chart": lambda v: v["sync"].update(revision="sha256:" + "0" * 64),
+    "degraded": lambda v: v["health"].update(status="Degraded"),
+    "a replica not updated": lambda v: v["deployments"][0]["status"].update(updatedReplicas=1),
+    "a replica not available": lambda v: v["deployments"][0]["status"].update(availableReplicas=1),
+    "generation not observed": lambda v: v["deployments"][0]["status"].update(observedGeneration=2),
+    "a deployment by name only": lambda v: v["deployments"].append({"name": "travel-worker"}),
+    "no deployments": lambda v: v.update(deployments=[]),
+    "another digest of the image": lambda v: v["deployments"][0].update(
+        images=[f"localhost:30500/travel-app:{VERSION}@sha256:" + "1" * 64]),
+    "an image of another repository": lambda v: v["deployments"][0]["images"].append(
+        "localhost:30500/sidecar:1@sha256:" + "2" * 64),
+    "an image with no digest": lambda v: v["deployments"][0].update(images=["localhost:30500/travel-app:0.1.0"]),
+    "no image at all": lambda v: v["deployments"][0].update(images=[]),
+}
+
+
+class RunningTests(unittest.TestCase):
+    """plan takes the running version only from a status that proves it runs."""
+
+    def run_cli(self, *responses, timeout="180", release=RELEASE):
         script = Script(*responses)
+        reads = []
+
+        def read(app, version):
+            reads.append((app, version))
+            return copy.deepcopy(release)
+
         stack, clock = fake_clock()
         with tempfile.TemporaryDirectory() as tmp, stack:
             summary = Path(tmp) / "summary"
             with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", script), \
+                    patch.object(wacd, "read_release", read), \
                     patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
-                code, out, err = CliTests.main(self, "running", "--wait-timeout", timeout)
+                code, out, err = CliTests.main(self, "running", "--app", "travel", "--wait-timeout", timeout)
             written = summary.read_text() if summary.exists() else ""
-        return script, clock, (code, out, err, written)
+        return script, reads, clock, (code, out, err, written)
 
-    def test_the_running_version_is_printed_for_the_step_output(self):
-        script, _, (code, out, err, _) = self.run_cli((200, running("1.4.2")))
-        self.assertEqual((code, out, err), (0, "running=1.4.2\n", ""))
+    def test_a_steady_status_names_the_version_its_code_and_its_images(self):
+        script, reads, _, (code, out, err, _) = self.run_cli((200, evidence()))
+        self.assertEqual((code, err), (0, ""), err)
+        self.assertEqual(
+            out.splitlines(),
+            [f"running={VERSION}", f"commit={SOURCE}",
+             "images=" + json.dumps(IMAGES, separators=(",", ":"), sort_keys=True)],
+        )
         self.assertEqual(script.bodies, [wacd.STATUS_BODY()], "one status read; nothing is released")
+        self.assertEqual(reads, [("travel", VERSION)])
 
-    def test_unavailable_is_retried_within_the_wait(self):
-        script, clock, (code, out, err, _) = self.run_cli((503, {}), (503, {}), (200, running("1.4.2")))
-        self.assertEqual((code, out), (0, "running=1.4.2\n"), err)
-        self.assertEqual(len(script.bodies), 3)
-        script, clock, (code, out, err, _) = self.run_cli((503, {}), timeout="20")
-        self.assertEqual((code, out), (1, ""))
-        self.assertIn("deadline", err)
-        self.assertLessEqual(clock.now - 1000.0, 21)
+    def test_images_are_matched_by_repository_and_digest_not_by_the_string(self):
+        for images in ([f"localhost:30500/travel-app:0.0.9@{IMAGE_DIGEST}"], [f"localhost:30500/travel-app@{IMAGE_DIGEST}"]):
+            with self.subTest(images=images):
+                status = evidence()
+                status["deployments"][0]["images"] = images
+                _, _, _, (code, out, err, _) = self.run_cli((200, status))
+                self.assertEqual(code, 0, err)
 
-    def test_a_coded_refusal_names_its_sentence_in_the_summary(self):
-        _, _, (code, out, err, summary) = self.run_cli((403, {"reason": "fleet_copy_missing"}))
-        self.assertEqual((code, out), (1, ""))
-        self.assertIn(wacd.REFUSALS["fleet_copy_missing"], err)
-        self.assertIn(wacd.REFUSALS["fleet_copy_missing"], summary)
-        _, _, (code, _, err, _) = self.run_cli((500, {}))
-        self.assertEqual(code, 1)
-        self.assertIn("HTTP 500", err)
+    def test_an_unsteady_status_is_read_again_until_it_settles(self):
+        for label, change in UNSTEADY.items():
+            with self.subTest(case=label):
+                script, _, _, (code, out, err, _) = self.run_cli((200, unsteady(change)), (200, evidence()))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(len(script.bodies), 2)
 
-    def test_a_running_version_that_is_not_x_y_z_is_no_version_to_release_settings_on(self):
-        for value in ("bootstrap", "v1.4.2", "", None, 7):
+    def test_a_status_that_never_settles_is_a_rollout_refusal_exit_3(self):
+        for label, change in UNSTEADY.items():
+            with self.subTest(case=label):
+                script, _, clock, (code, out, err, _) = self.run_cli((200, unsteady(change)), timeout="30")
+                self.assertEqual((code, out), (3, ""), err)
+                self.assertIn(f"travel was rolling out {VERSION}", err)
+                self.assertEqual(len(err.strip().splitlines()), 1)
+                self.assertGreater(len(script.bodies), 1)
+                self.assertLessEqual(clock.now - 1000.0, 31)
+
+    def test_an_unknown_or_malformed_running_version_is_a_fault_not_a_rollout(self):
+        for value in ("", "bootstrap", "v1.4.2", None, 7):
             with self.subTest(running=value):
                 status = evidence()
                 status["version"] = value
-                _, _, (code, out, err, _) = self.run_cli((200, status))
+                script, reads, _, (code, out, err, _) = self.run_cli((200, status))
                 self.assertEqual((code, out), (1, ""))
                 self.assertIn("is not a released X.Y.Z", err)
-                self.assertEqual(len(err.strip().splitlines()), 1)
+                self.assertEqual((len(script.bodies), reads), (1, []))
+
+    def test_the_status_must_name_the_chart_the_registry_holds(self):
+        for label, release, needle in (
+            ("another manifest", {**RELEASE, "digest": "sha256:" + "9" * 64}, "not the chart the registry holds"),
+            ("absent", None, "is not in the registry"),
+        ):
+            with self.subTest(case=label):
+                script, _, _, (code, out, err, _) = self.run_cli((200, evidence()), release=release)
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn(needle, err)
+                self.assertEqual(len(script.bodies), 1)
+
+    def test_unavailable_is_retried_and_staying_unavailable_is_not_a_rollout(self):
+        script, _, _, (code, out, err, _) = self.run_cli((503, {}), (503, {}), (200, evidence()))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(script.bodies), 3)
+        _, _, _, (code, out, err, _) = self.run_cli((503, {}), timeout="20")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("could not read the cluster", err)
+
+    def test_refusals(self):
+        _, _, _, (code, out, err, summary) = self.run_cli((403, {}))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("not onboarded", err)
+        _, _, _, (code, out, err, summary) = self.run_cli((403, {"reason": "fleet_copy_missing"}))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(wacd.REFUSALS["fleet_copy_missing"], err)
+        self.assertIn(wacd.REFUSALS["fleet_copy_missing"], summary)
+        _, _, _, (code, _, err, _) = self.run_cli((500, {}))
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 500", err)
+
+    def test_the_chart_is_read_at_the_push_address(self):
+        calls = []
+        with patch.object(wacd.chart, "chart_release", lambda *args: calls.append(args) or RELEASE):
+            self.assertEqual(wacd.read_release("travel", VERSION), RELEASE)
+        self.assertEqual(calls, [("registry.network.svc.cluster.local:5000", "travel", VERSION)])
 
     def test_the_token_is_never_printed(self):
         def explode(body, trust, timeout):
             raise RuntimeError(f"Authorization: Bearer {TOKEN}")
 
         with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", explode):
-            code, out, err = CliTests.main(self, "running", "--wait-timeout", "30")
+            code, out, err = CliTests.main(self, "running", "--app", "travel", "--wait-timeout", "30")
         self.assertEqual(code, 1)
         self.assertNotIn(TOKEN, out + err)
 
