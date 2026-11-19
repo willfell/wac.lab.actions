@@ -236,10 +236,17 @@ jobs:
             plan_version() {
               local planned
               local reason
-              if ! planned="$(python3 "$WACD_SCRIPTS"/wacd-version.py --prefix "$TAG_PREFIX" \
+              local code=0
+              planned="$(python3 "$WACD_SCRIPTS"/wacd-version.py --prefix "$TAG_PREFIX" \
                 --version-source "$VERSION_SOURCE" --version "$CALLER_VERSION" --deploy "$DEPLOY" \
-                --published "$1" 2> "$RUNNER_TEMP/version.err")"; then
-                reason="$(tr '\n' ' ' < "$RUNNER_TEMP/version.err" | sed 's/^wacd version: //; s/ *$//')"
+                --published "$1" 2> "$RUNNER_TEMP/version.err")" || code=$?
+              if [[ "$code" -ne 0 ]]; then
+                reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/version.err" | sed 's/^wacd version: //; s/ *$//')"
+                if [[ "$code" -eq 3 ]]; then
+                  printf 'replay_refused=%s\n' "$reason" >> "$GITHUB_OUTPUT"
+                  echo "wac-cd: replay refused; the next step reports it"
+                  exit 0
+                fi
                 echo "wac-cd: $reason" >&2
                 echo "::error::wac-cd: $reason"
                 {
@@ -303,6 +310,21 @@ jobs:
               echo "Superseded: $superseded. Nothing was built or published; the newer run releases these commits cumulatively."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Refuse to replay an old version
+        timeout-minutes: 1
+        if: ${{ steps.version.outputs.replay_refused != '' }}
+        shell: bash
+        env:
+          REASON: ${{ steps.version.outputs.replay_refused }}
+        run: |
+          echo "wac-cd: $REASON" >&2
+          echo "::error::wac-cd: $REASON"
+          {
+            echo "### wac-cd plan"
+            echo
+            echo "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
   shadow:
     needs: plan

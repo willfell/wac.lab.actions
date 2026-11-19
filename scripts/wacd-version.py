@@ -3,7 +3,8 @@
 
 Run inside the app checkout, with full history and tags fetched. The CLI prints
 mode=, version= and tag= lines for $GITHUB_OUTPUT. Any problem exits 1 with a
-one-line message.
+one-line message, except a refused replay (below), which exits 3 so the caller
+can tell it from every other failure.
 
 Modes: release (tag and deploy), publish (tag and push images, no deploy),
 resume (HEAD is already tagged, so finish that release) and none.
@@ -32,9 +33,14 @@ FEAT_HEADER = re.compile(r"feat(\([^)]*\))?:")
 BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
 PUBLISHED = ("true", "false", "unknown")
 MAIN_REF = "origin/main"
+REPLAY_REFUSED_EXIT = 3
 
 
 class VersionError(Exception):
+    pass
+
+
+class ReplayRefused(VersionError):
     pass
 
 
@@ -117,8 +123,8 @@ def tag_lines(repo, *args):
     return [line for line in git(repo, "tag", *args).splitlines() if line]
 
 
-def replaced_by(tag):
-    return (
+def older_than(tag):
+    return ReplayRefused(
         f"This commit is older than {tag}, which is already published and contains "
         "or replaces it. Roll back or release anew; an old build is never replayed."
     )
@@ -162,12 +168,12 @@ def plan(
         if deploy:
             newest, unmerged = published_tags(repo, prefix, main_ref)
             if newest is not None and parsed < newest[0]:
-                raise VersionError(
+                raise ReplayRefused(
                     f"This run is for {tag}, but {newest[1]} is already published. "
                     "Roll back or release anew; an old build is never replayed."
                 )
             if unmerged is not None:
-                raise VersionError(replaced_by(unmerged[1]))
+                raise older_than(unmerged[1])
         result = {
             "mode": "release" if published == "false" else "resume",
             "version": ".".join(str(part) for part in parsed),
@@ -195,7 +201,7 @@ def plan(
     if deploy:
         _, unmerged = published_tags(repo, prefix, main_ref)
         if unmerged is not None:
-            raise VersionError(replaced_by(unmerged[1]))
+            raise older_than(unmerged[1])
 
     tag = f"{prefix}{new}"
     existing = commit_of(repo, tag)
@@ -233,7 +239,7 @@ def main(argv):
     except VersionError as err:
         message = " ".join(str(err).split())
         print(f"wacd version: {message}", file=sys.stderr)
-        return 1
+        return REPLAY_REFUSED_EXIT if isinstance(err, ReplayRefused) else 1
     for key in ("mode", "version", "tag"):
         print(f"{key}={result[key]}")
     return 0

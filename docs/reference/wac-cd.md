@@ -336,6 +336,19 @@ replaying an old build. A rollback is not refused: it names its version and does
 not consult this rule. A `deploy: false` run is not refused either, since it
 never deploys.
 
+**The refusal is its own step.** `Plan the version` records a refused replay
+as the step output `replay_refused` and succeeds, setting no mode, version, tag
+or expected SHA; the next step, named exactly `Refuse to replay an old version`,
+runs only when that output is set, writes the sentence to stderr, to an
+`::error::wac-cd:` annotation and to the run summary, and exits 1. It is the
+last step of `plan`, so `plan` fails, every job that needs it is skipped, and
+nothing was tagged or published. Hemi reads a refused replay from the Actions
+jobs API as the job `cd / plan`, step `Refuse to replay an old version`,
+conclusion `failure`; any other failure of `plan`, including a shallow checkout,
+a tag collision or a missing `origin/main`, fails `Plan the version` itself and
+leaves this step skipped. Do not rename the step. `wacd-version.py` tells the
+two apart by exit code: 3 for a refused replay, 1 for any other failure.
+
 **Rollback** is a `workflow_dispatch` of `cd.yml` with `version`. `plan` reads
 the chart's recorded revision and requires it to be an ancestor of `main`;
 build and publish are skipped and the chart that already exists is released

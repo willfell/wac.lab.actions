@@ -514,6 +514,30 @@ class CliTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
 
+    def test_cli_exits_3_for_a_refused_replay_and_1_for_any_other_failure(self):
+        git(self.repo, "tag", "v0.1.0")
+        git(self.repo, "commit", "--allow-empty", "-q", "-m", "feat: second")
+        git(self.repo, "tag", "v0.2.0")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        git(self.repo, "checkout", "-q", "v0.1.0")
+        result = self.cli("--prefix", "v")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("This run is for v0.1.0, but v0.2.0 is already published.", result.stderr)
+        git(self.repo, "checkout", "-q", "-")
+        git(self.repo, "checkout", "-q", "--detach", "HEAD~1")
+        git(self.repo, "commit", "--allow-empty", "-q", "-m", "fix: untagged")
+        result = self.cli("--prefix", "v")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("This commit is older than v0.2.0", result.stderr)
+        for args in (
+            ["--main-ref", "refs/remotes/origin/absent"],
+            ["--version-source", "caller", "--version", "v1.0.0"],
+        ):
+            with self.subTest(args=args):
+                result = self.cli("--prefix", "v", *args)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
     def test_cli_rejects_bad_deploy_value(self):
         result = self.cli("--prefix", "v", "--deploy", "yes")
         self.assertNotEqual(result.returncode, 0)

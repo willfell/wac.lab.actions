@@ -416,7 +416,15 @@ class ReusableWorkflowTests(unittest.TestCase):
 
         root = Path(__file__).resolve().parents[2]
         doc = yaml.safe_load((root / ".github" / "workflows" / "wac-cd.yml").read_text())
-        step = next(s for s in doc["jobs"]["plan"]["steps"] if s.get("name") == "Plan the version")
+        steps = doc["jobs"]["plan"]["steps"]
+        names = [s.get("name") for s in steps]
+        step = steps[names.index("Plan the version")]
+        refusal = steps[names.index("Plan the version") + 1]
+        self.assertEqual(refusal["name"], "Refuse to replay an old version")
+        self.assertEqual(refusal["if"], "${{ steps.version.outputs.replay_refused != '' }}")
+        self.assertEqual(refusal["env"], {"REASON": "${{ steps.version.outputs.replay_refused }}"})
+        self.assertIsInstance(refusal["timeout-minutes"], int)
+        self.assertEqual(names[-1], refusal["name"], "nothing runs between the planning step and the refusal")
 
         def git(repo, *args):
             return subprocess.run(
@@ -462,6 +470,13 @@ class ReusableWorkflowTests(unittest.TestCase):
                 result = subprocess.run(["bash", "-c", step["run"]], env=env, cwd=repo,
                                         capture_output=True, text=True)
                 outputs = dict(line.split("=", 1) for line in out.read_text().splitlines()) if out.exists() else {}
+                reason = outputs.pop("replay_refused", "")
+                if reason:
+                    self.assertEqual(result.returncode, 0, "the planning step records a refused replay and succeeds")
+                    self.assertEqual(outputs, {}, "no mode, version or tag is left for a later job")
+                    self.assertFalse(summary.exists(), "the refusal step writes the summary")
+                    result = subprocess.run(["bash", "-c", refusal["run"]], env={**env, "REASON": reason},
+                                            capture_output=True, text=True)
                 return result, outputs, summary.read_text() if summary.exists() else ""
 
         sentence = ("This run is for v0.1.0, but v0.2.0 is already published. "
@@ -481,6 +496,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(outputs, {})
         self.assertIn("origin/main is not in the checkout", summary)
+        self.assertIn("origin/main is not in the checkout", result.stderr)
 
         result, outputs, _ = run("main", extra_commit=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -497,6 +513,15 @@ class ReusableWorkflowTests(unittest.TestCase):
         result, outputs, _ = run("main", rollback="0.1.0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((outputs["mode"], outputs["version"], outputs["tag"]), ("rollback", "0.1.0", "v0.1.0"))
+
+        jobs = doc["jobs"]
+        for name in ("shadow", "build", "publish", "deploy", "github-release"):
+            with self.subTest(job=name):
+                condition = str(jobs[name].get("if", ""))
+                self.assertIn("plan", jobs[name]["needs"])
+                self.assertNotIn("always()", condition)
+                if "cancelled()" in condition:
+                    self.assertIn("!failure()", condition)
 
     def test_wac_cd_shadow_observes_and_never_holds_a_release(self):
         """A hemi outage must not fail or delay a release: the shadow job is off the release path."""
