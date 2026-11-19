@@ -31,14 +31,15 @@ rate-limited or down behind it) and is retried every POLL_SECONDS within
 CONTRACT_WAIT seconds, as a `release` retries it. A 403 is a denial, told
 apart from a 503 by its status, never its body: a coded one carries one of
 REFUSALS' codes, an unverified caller none. The response body is never
-printed; only a sentence chosen here is. The gateway's address is
+printed; only a sentence is. The request is wacd-release.py's post(), and the
+code-to-sentence map is wacd-release.py's REFUSALS with its two defaults, so a
+refused contract and a refused release read alike. The gateway's address is
 ci-release.py's constant, never an input, and no token is ever printed.
 """
 
 import argparse
 import base64
 import binascii
-import http.client
 import importlib.util
 import json
 import os
@@ -47,8 +48,6 @@ import shutil
 import ssl
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 
@@ -59,7 +58,8 @@ def _load(name, filename):
     return module
 
 
-ci = _load("wacd_contract_ci_release", "ci-release.py")
+release = _load("wacd_contract_release", "wacd-release.py")
+ci = release.ci
 profile = _load("wacd_contract_profile", "wacd-profile.py")
 chart = _load("wacd_contract_chart", "wacd-chart.py")
 
@@ -67,50 +67,16 @@ CONTRACT_BODY = {"operation": "contract"}
 CONTRACT_WAIT = 120
 POLL_SECONDS = 5
 REQUEST_TIMEOUT = 30
-MAX_BODY = 1024 * 1024
 FILES_PROFILE = Path(".github") / "wacd.json"
 SOURCES = ("files", "hemi")
 SHA40 = re.compile(r"[0-9a-f]{40}")
-CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 REPOSITORY_ID = re.compile(r"[0-9]{1,20}")
 
-# The gateway's closed list of refusal codes, each with the sentence the run
-# summary shows. The release-check codes come back from `release`, not from
-# `contract`; they are listed so one map serves both.
-REFUSALS = {
-    "fleet_copy_missing": (
-        "This app has released from hemi's settings before, and the gateway found no copy "
-        "of them, so nothing was built."
-    ),
-    "fleet_copy_unreadable": (
-        "The gateway could not read hemi's copy of this app's settings, so nothing was built."
-    ),
-    "fleet_copy_mismatch": (
-        "hemi's copy of this app's settings names another app, so nothing was built."
-    ),
-    "fleet_commit_not_on_default_branch": (
-        "The settings this release was planned with are no longer on the fleet copy's main line."
-    ),
-    "fleet_commit_older_than_last_release": (
-        "The settings this release was planned with are older than the settings already released."
-    ),
-    "revision_annotation_missing": (
-        "This app releases from hemi's settings, and this chart does not say which revision "
-        "of them it was built from."
-    ),
-    "revision_mismatch": (
-        "This chart names a different revision of the settings from the copy it points to."
-    ),
-}
+REFUSALS = release.REFUSALS
 
 SENTENCES = {
-    "unverified": (
-        "The gateway did not accept this run as a release of a registered app, so it handed "
-        "over no settings."
-    ),
-    "unknown_refusal": (
-        "The gateway refused to hand over this app's settings for a reason this wac-cd does not know"
-    ),
+    "unverified": release.UNVERIFIED,
+    "unknown_refusal": release.UNKNOWN_REFUSAL,
     "another_repository": (
         "The settings copy the gateway handed over belongs to another repository, so nothing "
         "was built."
@@ -160,54 +126,14 @@ def trust_context():
         raise Refusal(SENTENCES["no_trust"]) from None
 
 
-def denial(value):
-    """The sentence for a 403, chosen by the reason code it carries."""
-    reason = value.get("reason") if isinstance(value, dict) else None
-    if reason is None:
-        return SENTENCES["unverified"]
-    if isinstance(reason, str) and reason in REFUSALS:
-        return REFUSALS[reason]
-    if isinstance(reason, str) and CODE.fullmatch(reason):
-        return f"{SENTENCES['unknown_refusal']} (code {reason})."
-    return SENTENCES["unknown_refusal"] + "."
-
-
 def post(trust, timeout):
     """One contract request with a token minted for it: (status, parsed body or None, token)."""
     try:
-        token = ci.oidc_token()
+        return release.post(CONTRACT_BODY, trust, timeout)
+    except release.Unreachable:
+        raise Refusal(SENTENCES["unreachable"]) from None
     except ci.ReleaseError:
         raise Refusal(SENTENCES["no_token"]) from None
-    request = urllib.request.Request(
-        ci.URL,
-        data=json.dumps(CONTRACT_BODY).encode(),
-        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
-        method="POST",
-    )
-    opener = urllib.request.build_opener(
-        ci.NoRedirect(),
-        urllib.request.HTTPSHandler(context=trust),
-        urllib.request.ProxyHandler({}),
-    )
-    try:
-        response = opener.open(request, timeout=timeout)
-    except urllib.error.HTTPError as error:
-        response = error
-    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
-        raise Refusal(SENTENCES["unreachable"]) from None
-    try:
-        with response:
-            status = response.code if isinstance(response, urllib.error.HTTPError) else response.status
-            raw = response.read(MAX_BODY + 1)
-    except (OSError, http.client.HTTPException, ValueError):
-        raise Refusal(SENTENCES["unreachable"]) from None
-    value = None
-    if len(raw) <= MAX_BODY:
-        try:
-            value = json.loads(raw)
-        except (ValueError, UnicodeError):
-            value = None
-    return status, value, token
 
 
 def ask(trust):
@@ -219,7 +145,7 @@ def ask(trust):
         if status == 200:
             return value, token
         if status == 403:
-            raise Refusal(denial(value))
+            raise Refusal(release.refusal_sentence(value))
         if status != 503:
             raise Refusal(SENTENCES["status"].format(status=status))
         time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))

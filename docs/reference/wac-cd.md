@@ -174,12 +174,19 @@ gateway's codes gets this sentence in the run summary:
 
 `fleet_commit_not_on_default_branch`, `fleet_commit_older_than_last_release`,
 `revision_annotation_missing` and `revision_mismatch` are the gateway's release
-checks, so they answer a `release` rather than this request; `deploy` still
-reports a refused release by its HTTP status alone.
+checks, so they answer a `release` (or its `status` pre-check) in `deploy`
+rather than this request. `scripts/wacd-release.py` holds the map, and both
+scripts use it: `deploy` fails with
+`release request refused (HTTP 403): <sentence>` and adds
+`The gateway refused the release: <sentence>` to the job summary. Its POST
+keeps only a 403's `reason` and drops the rest of every body but a 200's.
 
-A code not in that list gets `The gateway refused to hand over this app's settings for a reason this wac-cd does not know (code <code>).`,
-so a code added to the gateway later cannot break a release summary. A
-denial without a code reads `The gateway did not accept this run as a release of a registered app, so it handed over no settings.` The run summary's
+A code not in that list gets
+`The gateway refused this request for a reason this wac-cd does not know (code <code>).`
+(without the parenthesis when the code is not a plain lowercase word), so a
+code added to the gateway later cannot break a release summary. A denial
+without a code reads
+`The gateway did not accept this run as a release of a registered app.` The run summary's
 `wac-cd settings` section names the source, the revision and the fleet commit,
 with one sentence saying which rule applied or why the run stopped. The
 revision is a JSON number in the copy and a decimal string in the annotation;

@@ -510,7 +510,7 @@ class DowngradeTests(unittest.TestCase):
             receipt = str(Path(tmp) / "receipt.json")
             script = Script((200, running("1.0.0")), (200, released()))
             with patch.object(wacd, "trust_context", lambda: None), patch.object(
-                wacd.ci, "request", script
+                wacd, "transport", script
             ):
                 code, out, err = CliTests.main(self, *CliTests.release_argv(self, receipt))
             self.assertEqual((code, out), (1, ""))
@@ -613,6 +613,89 @@ class ServedTests(unittest.TestCase):
             health.close()
 
 
+class RefusalTests(unittest.TestCase):
+    """A coded 403 from the gateway reaches the job summary as a sentence, never as its body."""
+
+    MARKER = "raw-gateway-body-never-printed"
+    CODES = (
+        "fleet_copy_missing",
+        "fleet_copy_unreadable",
+        "fleet_copy_mismatch",
+        "fleet_commit_not_on_default_branch",
+        "fleet_commit_older_than_last_release",
+        "revision_annotation_missing",
+        "revision_mismatch",
+    )
+
+    def release(self, *responses):
+        gateway = Gateway(*responses)
+        self.addCleanup(gateway.close)
+        minted = []
+
+        def mint():
+            minted.append(f"minted.token.{len(minted)}")
+            return minted[-1]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = Path(tmp) / "summary.md"
+            argv = CliTests.release_argv(self, str(Path(tmp) / "receipt.json"))
+            out, err = io.StringIO(), io.StringIO()
+            stack, _ = fake_clock()
+            with stack, patch.object(wacd.ci, "URL", gateway.url), patch.object(wacd.ci, "oidc_token", mint), \
+                    patch.object(wacd, "trust_context", lambda: None), \
+                    patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = wacd.main(["wacd-release.py", *argv])
+            written = summary.read_text() if summary.exists() else ""
+        everything = out.getvalue() + err.getvalue() + written
+        for token in minted:
+            self.assertNotIn(token, everything)
+        self.assertNotIn(self.MARKER, everything)
+        return code, err.getvalue(), written, gateway
+
+    def refused(self, reason=None, status=403):
+        body = {"error": "release request denied", "detail": self.MARKER}
+        if reason is not None:
+            body["reason"] = reason
+        return status, body
+
+    def test_each_release_check_code_reaches_the_summary_as_its_sentence(self):
+        self.assertEqual(sorted(wacd.REFUSALS), sorted(self.CODES))
+        for reason in self.CODES:
+            with self.subTest(reason=reason):
+                code, err, summary, gateway = self.release((200, running(VERSION)), self.refused(reason))
+                self.assertEqual(code, 1)
+                self.assertEqual(len(err.strip().splitlines()), 1)
+                self.assertIn("HTTP 403", err)
+                self.assertIn(wacd.REFUSALS[reason], err)
+                self.assertIn(wacd.REFUSALS[reason], summary)
+                self.assertEqual([body for _, body in gateway.seen], [wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION)])
+
+    def test_a_coded_pre_check_refusal_is_named_too(self):
+        code, err, summary, _ = self.release(self.refused("revision_annotation_missing"))
+        self.assertEqual(code, 1)
+        self.assertIn(wacd.REFUSALS["revision_annotation_missing"], summary)
+
+    def test_unknown_and_absent_codes_get_the_default_sentences(self):
+        for reason, expected in (
+            ("fleet_copy_haunted", wacd.UNKNOWN_REFUSAL + " (code fleet_copy_haunted)."),
+            (self.MARKER, wacd.UNKNOWN_REFUSAL + "."),
+            (7, wacd.UNKNOWN_REFUSAL + "."),
+            (None, wacd.UNVERIFIED),
+        ):
+            with self.subTest(reason=str(reason)[:20]):
+                code, err, summary, _ = self.release((200, running(VERSION)), self.refused(reason))
+                self.assertEqual(code, 1)
+                self.assertIn(expected, err)
+                self.assertIn(expected, summary)
+
+    def test_a_coded_body_on_another_status_is_only_its_status(self):
+        code, err, summary, _ = self.release((200, running(VERSION)), self.refused("revision_mismatch", 409))
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 409", err)
+        self.assertNotIn(wacd.REFUSALS["revision_mismatch"], err + summary)
+
+
 class CliTests(unittest.TestCase):
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -638,7 +721,7 @@ class CliTests(unittest.TestCase):
             receipt = str(Path(tmp) / "receipt.json")
             script = Script((200, released()))
             with patch.object(wacd, "trust_context", lambda: None), patch.object(
-                wacd.ci, "request", script
+                wacd, "transport", script
             ):
                 code, out, err = self.main(*self.release_argv(receipt))
             self.assertEqual((code, err), (0, ""), err)
@@ -653,7 +736,7 @@ class CliTests(unittest.TestCase):
             )
             stack, _ = fake_clock()
             with stack, patch.object(wacd, "trust_context", lambda: None), patch.object(
-                wacd.ci, "request", script
+                wacd, "transport", script
             ):
                 code, _, err = self.main(*self.release_argv(receipt))
             self.assertEqual((code, err), (0, ""), err)
@@ -674,7 +757,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             receipt = str(Path(tmp) / "receipt.json")
             with patch.object(wacd, "trust_context", lambda: None), patch.object(
-                wacd.ci, "request", Script((200, released()))
+                wacd, "transport", Script((200, released()))
             ):
                 code, _, err = self.main(*self.release_argv(
                     receipt, mode="rollback", tag="app-v" + VERSION, expected_sha="b" * 40))
@@ -688,7 +771,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             receipt = str(Path(tmp) / "receipt.json")
             with patch.object(wacd, "trust_context", lambda: None), patch.object(
-                wacd.ci, "request", explode
+                wacd, "transport", explode
             ):
                 code, out, err = self.main(*self.release_argv(receipt))
             self.assertEqual(code, 1)
@@ -703,7 +786,7 @@ class CliTests(unittest.TestCase):
             lines = set()
             for code_ in (403, 404, 409):
                 with patch.object(wacd, "trust_context", lambda: None), patch.object(
-                    wacd.ci, "request", Script((code_, {}))
+                    wacd, "transport", Script((code_, {}))
                 ):
                     code, out, err = self.main(*self.release_argv(receipt))
                 self.assertEqual((code, out), (1, ""))
@@ -752,7 +835,7 @@ class CliTests(unittest.TestCase):
             }
             for label, argv in bad.items():
                 with self.subTest(label):
-                    with patch.object(wacd.ci, "request", Script((200, released()))) as _:
+                    with patch.object(wacd, "transport", Script((200, released()))) as _:
                         code, out, err = self.main(*argv)
                     self.assertEqual(code, 1, err)
                     self.assertNotIn("Traceback", err)

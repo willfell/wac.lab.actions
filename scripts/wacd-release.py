@@ -5,9 +5,17 @@ wac-cd publishes the deploy chart, then asks the release gateway to release
 that chart version and polls its status until Argo CD has synced the chart's
 manifest digest, every Deployment has rolled out, and the Deployments run this
 release's images. The release CLI first asks for status once and refuses to
-release over a newer running X.Y.Z unless the mode is rollback. The transport is scripts/ci-release.py's, which mints a fresh
-GitHub OIDC token for every request. That file belongs to other components and
-is loaded, never changed.
+release over a newer running X.Y.Z unless the mode is rollback. Every request
+mints a fresh GitHub OIDC token through scripts/ci-release.py's oidc_token()
+and goes to its URL with its CA file and NoRedirect; that file belongs to other
+components and is loaded, never changed. The POST itself is post() here rather
+than ci-release's request(), because ci-release's fetch() drops the body of
+every answer but a 200, and a 403 from the gateway carries a refusal code
+(reason). Only that code is kept, mapped through REFUSALS to a sentence (a code
+not in the list gets UNKNOWN_REFUSAL, a 403 without one UNVERIFIED), and the
+sentence is the error line and a job summary line. The body is never printed.
+wacd-contract.py uses the same post() and map for the gateway's contract
+operation.
 
 The gateway contract (Plan 2, "Chart releases (wac-cd)") is isolated in
 RELEASE_BODY, STATUS_BODY and ready(). After the proof, github-release creates
@@ -49,6 +57,68 @@ GITHUB_TIMEOUT = 30
 TAG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 RELEASED_MODES = ("release", "resume", "rollback")
+REASON_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+# The gateway's closed list of refusal codes, each with the sentence a run
+# summary shows. The first three answer the contract operation, the rest the
+# release checks; one map serves wacd-contract.py and the release below.
+REFUSALS = {
+    "fleet_copy_missing": (
+        "This app has released from hemi's settings before, and the gateway found no copy "
+        "of them, so nothing was built."
+    ),
+    "fleet_copy_unreadable": (
+        "The gateway could not read hemi's copy of this app's settings, so nothing was built."
+    ),
+    "fleet_copy_mismatch": (
+        "hemi's copy of this app's settings names another app, so nothing was built."
+    ),
+    "fleet_commit_not_on_default_branch": (
+        "The settings this release was planned with are no longer on the fleet copy's main line."
+    ),
+    "fleet_commit_older_than_last_release": (
+        "The settings this release was planned with are older than the settings already released."
+    ),
+    "revision_annotation_missing": (
+        "This app releases from hemi's settings, and this chart does not say which revision "
+        "of them it was built from."
+    ),
+    "revision_mismatch": (
+        "This chart names a different revision of the settings from the copy it points to."
+    ),
+}
+UNKNOWN_REFUSAL = "The gateway refused this request for a reason this wac-cd does not know"
+UNVERIFIED = "The gateway did not accept this run as a release of a registered app."
+
+
+class Unreachable(ReleaseError):
+    """The gateway could not be reached or dropped the answer."""
+
+
+class Refused(ReleaseError):
+    """The gateway answered 403; the message ends with the refusal's sentence."""
+
+    def __init__(self, what, sentence):
+        super().__init__(f"{what} refused (HTTP 403): {sentence}")
+        self.sentence = sentence
+
+
+def refusal_sentence(value):
+    """The sentence for a 403 whose body carried value; value never reaches output."""
+    reason = value.get("reason") if isinstance(value, dict) else None
+    if reason is None:
+        return UNVERIFIED
+    if isinstance(reason, str) and reason in REFUSALS:
+        return REFUSALS[reason]
+    if isinstance(reason, str) and REASON_PATTERN.fullmatch(reason):
+        return f"{UNKNOWN_REFUSAL} (code {reason})."
+    return UNKNOWN_REFUSAL + "."
+
+
+def rejected(what, code, value):
+    if code == 403:
+        return Refused(what, refusal_sentence(value))
+    return ReleaseError(f"{what} rejected (HTTP {code})")
 
 
 def RELEASE_BODY(version):
@@ -68,8 +138,57 @@ def trust_context():
         ) from None
 
 
+def post(body, trust, timeout):
+    """One POST to the gateway with a token minted for it: (status, JSON or None, token).
+
+    ci.oidc_token() raises ReleaseError when no token can be had; a transport
+    failure raises Unreachable. Whatever the status, the parsed body is
+    returned to the caller, which keeps only what it needs from it.
+    """
+    token = ci.oidc_token()
+    request = urllib.request.Request(
+        ci.URL,
+        data=json.dumps(body).encode(),
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(
+        ci.NoRedirect(),
+        urllib.request.HTTPSHandler(context=trust),
+        urllib.request.ProxyHandler({}),
+    )
+    unreachable = "release transport failed; check TLS trust and service readiness"
+    try:
+        response = opener.open(request, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        response = error
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
+        raise Unreachable(unreachable) from None
+    try:
+        with response:
+            status = response.code if isinstance(response, urllib.error.HTTPError) else response.status
+            raw = response.read(MAX_BODY + 1)
+    except (OSError, http.client.HTTPException, ValueError):
+        raise Unreachable(unreachable) from None
+    value = None
+    if len(raw) <= MAX_BODY:
+        try:
+            value = json.loads(raw)
+        except (ValueError, UnicodeError):
+            value = None
+    return status, value, token
+
+
 def transport(body, trust, timeout):
-    return ci.request(body, trust, timeout)
+    """(status, value) as ci-release's request() returns it, but a 403 keeps its reason."""
+    status, value, _ = post(body, trust, timeout)
+    if status == 200:
+        if not isinstance(value, dict):
+            raise ReleaseError("invalid release response")
+        return status, value
+    if status == 403 and isinstance(value, dict) and "reason" in value:
+        return status, {"reason": value["reason"]}
+    return status, {}
 
 
 def released_digest(value, version):
@@ -207,7 +326,7 @@ def proved(version, images, wait_timeout, request=None, mode=None):
         elif code == 503:
             wait()
         else:
-            raise ReleaseError(f"status pre-check rejected (HTTP {code})")
+            raise rejected("status pre-check", code, value)
 
     digest = None
     record = None
@@ -221,14 +340,14 @@ def proved(version, images, wait_timeout, request=None, mode=None):
         elif code == 503:
             wait()
         else:
-            raise ReleaseError(f"release request rejected (HTTP {code})")
+            raise rejected("release request", code, value)
     while digest is not None and time.monotonic() < deadline:
         code, value = send(STATUS_BODY())
         if code == 200:
             if ready(value, version, digest, images):
                 return value, record
         elif code != 503:
-            raise ReleaseError(f"release request rejected (HTTP {code})")
+            raise rejected("release request", code, value)
         wait()
     raise ReleaseError("release evidence deadline exceeded")
 
@@ -424,10 +543,23 @@ def run(args):
     return "Verified release receipt: " + args.receipt
 
 
+def summarize_refusal(sentence):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"\nThe gateway refused the release: {sentence}\n")
+    except OSError:
+        pass
+
+
 def main(argv):
     try:
         line = run(build_parser().parse_args(argv[1:]))
     except ReleaseError as err:
+        if isinstance(err, Refused):
+            summarize_refusal(err.sentence)
         print("wacd release: " + " ".join(str(err).split()), file=sys.stderr)
         return 1
     except Exception:
