@@ -255,6 +255,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install helm
+        continue-on-error: true
+        shell: bash
+        env:
+          HELM_VERSION: v3.16.3
+        run: bash "$WACD_SCRIPTS"/install-tools.sh helm
       - name: Compare hemi's copy with the files
         shell: bash
         run: python3 "$WACD_SCRIPTS"/wacd-shadow.py .github/wacd.json

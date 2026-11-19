@@ -179,9 +179,21 @@ within a fixed 300 seconds.
 stored copy of the app's configuration matches the files. It mints a GitHub
 OIDC job token with audience `wacwini:hemi` for each request, reads
 `GET http://hemi-app.hemi.svc.cluster.local:3000/api/v1/contract` for the copy
-number (`identity.revision`), then posts `{"revision", "profile", "values"}`
-to `/api/v1/shadow`: the copy number, `.github/wacd.json` parsed as JSON, and the text of the values
-file the profile names. Each request has a 10-second timeout, no proxy and no
+number (`identity.revision`), then posts `{"revision", "profile", "values"}` and,
+when Helm could read the file, `"helmValues"` to `/api/v1/shadow`: the copy number, `.github/wacd.json` parsed as JSON, the text of the values
+file the profile names, and `helmValues`, Helm's own reading of that file. YAML 1.1,
+which Helm uses, reads `yes` and `on` as true, `010` as 8 and a key written `y` as
+the string `true`, and applies `<<` merges; hemi reads the same text as YAML 1.2, so
+hemi compares JSON with JSON. The job installs Helm `v3.16.3` (the version `publish`
+installs) in a step that may fail, and the script runs `helm template probe
+scripts/fixtures/values-probe -f <values file> --show-only templates/values.json`
+with no cluster (`KUBECONFIG=/dev/null`), none of the job's token variables and a
+30-second timeout. The probe chart's only template is `{{ toJson .Values }}` and it
+ships no `values.yaml`, because with chart defaults Helm removes a key the user set to
+null and without them it keeps every null where it was written. If Helm is absent,
+fails, times out or prints anything but a JSON object, the body carries no
+`helmValues` and the summary ends with `Helm could not read the values; hemi
+compared its own reading.` Each request has a 10-second timeout, no proxy and no
 redirects. The job summary gets one line, `hemi's copy matched the files
 (copy <n>).` or `hemi's copy differs from the files in <k> places (copy <n>).`
 (`in 1 place` for a single difference) followed by one line per difference, or `hemi did not answer; nothing was

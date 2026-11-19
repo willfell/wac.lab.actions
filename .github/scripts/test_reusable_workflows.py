@@ -369,6 +369,27 @@ class ReusableWorkflowTests(unittest.TestCase):
         runs = [s["run"] for s in job["steps"] if "wacd-shadow.py" in s.get("run", "")]
         self.assertEqual(runs, ['python3 "$WACD_SCRIPTS"/wacd-shadow.py .github/wacd.json'])
         self.assertTrue((root / "scripts" / "wacd-shadow.py").is_file())
+        steps = job["steps"]
+        installs = [i for i, s in enumerate(steps) if "install-tools.sh" in s.get("run", "")]
+        compare = [i for i, s in enumerate(steps) if "wacd-shadow.py" in s.get("run", "")]
+        self.assertEqual(len(installs), 1)
+        install = steps[installs[0]]
+        self.assertLess(installs[0], compare[0], "helm is on PATH before the comparison reads it")
+        self.assertEqual(install["run"], 'bash "$WACD_SCRIPTS"/install-tools.sh helm')
+        publish_installs = [
+            st for st in jobs["publish"]["steps"] if "install-tools.sh helm" in st.get("run", "")
+        ]
+        self.assertEqual(install["env"], publish_installs[0]["env"], "one pinned Helm for the whole workflow")
+        self.assertIs(install.get("continue-on-error"), True, "a failed download must not skip the comparison")
+        self.assertEqual(
+            sorted((root / "scripts" / "fixtures" / "values-probe").rglob("*")),
+            [
+                root / "scripts" / "fixtures" / "values-probe" / "Chart.yaml",
+                root / "scripts" / "fixtures" / "values-probe" / "templates",
+                root / "scripts" / "fixtures" / "values-probe" / "templates" / "values.json",
+            ],
+            "the probe chart ships no values.yaml: chart defaults would remove a user's explicit null",
+        )
 
     def test_wac_ci_setup_go_takes_the_version_or_the_version_file_from_the_profile(self):
         import yaml

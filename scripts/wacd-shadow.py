@@ -14,6 +14,16 @@ request bearer nor a minted token is ever printed: every token minted is kept,
 and any occurrence of one in an output line, including one hemi echoed back in
 a difference, is replaced with [token] before the line is written.
 
+Files compared as text differ from Helm's reading of them (YAML 1.1 reads
+`yes` as true, `010` as 8 and a key written `y` as "true"), and Helm is what
+the chart actually sees. So when Helm is installed the script also renders
+a fixture chart whose only template is `{{ toJson .Values }}` against the values
+file and posts the result as `helmValues`. That chart ships no values.yaml: with
+chart defaults a user's explicit null removes the key, without them Helm keeps
+every null where it was written. If Helm is absent, fails, hangs or prints
+anything but a JSON object, the files are posted without `helmValues` and the
+summary says so.
+
 ci-release.py mints its token the same way. It is not imported because wac.lab
 loads that file by path and its names are pinned; this script keeps its own.
 """
@@ -23,6 +33,8 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -35,8 +47,11 @@ AUDIENCE = "wacwini:hemi"
 TOKEN_SCHEME = "https"
 TOKEN_HOST_SUFFIX = ".actions.githubusercontent.com"
 TIMEOUT = 10
+HELM_TIMEOUT = 30
+PROBE_CHART = Path(__file__).resolve().parent / "fixtures" / "values-probe"
 MAX_RESPONSE = 1048576
 SILENT = "hemi did not answer; nothing was compared."
+HELM_UNREAD = "Helm could not read the values; hemi compared its own reading."
 REDACTED = "[token]"
 MINTED: list[str] = []
 
@@ -129,18 +144,49 @@ def one_line(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True)
 
 
+def helm_values(values_file: Path) -> dict[str, Any] | None:
+    """Helm's own reading of the values file as JSON, or None when it cannot be had.
+
+    Helm gets a bare environment: no cluster (KUBECONFIG=/dev/null) and none of
+    the job's token variables.
+    """
+    helm = shutil.which("helm")
+    if helm is None:
+        return None
+    env = {"KUBECONFIG": os.devnull}
+    for name in ("PATH", "HOME", "TMPDIR"):
+        if name in os.environ:
+            env[name] = os.environ[name]
+    try:
+        result = subprocess.run(
+            [helm, "template", "probe", str(PROBE_CHART), "-f", str(values_file),
+             "--show-only", "templates/values.json"],
+            capture_output=True, text=True, env=env, timeout=HELM_TIMEOUT, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        start = result.stdout.index("{")
+        value = json.loads(result.stdout[start:])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def compare(profile_path: str) -> list[str]:
     path = Path(profile_path)
     text = path.read_text()
     profile = json.loads(text)
-    values = (path.parent.parent / profile["values_file"]).read_text()
+    values_file = path.parent.parent / profile["values_file"]
+    values = values_file.read_text()
     identity = call("GET", "/api/v1/contract").get("identity")
     revision = identity.get("revision") if isinstance(identity, dict) else None
     if not isinstance(revision, int) or isinstance(revision, bool):
         raise Unanswered("hemi's contract carries no copy number")
-    answer = call(
-        "POST", "/api/v1/shadow", {"revision": revision, "profile": profile, "values": values}
-    )
+    body: dict[str, Any] = {"revision": revision, "profile": profile, "values": values}
+    helm = helm_values(values_file)
+    if helm is not None:
+        body["helmValues"] = helm
+    answer = call("POST", "/api/v1/shadow", body)
     equal, differences = answer.get("equal"), answer.get("differences")
     if (
         not isinstance(equal, bool)
@@ -149,8 +195,9 @@ def compare(profile_path: str) -> list[str]:
         or not all(isinstance(d, dict) and isinstance(d.get("path"), str) for d in differences)
     ):
         raise Unanswered("hemi's comparison is not in the expected shape")
+    unread = [] if helm is not None else [HELM_UNREAD]
     if equal:
-        return [f"hemi's copy matched the files (copy {revision})."]
+        return [f"hemi's copy matched the files (copy {revision}).", *unread]
     places = "1 place" if len(differences) == 1 else f"{len(differences)} places"
     lines = [f"hemi's copy differs from the files in {places} (copy {revision})."]
     for difference in differences:
@@ -159,7 +206,7 @@ def compare(profile_path: str) -> list[str]:
             f"- {where}: hemi's copy has {one_line(difference.get('contract'))}, "
             f"the files have {one_line(difference.get('files'))}"
         )
-    return lines
+    return lines + unread
 
 
 def main(argv: list[str]) -> int:

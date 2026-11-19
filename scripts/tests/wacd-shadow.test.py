@@ -1,5 +1,9 @@
 """wacd-shadow compares hemi's copy with the files and never fails or leaks the token.
 
+Helm is the real one where the comparison depends on how it reads YAML, gated
+like wacd-chart.test.py by WACD_REQUIRE_HELM (CI sets it). The failure paths
+use small stand-in executables on a PATH the test controls.
+
 One ThreadingHTTPServer stands in for both the GitHub OIDC token endpoint and
 hemi. In-process scenarios point the script's hemi address and token-endpoint
 check at it with patch.object, the way wacd-release.test.py points ci-release's
@@ -11,6 +15,8 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,7 +37,39 @@ REQUEST_BEARER = "runner.request.bearer"
 TOKEN = "minted.job.token"
 PROFILE = {"schema_version": 1, "app": "travel", "values_file": "deploy/values.yaml"}
 VALUES = "image:\n  repository: travel-app\nreplicas: 2\n"
+VALUES_AS_HELM_READS_THEM = {"image": {"repository": "travel-app"}, "replicas": 2}
 SILENT = "hemi did not answer; nothing was compared.\n"
+HELM_UNREAD = "Helm could not read the values; hemi compared its own reading."
+HAVE_HELM = shutil.which("helm") is not None
+NEEDS_HELM = unittest.skipUnless(
+    HAVE_HELM or os.environ.get("WACD_REQUIRE_HELM"), "helm is not installed"
+)
+YAML_11_VALUES = """\
+nothing: null
+nested:
+  nothing: null
+list: [null, 1]
+yes_word: yes
+on_word: on
+octal: 010
+base: &base
+  replicas: 2
+derived:
+  <<: *base
+  tier: web
+y: letter
+"""
+YAML_11_AS_HELM_READS_IT = {
+    "nothing": None,
+    "nested": {"nothing": None},
+    "list": [None, 1],
+    "yes_word": True,
+    "on_word": True,
+    "octal": 8,
+    "base": {"replicas": 2},
+    "derived": {"replicas": 2, "tier": "web"},
+    "true": "letter",
+}
 CLOSE = object()
 
 
@@ -100,32 +138,41 @@ class Stub:
         self.server.server_close()
 
 
-def app_repo(tmp):
+def app_repo(tmp, values=VALUES):
     root = Path(tmp) / "app"
     (root / ".github").mkdir(parents=True)
     (root / "deploy").mkdir()
     (root / ".github" / "wacd.json").write_text(json.dumps(PROFILE, indent=2) + "\n")
-    (root / "deploy" / "values.yaml").write_text(VALUES)
+    (root / "deploy" / "values.yaml").write_text(values)
     return root / ".github" / "wacd.json"
 
 
-class ShadowTests(unittest.TestCase):
-    def run_against(self, stub):
-        """Run main() against the stub; return (code, stdout, stderr, summary)."""
+class Harness:
+    def run_against(self, stub, values=VALUES, path=None, helm_timeout=None):
+        """Run main() against the stub from an unrelated directory; return (code, stdout, stderr, summary).
+
+        path replaces PATH for the run, so what is installed on the machine does not decide the result.
+        """
         with tempfile.TemporaryDirectory() as tmp:
-            profile = app_repo(tmp)
+            profile = app_repo(tmp, values)
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir()
             summary = Path(tmp) / "summary.md"
             env = {
                 "ACTIONS_ID_TOKEN_REQUEST_URL": stub.url + "/token?audience=wrong&api-version=2.0",
                 "ACTIONS_ID_TOKEN_REQUEST_TOKEN": REQUEST_BEARER,
                 "GITHUB_STEP_SUMMARY": str(summary),
             }
+            if path is not None:
+                env["PATH"] = str(path)
             out, err = io.StringIO(), io.StringIO()
             with (
                 patch.dict(os.environ, env),
                 patch.object(shadow, "URL", stub.url),
                 patch.object(shadow, "TOKEN_SCHEME", "http"),
                 patch.object(shadow, "TOKEN_HOST_SUFFIX", "127.0.0.1"),
+                patch.object(shadow, "HELM_TIMEOUT", helm_timeout or shadow.HELM_TIMEOUT),
+                contextlib.chdir(elsewhere),
                 contextlib.redirect_stdout(out),
                 contextlib.redirect_stderr(err),
             ):
@@ -134,6 +181,13 @@ class ShadowTests(unittest.TestCase):
         for secret in (REQUEST_BEARER, TOKEN):
             self.assertNotIn(secret, out.getvalue() + err.getvalue() + text)
         return code, out.getvalue(), err.getvalue(), text
+
+    def posted(self, stub):
+        return stub.hemi_requests()[1][4]
+
+
+@NEEDS_HELM
+class ShadowTests(Harness, unittest.TestCase):
 
     def test_an_equal_copy_is_reported_with_its_number(self):
         stub = Stub((200, contract(7)))
@@ -160,7 +214,12 @@ class ShadowTests(unittest.TestCase):
                     "/api/v1/shadow",
                     "",
                     f"Bearer {TOKEN}.2",
-                    {"revision": 7, "profile": PROFILE, "values": VALUES},
+                    {
+                        "revision": 7,
+                        "profile": PROFILE,
+                        "values": VALUES,
+                        "helmValues": VALUES_AS_HELM_READS_THEM,
+                    },
                 ),
             ],
         )
@@ -251,6 +310,95 @@ class ShadowTests(unittest.TestCase):
                 finally:
                     stub.close()
                 self.assertEqual((code, summary), (0, SILENT))
+
+    def test_helm_reading_of_yaml_1_1_forms_is_posted_beside_the_text(self):
+        stub = Stub((200, contract(5)))
+        try:
+            code, _, _, summary = self.run_against(stub, values=YAML_11_VALUES)
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, "hemi's copy matched the files (copy 5).\n"))
+        body = self.posted(stub)
+        self.assertEqual(body["values"], YAML_11_VALUES)
+        self.assertEqual(body["helmValues"], YAML_11_AS_HELM_READS_IT)
+
+    def test_values_helm_cannot_parse_are_posted_without_its_reading(self):
+        stub = Stub((200, contract(5)))
+        try:
+            code, _, _, summary = self.run_against(stub, values="a: [unclosed\n")
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, f"hemi's copy matched the files (copy 5).\n{HELM_UNREAD}\n"))
+        self.assertEqual(
+            self.posted(stub),
+            {"revision": 5, "profile": PROFILE, "values": "a: [unclosed\n"},
+        )
+
+
+class HelmStandInTests(Harness, unittest.TestCase):
+    """Helm absent or misbehaving: the files are still posted and the release is untouched."""
+
+    def bin_dir(self, tmp, script=None):
+        directory = Path(tmp) / "bin"
+        directory.mkdir()
+        if script is not None:
+            helm = directory / "helm"
+            helm.write_text("#!/bin/sh\n" + script)
+            helm.chmod(helm.stat().st_mode | stat.S_IXUSR)
+        return directory
+
+    def assert_posts_files_alone(self, stub, result):
+        code, _, _, summary = result
+        self.assertEqual((code, summary), (0, f"hemi's copy matched the files (copy 3).\n{HELM_UNREAD}\n"))
+        self.assertEqual(
+            self.posted(stub), {"revision": 3, "profile": PROFILE, "values": VALUES}
+        )
+
+    def test_no_helm_on_path_posts_the_files_alone(self):
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                result = self.run_against(stub, path=self.bin_dir(tmp))
+        finally:
+            stub.close()
+        self.assert_posts_files_alone(stub, result)
+
+    def test_a_helm_that_fails_or_answers_badly_posts_the_files_alone(self):
+        cases = {
+            "exits non-zero": "echo '{}'; exit 1\n",
+            "prints no JSON": "echo not json\n",
+            "prints a JSON list": "echo '[1]'\n",
+            "prints a JSON scalar": "echo '3'\n",
+            "never finishes": f"exec {shutil.which('sleep')} 30\n",
+        }
+        for label, script in cases.items():
+            with self.subTest(label):
+                stub = Stub((200, contract(3)))
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        result = self.run_against(
+                            stub, path=self.bin_dir(tmp, script), helm_timeout=1
+                        )
+                finally:
+                    stub.close()
+                self.assert_posts_files_alone(stub, result)
+
+    def test_helm_runs_without_a_cluster_and_without_the_job_token(self):
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                seen = Path(tmp) / "env"
+                script = f"{shutil.which('env')} > '{seen}'\necho '{{\"a\": 1}}'\n"
+                code, _, _, _ = self.run_against(stub, path=self.bin_dir(tmp, script))
+                helm_env = dict(
+                    line.split("=", 1) for line in seen.read_text().splitlines() if "=" in line
+                )
+        finally:
+            stub.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.posted(stub)["helmValues"], {"a": 1})
+        self.assertEqual(helm_env["KUBECONFIG"], "/dev/null")
+        self.assertFalse([k for k in helm_env if k.startswith("ACTIONS_") or k == "GITHUB_STEP_SUMMARY"])
 
 
 class CommandLineTests(unittest.TestCase):

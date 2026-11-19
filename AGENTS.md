@@ -42,7 +42,7 @@ WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-chart.test.py  # deploy chart pac
 python3 scripts/tests/wacd-release.test.py  # wac-cd's gateway client, against a stub gateway
 uv run --with pyyaml python scripts/tests/wacd-parity.test.py  # kustomize and Helm render parity
 python3 scripts/tests/wacd-tag.test.py  # wac-cd's tag push, against a local bare remote
-python3 scripts/tests/wacd-shadow.test.py  # wac-cd's shadow comparison, against a stub hemi and token endpoint
+WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-shadow.test.py  # wac-cd's shadow comparison, against a stub hemi and token endpoint; needs helm 3
 bash scripts/tests/agents-md.test.sh  # the agents-md gate, against fixture repos; needs uv and git
 uv run scripts/agents-md.py check  # this file against the fleet contract
 uv run scripts/agents-md.py render  # rewrite this file's tail after a catalog or fleet-rules edit
