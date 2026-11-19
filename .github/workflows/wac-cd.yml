@@ -235,9 +235,10 @@ jobs:
           APP: ${{ steps.profile.outputs.app }}
           TAG_PREFIX: ${{ steps.profile.outputs.tag_prefix }}
           PROFILE_IMAGES: ${{ steps.profile.outputs.images }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          registry=registry.network.svc.cluster.local:5000
+          deadline=$(( $(date +%s) + 120 ))
           fail() {
             echo "wac-cd: $1" >&2
             echo "::error::wac-cd: $1"
@@ -271,7 +272,7 @@ jobs:
           fi
           code=0
           status="$(python3 "$WACD_SCRIPTS"/wacd-release.py running --app "$APP" --wait-timeout 120 \
-            2> "$RUNNER_TEMP/settings.err")" || code=$?
+            --deadline "$deadline" 2> "$RUNNER_TEMP/settings.err")" || code=$?
           if [[ "$code" -eq 3 ]]; then
             reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
             printf 'rollout_refused=%s\n' "$reason" >> "$GITHUB_OUTPUT"
@@ -283,6 +284,7 @@ jobs:
           running="$(sed -n 's/^running=//p' <<< "$status")"
           commit="$(sed -n 's/^commit=//p' <<< "$status")"
           images="$(sed -n 's/^images=//p' <<< "$status")"
+          live="$(sed -n 's/^copy_revision=//p' <<< "$status")"
           if ! python3 -c 'import json, sys
           running = sorted(json.loads(sys.argv[1]))
           wanted = sorted(image["name"] for image in json.loads(sys.argv[2]))
@@ -293,21 +295,19 @@ jobs:
           version="$(sed -n 's/^version=//p' <<< "$planned")"
           claimed="$(sed -n 's/^claimed=//p' <<< "$planned")"
           above="$(sed -n 's/^above=//p' <<< "$planned")"
-          call line wacd-chart.py chart-copy-revision --registry "$registry" --app "$APP" --version "$running"
-          if [[ "${line#copy_revision=}" == "$SETTINGS_REVISION" ]]; then
+          if [[ "$live" == "$SETTINGS_REVISION" ]]; then
             version="$running"
           else
-            reuse=""
-            IFS=, read -r -a newer <<< "$above"
-            for earlier in ${newer[@]+"${newer[@]:0:25}"}; do
-              call line wacd-chart.py chart-copy-revision --registry "$registry" --app "$APP" --version "$earlier"
-              shipped="${line#copy_revision=}"
-              if [[ "$earlier" == "$claimed" && "$shipped" == absent ]]; then
-                reuse="$claimed"
-              elif [[ "$shipped" == "$SETTINGS_REVISION" ]]; then
-                fail "Revision $SETTINGS_REVISION was released as $earlier, and $running runs now after a rollback; save the settings again to release them on the running code."
-              fi
-            done
+            code=0
+            earlier="$(python3 "$WACD_SCRIPTS"/wacd-release.py earlier-release --app "$APP" --prefix "$TAG_PREFIX" \
+              --revision "$SETTINGS_REVISION" --running "$running" --versions "$above" --claimed "$claimed" \
+              --deadline "$deadline" 2> "$RUNNER_TEMP/settings.err")" || code=$?
+            if [[ "$code" -eq 4 ]]; then
+              fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
+            elif [[ "$code" -ne 0 ]]; then
+              fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/ *$//')"
+            fi
+            reuse="${earlier#reuse=}"
             version="${reuse:-$version}"
           fi
           summary="settings revision $SETTINGS_REVISION on $running's code (${commit:0:12}), released as $version"

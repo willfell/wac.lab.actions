@@ -252,8 +252,10 @@ class RegistryReadTests(RegistryCase):
         _, _, manifest = self.registry.routes["/v2/deploy/travel/manifests/0.1.0"]
         self.assertEqual(
             chart.chart_release(self.address, "travel", "0.1.0"),
-            {"digest": digest_of(manifest), "revision": SHA, "images": IMAGES},
+            {"digest": digest_of(manifest), "revision": SHA, "images": IMAGES, "copy": "none"},
         )
+        self.registry.put_chart("travel", "0.4.0", images=refs, extra={"wacwini.com/revision": "7"})
+        self.assertEqual(chart.chart_release(self.address, "travel", "0.4.0")["copy"], "7")
         self.assertIsNone(chart.chart_release(self.address, "travel", "0.2.0"))
         self.registry.put_chart("travel", "0.3.0")
         with self.assertRaises(chart.ChartError) as ctx:

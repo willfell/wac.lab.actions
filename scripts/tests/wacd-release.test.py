@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -544,7 +545,7 @@ class SettingsModeTests(unittest.TestCase):
             self.assertEqual(json.loads(Path(receipt).read_text())["wac_cd"], plan)
 
 
-RELEASE = {"digest": CHART_DIGEST, "revision": SOURCE, "images": IMAGES}
+RELEASE = {"digest": CHART_DIGEST, "revision": SOURCE, "images": IMAGES, "copy": "6"}
 
 
 def unsteady(change):
@@ -599,7 +600,7 @@ class RunningTests(unittest.TestCase):
         self.assertEqual(
             out.splitlines(),
             [f"running={VERSION}", f"commit={SOURCE}",
-             "images=" + json.dumps(IMAGES, separators=(",", ":"), sort_keys=True)],
+             "images=" + json.dumps(IMAGES, separators=(",", ":"), sort_keys=True), "copy_revision=6"],
         )
         self.assertEqual(script.bodies, [wacd.STATUS_BODY()], "one status read; nothing is released")
         self.assertEqual(reads, [("travel", VERSION)])
@@ -693,6 +694,149 @@ class RunningTests(unittest.TestCase):
             code, out, err = CliTests.main(self, "running", "--app", "travel", "--wait-timeout", "30")
         self.assertEqual(code, 1)
         self.assertNotIn(TOKEN, out + err)
+
+
+class DeadlineTests(unittest.TestCase):
+    """--deadline is wall-clock: a read stuck past it ends the command, whatever its own timeouts."""
+
+    def test_a_stuck_status_read_ends_at_the_deadline(self):
+        def stuck(body, trust, timeout):
+            time.sleep(30)
+
+        started = time.monotonic()
+        with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", stuck):
+            code, out, err = CliTests.main(
+                self, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", str(int(time.time()) + 2))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("did not finish within the settings plan's deadline", err)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_deadline_already_past_reads_nothing(self):
+        calls = []
+        with patch.object(wacd, "trust_context", lambda: None), \
+                patch.object(wacd, "transport", lambda *a: calls.append(a) or (200, evidence())):
+            code, _, err = CliTests.main(
+                self, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", str(int(time.time()) - 1))
+        self.assertEqual(code, 1)
+        self.assertIn("deadline", err)
+        self.assertEqual(calls, [])
+
+    def test_the_wait_never_runs_past_the_deadline(self):
+        script = Script((503, {}))
+        stack, clock = fake_clock()
+        with stack, patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", script), \
+                patch.object(wacd, "arm_deadline", lambda deadline: max(0, deadline - 1000)):
+            code, _, err = CliTests.main(self, "running", "--app", "travel", "--wait-timeout", "120",
+                                         "--deadline", "1030")
+        self.assertEqual(code, 1)
+        self.assertLessEqual(clock.now - 1000.0, 31, "the wait is the smaller of --wait-timeout and the deadline")
+
+
+class EarlierReleaseTests(unittest.TestCase):
+    """Rule B: an earlier version above the running one counts as released only if its GitHub Release exists."""
+
+    SENTENCE = ("Revision 7 was released as {v}, and 1.3.9 runs now after a rollback. To put those settings on the "
+                "running code, make them live again in hemi; they are released as a new revision.")
+
+    def run_cli(self, copies, releases, versions="1.4.4,1.4.3,1.4.2", claimed=""):
+        reads, asked = [], []
+
+        def read_copy(app, version):
+            reads.append(version)
+            return copies.get(version, "absent")
+
+        def released(tag):
+            asked.append(tag)
+            outcome = releases.get(tag, False)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with patch.object(wacd, "read_copy", read_copy), patch.object(wacd, "release_exists", released):
+            code, out, err = CliTests.main(
+                self, "earlier-release", "--app", "travel", "--prefix", "v", "--revision", "7",
+                "--running", "1.3.9", "--versions", versions, "--claimed", claimed)
+        return reads, asked, (code, out, err)
+
+    def test_a_version_carrying_the_revision_with_a_release_refuses(self):
+        _, asked, (code, out, err) = self.run_cli({"1.4.4": "7"}, {"v1.4.4": True})
+        self.assertEqual((code, out), (wacd.ALREADY_RELEASED_EXIT, ""))
+        self.assertEqual(err, "wacd release: " + self.SENTENCE.format(v="1.4.4") + "\n")
+        self.assertEqual(asked, ["v1.4.4"])
+
+    def test_a_version_carrying_the_revision_that_never_ran_does_not_refuse(self):
+        reads, asked, (code, out, err) = self.run_cli({"1.4.4": "7", "1.4.3": "6"}, {})
+        self.assertEqual((code, out, err), (0, "reuse=\n", ""), "the settings release proceeds with a fresh version")
+        self.assertEqual(asked, ["v1.4.4"])
+        reads, asked, (code, out, err) = self.run_cli({"1.4.4": "7", "1.4.3": "7"}, {"v1.4.3": True})
+        self.assertEqual(code, wacd.ALREADY_RELEASED_EXIT, "an older version that ran still counts")
+        self.assertIn(self.SENTENCE.format(v="1.4.3"), err)
+
+    def test_a_claim_on_the_running_code_is_taken_again_when_it_never_ran(self):
+        for copy in ("absent", "7"):
+            with self.subTest(claimed_chart=copy):
+                copies = {} if copy == "absent" else {"1.4.4": copy}
+                _, _, (code, out, err) = self.run_cli(copies, {}, claimed="1.4.4")
+                self.assertEqual((code, out), (0, "reuse=1.4.4\n"), err)
+        _, _, (code, out, err) = self.run_cli({"1.4.3": "7"}, {"v1.4.3": True}, claimed="1.4.4")
+        self.assertEqual(code, wacd.ALREADY_RELEASED_EXIT, "a released earlier version still refuses beside a claim")
+
+    def test_only_the_candidate_s_release_decides_never_the_running_version_s(self):
+        for label, running_release in (("V has its own Release", True), ("V is pre-ledger with no Release", False)):
+            with self.subTest(case=label):
+                releases = {"v1.3.9": running_release, "v1.4.4": True}
+                _, asked, (code, _, err) = self.run_cli({"1.4.4": "7"}, releases)
+                self.assertEqual(code, wacd.ALREADY_RELEASED_EXIT, err)
+                releases = {"v1.3.9": running_release}
+                _, asked_none, (code, out, err) = self.run_cli({"1.4.4": "7", "1.4.3": "6"}, releases)
+                self.assertEqual((code, out), (0, "reuse=\n"), err)
+                self.assertNotIn("v1.3.9", asked + asked_none)
+
+    def test_the_scan_stops_at_the_first_older_revision(self):
+        reads, asked, (code, out, _) = self.run_cli({"1.4.4": "absent", "1.4.3": "5", "1.4.2": "7"}, {"v1.4.2": True})
+        self.assertEqual((code, out), (0, "reuse=\n"))
+        self.assertEqual((reads, asked), (["1.4.4", "1.4.3"], []), "revisions only grow with versions")
+        reads, _, (code, out, _) = self.run_cli({"1.4.4": "none", "1.4.3": "7"}, {"v1.4.3": True})
+        self.assertEqual((code, out, reads), (0, "reuse=\n", ["1.4.4"]), "a chart with no copy predates every copy")
+
+    def test_a_release_that_cannot_be_read_fails_and_is_never_taken_as_absent(self):
+        _, _, (code, out, err) = self.run_cli({"1.4.4": "7"}, {"v1.4.4": ReleaseError("GitHub answered HTTP 502")})
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("HTTP 502", err)
+
+    def test_the_count_is_bounded_with_a_sentence(self):
+        versions = ",".join(f"1.5.{n}" for n in range(40, 0, -1))
+        copies = {f"1.5.{n}": "7" for n in range(1, 41)}
+        reads, asked, (code, out, err) = self.run_cli(copies, {}, versions=versions)
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(reads), wacd.MAX_EARLIER)
+        self.assertIn(f"{wacd.MAX_EARLIER} versions above 1.3.9", err)
+
+    def test_no_versions_above_reads_nothing(self):
+        reads, asked, (code, out, _) = self.run_cli({}, {}, versions="")
+        self.assertEqual((code, out, reads, asked), (0, "reuse=\n", [], []))
+
+    def test_release_exists_reads_one_tag_with_the_job_token(self):
+        for status, expected in ((200, True), (404, False)):
+            with self.subTest(status=status):
+                api = ReleasesApi([status])
+                self.addCleanup(api.close)
+                env = {"GITHUB_API_URL": api.url, "GITHUB_REPOSITORY": "willfell/travel", "GITHUB_TOKEN": "t0k"}
+                with patch.dict(os.environ, env):
+                    self.assertIs(wacd.release_exists("v1.4.4"), expected)
+                self.assertEqual(api.seen, [("GET", "/repos/willfell/travel/releases/tags/v1.4.4", "Bearer t0k", None)])
+        for status in (401, 403, 500, 502):
+            with self.subTest(status=status):
+                api = ReleasesApi([status])
+                self.addCleanup(api.close)
+                env = {"GITHUB_API_URL": api.url, "GITHUB_REPOSITORY": "willfell/travel", "GITHUB_TOKEN": "t0k"}
+                with patch.dict(os.environ, env), self.assertRaises(ReleaseError) as ctx:
+                    wacd.release_exists("v1.4.4")
+                self.assertIn(f"HTTP {status}", str(ctx.exception))
+                self.assertNotIn("t0k", str(ctx.exception))
+        with patch.dict(os.environ, {"GITHUB_API_URL": "http://127.0.0.1:9", "GITHUB_REPOSITORY": "willfell/travel",
+                                     "GITHUB_TOKEN": "t0k"}), self.assertRaises(ReleaseError):
+            wacd.release_exists("v1.4.4")
 
 
 class ServedTests(unittest.TestCase):

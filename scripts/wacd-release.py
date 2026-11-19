@@ -32,7 +32,27 @@ report the rollout from its own step. A version that is not a bare X.Y.Z, a
 chart_digest that is not the registry's, or a chart the registry lacks is a
 fault and exits 1 at once. A 503 (the gateway cannot read Kubernetes) is
 retried within N; a 403 without a reason means the app is not onboarded. It
-prints running=, commit= (the chart's source) and images= (its images).
+prints running=, commit= (the chart's source), images= (its images) and
+copy_revision= (the copy revision it ships).
+
+`earlier-release --app A --prefix P --revision N --running V --versions L
+--claimed X` is the settings plan's rule B over L, the versions on main above
+V, newest first. A version counts as released only with evidence that it ran:
+its GitHub Release, which wac-cd's github-release job creates only after
+deploy proved the served build. A rollback creates no Release for the
+version it leaves, so the evidence survives it. One that carries N and has a
+Release exits ALREADY_RELEASED_EXIT (4) with ALREADY_RELEASED; one that
+carries N and has none never ran, and is taken again when it is X (the claim
+on the running code), as is an X with no chart yet. Copy revisions only grow
+with versions, so the scan stops at the first chart with an older revision or
+none; at most MAX_EARLIER charts are read, and running out of them fails
+with a sentence. A Release that cannot be read (anything but 200 or 404)
+fails, never counting as absent. It prints reuse=<X or empty>. Only the
+candidates' Releases are read, never V's.
+
+Both settings reads take `--deadline <epoch seconds>`, the plan step's one
+wall-clock deadline: every read in them stops when it passes, however slowly
+an answer trickles in (SIGALRM), and the status wait never runs past it.
 
 The gateway contract (Plan 2, "Chart releases (wac-cd)") is isolated in
 RELEASE_BODY, STATUS_BODY and ready(). After the proof, github-release creates
@@ -47,6 +67,7 @@ import importlib.util
 import json
 import os
 import re
+import signal
 import ssl
 import sys
 import time
@@ -82,6 +103,12 @@ REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 RELEASED_MODES = ("release", "resume", "rollback", "settings")
 REASON_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 ROLLING_OUT_EXIT = 3
+ALREADY_RELEASED_EXIT = 4
+MAX_EARLIER = 25
+ALREADY_RELEASED = (
+    "Revision {revision} was released as {earlier}, and {running} runs now after a rollback. To put those "
+    "settings on the running code, make them live again in hemi; they are released as a new revision."
+)
 NOT_ONBOARDED = (
     "The gateway does not know this app (its status was refused without a reason), so it is not "
     "onboarded and there is no running version to release settings on."
@@ -145,6 +172,14 @@ def no_connection(error):
 
 class RollingOut(ReleaseError):
     """The status never settled within the wait: the app is mid-rollout."""
+
+
+class AlreadyReleased(ReleaseError):
+    """Rule B: an earlier version above the running one ran with this revision."""
+
+
+class Deadline(ReleaseError):
+    """The settings plan's wall-clock deadline passed during a read."""
 
 
 class Refused(ReleaseError):
@@ -412,6 +447,82 @@ def read_release(app, version):
         raise ReleaseError(str(error)) from None
 
 
+def read_copy(app, version):
+    """The copy revision deploy/<app>:<version> ships: "absent", "none" or the decimal."""
+    try:
+        return chart.chart_copy_revision(chart.PUSH_REGISTRY, app, version)
+    except chart.ChartError as error:
+        raise ReleaseError(str(error)) from None
+
+
+def github_context(environ):
+    api = environ.get("GITHUB_API_URL", "").rstrip("/")
+    repository = environ.get("GITHUB_REPOSITORY", "")
+    token = environ.get("GITHUB_TOKEN", "")
+    parsed = urllib.parse.urlsplit(api)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ReleaseError("GITHUB_API_URL must be an http or https URL")
+    if not REPOSITORY_PATTERN.fullmatch(repository):
+        raise ReleaseError("GITHUB_REPOSITORY must be owner/name")
+    if not token:
+        raise ReleaseError("GITHUB_TOKEN is empty")
+    return api, repository, token
+
+
+def release_exists(tag):
+    """Whether tag has a GitHub Release: 200 yes, 404 no, anything else a failure."""
+    if not TAG_PATTERN.fullmatch(tag):
+        raise ReleaseError("the tag is not a valid tag name")
+    api, repository, token = github_context(os.environ)
+    url = f"{api}/repos/{repository}/releases/tags/{urllib.parse.quote(tag, safe='')}"
+    code = github_call("GET", url, token)
+    if code == 200:
+        return True
+    if code == 404:
+        return False
+    raise ReleaseError(
+        f"GitHub answered HTTP {code} for the Release of {tag}, so whether it ran is unknown"
+    )
+
+
+def earlier_release(revision, running, versions, claimed, prefix, app):
+    """Rule B over versions (newest first); returns the version to take again, or ""."""
+    wanted = int(revision)
+    reuse = ""
+    for checked, earlier in enumerate(versions):
+        if checked == MAX_EARLIER:
+            raise ReleaseError(
+                f"{MAX_EARLIER} versions above {running} were read and none settled whether revision "
+                f"{revision} already ran, so the settings plan stops here and nothing was tagged"
+            )
+        copy = read_copy(app, earlier)
+        if copy == "absent":
+            reuse = earlier if earlier == claimed else reuse
+            continue
+        if copy == "none" or int(copy) < wanted:
+            break
+        if int(copy) != wanted:
+            continue
+        if release_exists(prefix + earlier):
+            raise AlreadyReleased(ALREADY_RELEASED.format(revision=revision, earlier=earlier, running=running))
+        reuse = earlier if earlier == claimed else reuse
+    return reuse
+
+
+def arm_deadline(deadline):
+    """Seconds left until the wall-clock deadline; a read still running then raises Deadline."""
+    left = deadline - time.time()
+    if left <= 0:
+        raise Deadline("the settings plan's deadline had passed before this read")
+
+    def expire(signum, frame):
+        raise Deadline("a read did not finish within the settings plan's deadline, so nothing was tagged")
+
+    signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, left)
+    return left
+
+
 def image_digest(ref):
     return ref.split("@", 1)[1] if "@" in ref else None
 
@@ -572,16 +683,7 @@ def github_release(tag, sha, environ):
         raise ReleaseError("--tag is not a valid tag name")
     if not SHA_PATTERN.fullmatch(sha):
         raise ReleaseError("--sha must be 40 lowercase hex characters")
-    api = environ.get("GITHUB_API_URL", "").rstrip("/")
-    repository = environ.get("GITHUB_REPOSITORY", "")
-    token = environ.get("GITHUB_TOKEN", "")
-    parsed = urllib.parse.urlsplit(api)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ReleaseError("GITHUB_API_URL must be an http or https URL")
-    if not REPOSITORY_PATTERN.fullmatch(repository):
-        raise ReleaseError("GITHUB_REPOSITORY must be owner/name")
-    if not token:
-        raise ReleaseError("GITHUB_TOKEN is empty")
+    api, repository, token = github_context(environ)
     releases = f"{api}/repos/{repository}/releases"
     lookup = f"{releases}/tags/{urllib.parse.quote(tag, safe='')}"
     # Look before writing: an existing release is left exactly as it is, so a
@@ -659,6 +761,11 @@ def build_parser():
     running = commands.add_parser("running")
     running.add_argument("--app", required=True)
     running.add_argument("--wait-timeout", required=True)
+    running.add_argument("--deadline", type=float)
+    earlier = commands.add_parser("earlier-release")
+    for name in ("--app", "--prefix", "--revision", "--running", "--versions", "--claimed"):
+        earlier.add_argument(name, required=True)
+    earlier.add_argument("--deadline", type=float)
     gh = commands.add_parser("github-release")
     gh.add_argument("--tag", required=True)
     gh.add_argument("--sha", required=True)
@@ -668,11 +775,27 @@ def build_parser():
 def run(args):
     if args.command == "github-release":
         return github_release(args.tag, args.sha, os.environ)
+    if args.command == "earlier-release":
+        if not chart.DECIMAL.fullmatch(args.revision):
+            raise ReleaseError("--revision must be a decimal")
+        versions = [v for v in args.versions.split(",") if v]
+        if any(not VERSION_PATTERN.fullmatch(v) for v in versions + ([args.claimed] if args.claimed else [])):
+            raise ReleaseError("--versions and --claimed must be X.Y.Z")
+        if args.deadline is not None:
+            arm_deadline(args.deadline)
+        return "reuse=" + earlier_release(
+            args.revision, args.running, versions, args.claimed, args.prefix, args.app
+        )
     timeout = wait_bound(args.wait_timeout)
     if args.command == "running":
+        if args.deadline is not None:
+            timeout = max(0, min(timeout, arm_deadline(args.deadline)))
         version, release = running_release(args.app, timeout)
         images = json.dumps(release["images"], separators=(",", ":"), sort_keys=True)
-        return f"running={version}\ncommit={release['revision']}\nimages={images}"
+        return (
+            f"running={version}\ncommit={release['revision']}\nimages={images}\n"
+            f"copy_revision={release['copy']}"
+        )
     if args.command == "health":
         if not SHA_PATTERN.fullmatch(args.sha):
             raise ReleaseError("--sha must be 40 lowercase hex characters")
@@ -715,7 +838,9 @@ def main(argv):
         if isinstance(err, Refused):
             summarize_refusal(err.sentence)
         print("wacd release: " + " ".join(str(err).split()), file=sys.stderr)
-        return ROLLING_OUT_EXIT if isinstance(err, RollingOut) else 1
+        if isinstance(err, RollingOut):
+            return ROLLING_OUT_EXIT
+        return ALREADY_RELEASED_EXIT if isinstance(err, AlreadyReleased) else 1
     except Exception:
         print("wacd release: unexpected failure", file=sys.stderr)
         return 1

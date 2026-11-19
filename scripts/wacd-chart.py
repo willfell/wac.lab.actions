@@ -444,7 +444,8 @@ def chart_release(registry, app, version):
 
     None when deploy/<app>:<version> is not in the registry. wac-cd's settings
     plan holds the gateway's status to it: the status's chart_digest must be
-    this digest, and every running image one of these.
+    this digest, and every running image one of these. copy is the copy
+    revision the chart ships, as chart_copy_revision reports it.
     """
     found = chart_with_digest(registry, app, version)
     if found is None:
@@ -457,7 +458,20 @@ def chart_release(registry, app, version):
     text = annotations.get(IMAGES_ANNOTATION)
     if not isinstance(text, str):
         raise ChartError(f"{DEPLOY_REPO}/{app}:{version} has no {IMAGES_ANNOTATION} annotation")
-    return {"digest": digest, "revision": revision, "images": parse_image_refs(text)}
+    return {
+        "digest": digest,
+        "revision": revision,
+        "images": parse_image_refs(text),
+        "copy": copy_of(annotations),
+    }
+
+
+def copy_of(annotations):
+    """The copy revision a chart ships, as chart-copy-revision prints it: "none" or the decimal."""
+    text = annotations.get(CONTRACT_REVISION_ANNOTATION)
+    if text is None:
+        return "none"
+    return revision_annotation(revision_from_annotation(text))
 
 
 def chart_copy_revision(registry, app, version):
@@ -469,10 +483,7 @@ def chart_copy_revision(registry, app, version):
     config = chart_config(registry, app, version)
     if config is None:
         return "absent"
-    text = chart_annotations(config).get(CONTRACT_REVISION_ANNOTATION)
-    if text is None:
-        return "none"
-    return revision_annotation(revision_from_annotation(text))
+    return copy_of(chart_annotations(config))
 
 
 def runnable_manifest(registry, name, manifest):

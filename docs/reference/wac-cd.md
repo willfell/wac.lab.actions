@@ -520,7 +520,11 @@ copy as for any run, and then, in `Plan the settings release`:
    save dispatched its own run. A copy older than the dispatched revision
    fails, since the save has not reached the fleet copy yet.
 2. Reads the running version V from a steady gateway `status`
-   (`wacd-release.py running`, within 120 seconds). The status's `version` is
+   (`wacd-release.py running`). The step sets one wall-clock deadline, 120
+   seconds after it starts, and passes it as `--deadline` to both of its
+   network reads, this one and rule 5's; each stops when it passes, however
+   slowly an answer arrives (a `SIGALRM`, not only per-socket timeouts), and
+   fails with a sentence. The step's other work is local git. The status's `version` is
    the version the gateway last pointed the Application at, which mid-sync or
    right after a rollback dispatch is already the new target, so it counts
    only when the same answer is Synced at its `chart_digest` and Healthy, every
@@ -551,17 +555,32 @@ copy as for any run, and then, in `Plan the settings release`:
    rollback:
    - when V's chart already carries `settings_revision`, V' is V (a re-run
      after the release went live; releasing it again changes nothing);
-   - when `main`'s newest tag sits on C above V and has no chart yet, V' is
-     that version (an earlier attempt claimed it and never published);
-   - when any version on `main` above V (newest first, at most 25) already
-     carries `settings_revision`, `plan` fails with `Revision <n> was released
-     as <V'old>, and <V> runs now after a rollback; save the settings again to
-     release them on the running code.` Nothing is tagged or retagged. A
-     re-run nobody dispatched must not put those settings back over a
-     deliberate rollback, and a new save gets a new revision. The same
-     sentence answers a "Re-run all jobs" of a settings run whose `deploy` was
-     refused after `publish` (V' published, never released); "Re-run failed
-     jobs" re-releases the same V' instead.
+   - otherwise `wacd-release.py earlier-release` judges the versions on
+     `main` above V, newest first. A version counts as released only with
+     evidence that it ran: its GitHub Release, which `github-release` creates
+     only after `deploy` proved the served build, read with the job's
+     `GITHUB_TOKEN` (`GET /repos/{repo}/releases/tags/{tag}`; `plan`'s
+     existing `contents: write` covers it). A rollback creates no Release for
+     the version it leaves (it creates the Release of its own target when
+     that is missing), so the evidence survives it; V's own Release is never
+     read. When a version above V carries `settings_revision` and has a
+     Release, `plan` fails with `Revision <n> was released as <V'old>, and <V>
+     runs now after a rollback. To put those settings on the running code,
+     make them live again in hemi; they are released as a new revision.`
+     Nothing is tagged or retagged: a re-run nobody dispatched must not put
+     those settings back over a deliberate rollback.
+   - a version above V that carries `settings_revision` and has no Release
+     never ran (a code release whose gateway release was refused or timed
+     out, a `deploy: false` publish, or a settings run whose deploy failed),
+     so it does not refuse. When it is `main`'s newest tag and sits on C (the
+     claim on the running code), V' is that version, as it is when that claim
+     has no chart yet; otherwise V' is the next patch.
+   - a 404 for the Release means not released; any other answer, or none,
+     fails `plan` with a sentence and never counts as absent.
+   - Copy revisions only grow with versions, so the scan stops at the first
+     chart with an older revision, or with none (charts from before any
+     copy); a version with no chart is skipped. It reads at most 25 charts,
+     and running out of them fails `plan` with a sentence.
 6. Unless V' is V, compares `.github/workflows` at C with `origin/main`
    (below). Re-proving the live version claims no new tag, so it needs no
    check.
@@ -594,7 +613,7 @@ old version`; hemi reads all three by job `cd / plan`, step name and
 conclusion. Do not rename any of them.
 
 - `Refuse a settings release while the app is rolling out`: the status never
-  became steady within 120 seconds. The sentence names V and says no settings
+  became steady before the step's 120-second deadline. The sentence names V and says no settings
   were released; dispatch again once the app settles.
 - `Refuse a settings release behind a workflow change`: GitHub refuses a
   `GITHUB_TOKEN` tag push at a commit whose `.github/workflows` differ from the
@@ -619,10 +638,11 @@ points at V' whatever happens next.
 | Superseded | `success` | `cd / plan` `success`, and `cd / shadow`, `cd / retag`, `cd / publish`, `cd / deploy` and `cd / github-release` all `skipped`; summary `mode: none (a newer revision is live; its own release follows)` | no | no | no |
 | Behind a workflow change | `failure` | `cd / plan`, step `Refuse a settings release behind a workflow change` `failure` | no | no | no |
 | Mid-rollout | `failure` | `cd / plan`, step `Refuse a settings release while the app is rolling out` `failure` | no | no | no |
-| Already released, then rolled back | `failure` | `cd / plan`, step `Plan the settings release` `failure`, sentence `Revision <n> was released as <V'old>, and <V> runs now after a rollback; save the settings again to release them on the running code.` | no | no | no |
+| Already released, then rolled back | `failure` | `cd / plan`, step `Plan the settings release` `failure`, sentence `Revision <n> was released as <V'old>, and <V> runs now after a rollback. To put those settings on the running code, make them live again in hemi; they are released as a new revision.` | no | no | no |
 | Failed before deploying | `failure` | `cd / plan`, `cd / retag` or `cd / publish` `failure` with `cd / deploy` `skipped` | if `cd / plan` succeeded | if `cd / retag` succeeded | no |
 | Failed at the release | `failure` | `cd / deploy` failed at `Release through the gateway`: the release may or may not have been accepted. The app's target tells them apart: if it is V' (its chart carries the settings revision), the patch landed and this is failed after deploying; if it is not, nothing was patched and this is failed before deploying; if hemi could not read the target since the run ended, it concludes nothing yet. | yes | yes | by the app's target (see that cell) |
 | Failed after deploying | `failure` | `cd / deploy` step `Release through the gateway` `success`, then step `Prove the served build` `failure` | yes | yes | yes, and it stays |
+| Failed at another deploy step | `failure` | `cd / deploy` `failure` at a step other than `Release through the gateway` and `Prove the served build`, keyed on where it sits: before `Release through the gateway` (the python3 check, the shared checkout, `Read the published images`, `Summarize the release`), so `Release through the gateway` is `skipped`, is failed before deploying; `Upload the release receipt`, after `Release through the gateway` `success` and with `Prove the served build` `skipped`, is failed after deploying, patched and not proved; `Record the proof`, after `Prove the served build` `success`, is patched and proved, with `cd / github-release` `skipped` | yes | yes | no before `Release through the gateway`; yes after it, and it stays |
 | Cancelled | `cancelled` | the run's conclusion; `cd / deploy` `success` or its step `Release through the gateway` `success` says the patch landed | if `cd / plan` succeeded | if `cd / retag` succeeded | only if `Release through the gateway` succeeded |
 | Released | `success` | `cd / retag` `success` and `cd / deploy` `success` | yes | yes | yes |
 
@@ -644,6 +664,17 @@ re-run of C's own code-release run then sees V' on its HEAD: while V' is the
 newest it resumes V', a harmless re-release of the current settings; once
 anything newer exists, **No replay of an old version** refuses it. When C was
 `main`'s head, HEAD carries both V and V', and counts by V'.
+
+**Known limit: a repository id that changes.** When a repository's id changes
+(a delete and re-create under the same name), hemi starts its revisions at 1
+again, while the tags and `deploy/<app>:<V>` charts persist under the app
+name, and a chart annotation carries only the revision number, never the
+repository id. After a rollback onto code from before the change, a new
+revision can equal an old chart's number: on V itself it takes the V' = V
+shortcut and ships none of the new settings, and on a version above V with a
+Release it is refused by rule 5. `wac-cd` cannot tell the two lineages apart;
+the gateway checks the copy's repository at release time, not the old
+chart's.
 
 **The next code release may over-bump.** After a settings tag V' on a
 rolled-back commit C1, the next merge counts its commits from V', the highest
