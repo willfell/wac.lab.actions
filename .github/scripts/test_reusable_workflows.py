@@ -691,7 +691,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertIn("!failure()", condition)
 
     def docs_plan(self, after, released=("0.2.0",), docs_paths='["docs/**","mkdocs.yml","*.md"]', event="push",
-                  tagged=True, gateway=None, deploy="true"):
+                  tagged=True, gateway=None, deploy="true", ambient=None, claim=None, tag_read_fails=False):
         """Run plan's `Plan the version` on a push in a temp repository with real tags, the real scripts and a bare
         origin, against stand-in GitHub Releases for the versions in released ("unreadable": every read is a 502).
 
@@ -705,6 +705,10 @@ class ReusableWorkflowTests(unittest.TestCase):
         gateway is the stand-in gateway's answer to every request, (code, body), or "refused" for a port nothing
         listens on. With it, the step runs wacd-release.py with only the runner's parts replaced: the gateway's
         address, the OIDC mint (each mint is logged) and the CA file; every other script is the real one.
+        With a gateway, claim replaces wacd-tag.py with one that answers `claim=<claim>` and pushes nothing,
+        and tag_read_fails makes `wacd-version.py --mode tagged` fail as a git failure does.
+
+        ambient is extra environment the runner itself exports, as a runner image or pod could.
         """
         import os
         import shutil
@@ -840,7 +844,23 @@ class ReusableWorkflowTests(unittest.TestCase):
                 "    sys.exit(real.main(sys.argv))\n"
                 "globals().update({k: v for k, v in vars(real).items() if not k.startswith('__')})\n"
             )
+            if claim is not None:
+                (scripts / "wacd-tag.py").unlink()
+                (scripts / "wacd-tag.py").write_text(
+                    "print('Tag claim stand-in: main moved on')\n"
+                    f"print('claim={claim}')\n"
+                )
+            if tag_read_fails:
+                (scripts / "wacd-version.py").unlink()
+                (scripts / "wacd-version.py").write_text(
+                    "import os, runpy, sys\n"
+                    "if '--mode' in sys.argv and sys.argv[sys.argv.index('--mode') + 1] == 'tagged':\n"
+                    "    sys.exit(print('wacd version: git tag failed: not a git repository', file=sys.stderr) or 1)\n"
+                    "sys.argv[0] = os.environ['WACD_REAL_VERSION']\n"
+                    "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+                )
             env.update({"WACD_SCRIPTS": str(scripts), "WACD_REAL_RELEASE": str(root / "scripts" / "wacd-release.py"),
+                        "WACD_REAL_VERSION": str(root / "scripts" / "wacd-version.py"),
                         "WACD_GATEWAY_URL": url, "WACD_MINT_LOG": str(mints)})
         step_env = {"ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "", "DEPLOY": deploy,
                     "APP": "app", "TAG_PREFIX": "v", "SETTINGS_REVISION": "", "SETTINGS_MODE": "",
@@ -848,7 +868,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                     "SETTINGS_UNFINISHED": "", "EVENT_NAME": event, "DOCS_PATHS": docs_paths,
                     "GITHUB_TOKEN": "job-token"}
         self.assertEqual(set(step_env), set(step["env"]))
-        result = subprocess.run(["bash", "-c", step["run"]], env={**env, **step_env}, cwd=repo,
+        result = subprocess.run(["bash", "-c", step["run"]], env={**env, **(ambient or {}), **step_env}, cwd=repo,
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
@@ -1006,6 +1026,47 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertNotIn("publish_only", plan["outputs"])
                 self.assertNotIn("has not been released yet", plan["summary"])
                 self.assertEqual((plan["asked"], plan["mints"]), ([], []))
+
+    def test_wac_cd_a_runners_own_environment_never_decides_a_push(self):
+        """`bootstrap` and `docs_since`, exported by a runner image or pod, cannot turn a release into a publish
+        or fake a documentation-only base: the step sets every variable it reads before it reads it."""
+        hostile = {"bootstrap": "0.1.0", "docs_since": "v0.2.0"}
+        for exported in ({"bootstrap": "0.1.0"}, {"docs_since": "v0.2.0"}, hostile):
+            for label, kwargs, version in (
+                ("a tagged, released app", {"after": ("code",)}, "0.2.1"),
+                ("a tagged app whose gateway is asked nothing",
+                 {"after": ("code",), "gateway": self.status("0.1.0", "")}, "0.2.1"),
+                ("an untagged app whose target was released",
+                 {"after": ("code",), "released": (), "tagged": False, "gateway": self.status("0.1.0", self.DIGEST_A)},
+                 "0.1.0"),
+            ):
+                with self.subTest(case=label, exported=sorted(exported)):
+                    plan = self.docs_plan(ambient=exported, **kwargs)
+                    self.assertReleases(plan, version)
+                    self.assertNotIn("publish_only", plan["outputs"])
+                    self.assertNotIn("has not been released yet", plan["summary"])
+        plan = self.docs_plan(("code",), deploy="false", ambient=hostile)
+        self.assertEqual(plan["outputs"]["mode"], "publish")
+        self.assertNotIn("publish_only", plan["outputs"], "a deploy: false publish gains no first-merge sentence")
+        self.assertNotIn("docs_since", plan["outputs"])
+
+    def test_wac_cd_a_tag_read_that_fails_releases_without_asking_the_gateway(self):
+        plan = self.docs_plan(("code",), released=(), tagged=False, gateway=self.status("0.1.0", ""),
+                              tag_read_fails=True)
+        self.assertReleases(plan, "0.1.0")
+        self.assertNotIn("publish_only", plan["outputs"])
+        self.assertEqual((plan["asked"], plan["mints"]), ([], []), "an unknown tag read never reaches the gateway")
+
+    def test_wac_cd_a_superseded_claim_after_a_publish_only_decision_publishes_nothing(self):
+        plan = self.docs_plan(("code",), released=(), tagged=False, gateway=self.status("0.1.0", ""),
+                              claim="superseded")
+        self.assertEqual(plan["outputs"], {"mode": "none", "version": "", "tag": "", "expected_sha": plan["head"]},
+                         plan["log"])
+        self.assertNotIn("publish_only", plan)
+        self.assertEqual(plan["pushed"], [])
+        self.assertIn("Superseded: Tag claim stand-in: main moved on. Nothing was built or published", plan["summary"])
+        self.assertNotIn("has not been released yet", plan["summary"])
+        self.assertAskedOnce(plan)
 
     def test_wac_cd_a_publish_only_run_builds_and_publishes_and_never_deploys(self):
         jobs = self.wac_cd()["jobs"]

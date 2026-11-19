@@ -428,6 +428,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          bootstrap=""
+          docs_since=""
           registry=registry.network.svc.cluster.local:5000
           revision_of() {
             local line

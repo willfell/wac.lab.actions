@@ -898,8 +898,9 @@ copy as for any run, and then, in `Plan the settings release`:
      newer one only by a rollback. V is never taken as rolled back merely
      because it is older or below a published chart, and no run list is read.
      A published chart with no Release (a code release whose deploy failed or
-     whose proof timed out, a `deploy: false` publish, a settings release
-     whose deploy failed) proves nothing and is passed over.
+     whose proof timed out, a `deploy: false` publish, a new app's
+     first-merge publish, a settings release whose deploy failed) proves
+     nothing and is passed over.
    - After a rollback (a version above the running one has a GitHub Release),
      the settings release proceeds past the unfinished code release, which
      can now ship only as a new commit, and the run summary gains exactly one
@@ -942,8 +943,8 @@ copy as for any run, and then, in `Plan the settings release`:
      those settings back over a deliberate rollback.
    - a version above V that carries `settings_revision` and has no Release
      was never proved running (a code release whose gateway release was
-     refused or whose proof timed out, a `deploy: false` publish, a deploy
-     that failed after `Release through the gateway`, or a run cancelled after
+     refused or whose proof timed out, a `deploy: false` publish, a new app's
+     first-merge publish, a deploy that failed after `Release through the gateway`, or a run cancelled after
      it), so it does not refuse. Such a version may still have reached the
      cluster; a GitHub Release is the only proof wac-cd keeps that it ran. When it is `main`'s newest tag and sits on C (the
      claim on the running code), V' is that version, as it is when that claim
@@ -1076,8 +1077,10 @@ unchanged. A hand edit must carry a new revision number (hemi's runbook).
 release.** Rule 5 refuses a settings release only for a code release that
 never published its chart. One whose chart was published without being proved
 running counts as published: a code release whose run then failed (at
-`deploy`, or with its proof timed out), and a deliberate `deploy: false`
-publish, which leaves a chart and no Release by design. When it is the newest
+`deploy`, or with its proof timed out), a deliberate `deploy: false`
+publish, and a new app's first merge, which publishes without releasing
+(**A new app's first merge**); the last two leave a chart and no Release by
+design. When it is the newest
 code release above V, a settings release still plans V' above it, and "Re-run
 all jobs" on that code release is then refused at `Refuse to replay an old
 version` with `<tag> was taken by a later release (<newest>) that does not
