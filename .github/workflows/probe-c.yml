@@ -63,17 +63,19 @@ jobs:
           fetch-depth: 0
       - name: Push one probe tag per commit kind, then delete each that landed
         env:
-          MAIN_SHA: f1fdb7383f1d8c51d89a2fa82db8c1f60ff2e4f8
+          SAMEOLD_SHA: 4b3627b58ba0a6df0186d89c6c1ade835af3f4d1
           OLD_SHA: ad724c87f576c1593731cd3d05e034e915d9804b
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN: ${{ github.run_id }}
         run: |
           git fetch -q origin main
-          for kind in MAIN OLD HEAD; do
+          MAIN_SHA="$(git rev-parse origin/main)"; export MAIN_SHA
+          for kind in MAIN SAMEOLD OLD HEAD; do
             var="${kind}_SHA"; sha="${!var}"
             same=no
             if git diff --quiet "origin/main" "$sha" -- .github/workflows; then same=yes; fi
             name="probe-c-${RUN}-${kind,,}"
+            git cat-file -e "${sha}^{commit}" || { echo "RESULT ${kind} sha=${sha}: no such commit"; continue; }
             if out=$(git push origin "${sha}:refs/tags/${name}" 2>&1); then
               echo "RESULT ${kind} sha=${sha} workflows_same_as_main=${same}: pushed"
               git push -q origin ":refs/tags/${name}" && echo "  deleted ${name}"
