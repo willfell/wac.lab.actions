@@ -522,9 +522,14 @@ copy as for any run, and then, in `Plan the settings release`:
 2. Reads the running version V from a steady gateway `status`
    (`wacd-release.py running`). The step sets one wall-clock deadline, 120
    seconds after it starts, and passes it as `--deadline` to both of its
-   network reads, this one and rule 5's; each stops when it passes, however
-   slowly an answer arrives (a `SIGALRM`, not only per-socket timeouts), and
-   fails with a sentence. The step's other work is local git. The status's `version` is
+   network reads, this one and rule 5's. The status wait ends 15 seconds
+   before the deadline, starts no request with under 2 seconds of the wait
+   left, and bounds each read by the time left, so an app that never settles
+   always reaches the rollout refusal with its sentence. At the deadline
+   itself a `SIGALRM` backstop stops a read that trickles past every socket
+   timeout and fails the step with a sentence; each read disarms it and
+   restores the previous handler as soon as it decides, so it cannot fire
+   after a decision. The step's other work is local git. The status's `version` is
    the version the gateway last pointed the Application at, which mid-sync or
    right after a rollback dispatch is already the new target, so it counts
    only when the same answer is Synced at its `chart_digest` and Healthy, every
@@ -557,7 +562,7 @@ copy as for any run, and then, in `Plan the settings release`:
      after the release went live; releasing it again changes nothing);
    - otherwise `wacd-release.py earlier-release` judges the versions on
      `main` above V, newest first. A version counts as released only with
-     evidence that it ran: its GitHub Release, which `github-release` creates
+     evidence that it was proved running: its GitHub Release, which `github-release` creates
      only after `deploy` proved the served build, read with the job's
      `GITHUB_TOKEN` (`GET /repos/{repo}/releases/tags/{tag}`; `plan`'s
      existing `contents: write` covers it). A rollback creates no Release for
@@ -570,9 +575,11 @@ copy as for any run, and then, in `Plan the settings release`:
      Nothing is tagged or retagged: a re-run nobody dispatched must not put
      those settings back over a deliberate rollback.
    - a version above V that carries `settings_revision` and has no Release
-     never ran (a code release whose gateway release was refused or timed
-     out, a `deploy: false` publish, or a settings run whose deploy failed),
-     so it does not refuse. When it is `main`'s newest tag and sits on C (the
+     was never proved running (a code release whose gateway release was
+     refused or whose proof timed out, a `deploy: false` publish, a deploy
+     that failed after `Release through the gateway`, or a run cancelled after
+     it), so it does not refuse. Such a version may still have reached the
+     cluster; a GitHub Release is the only proof wac-cd keeps that it ran. When it is `main`'s newest tag and sits on C (the
      claim on the running code), V' is that version, as it is when that claim
      has no chart yet; otherwise V' is the next patch.
    - a 404 for the Release means not released; any other answer, or none,
@@ -613,7 +620,8 @@ old version`; hemi reads all three by job `cd / plan`, step name and
 conclusion. Do not rename any of them.
 
 - `Refuse a settings release while the app is rolling out`: the status never
-  became steady before the step's 120-second deadline. The sentence names V and says no settings
+  became steady within the status wait, which ends 15 seconds before the
+  step's 120-second deadline. The sentence names V and says no settings
   were released; dispatch again once the app settles.
 - `Refuse a settings release behind a workflow change`: GitHub refuses a
   `GITHUB_TOKEN` tag push at a commit whose `.github/workflows` differ from the
@@ -672,9 +680,15 @@ name, and a chart annotation carries only the revision number, never the
 repository id. After a rollback onto code from before the change, a new
 revision can equal an old chart's number: on V itself it takes the V' = V
 shortcut and ships none of the new settings, and on a version above V with a
-Release it is refused by rule 5. `wac-cd` cannot tell the two lineages apart;
-the gateway checks the copy's repository at release time, not the old
-chart's.
+Release it is refused by rule 5, and rule 5's scan can stop early and fail
+open: the new lineage's charts read `none` or a number below the old one, so
+the scan stops before an old chart above V that carries the number and has a
+Release, and rule 5 may not refuse. `wac-cd` cannot tell the two lineages
+apart; the gateway checks the copy's repository at release time, not the old
+chart's. What remains is a re-run of a settings run while its revision is
+still the active one after a rollback, which needs hemi to have neither
+reverted nor reconciled; hemi's H14 (settings follow what runs) is the guard,
+and is a precondition of the first cutover.
 
 **The next code release may over-bump.** After a settings tag V' on a
 rolled-back commit C1, the next merge counts its commits from V', the highest

@@ -439,7 +439,7 @@ def chart_images(registry, app, version):
     return parse_image_refs(text)
 
 
-def chart_release(registry, app, version):
+def chart_release(registry, app, version, timeout=TIMEOUT):
     """What the gateway released as <version>: manifest digest, source revision and images.
 
     None when deploy/<app>:<version> is not in the registry. wac-cd's settings
@@ -447,7 +447,7 @@ def chart_release(registry, app, version):
     this digest, and every running image one of these. copy is the copy
     revision the chart ships, as chart_copy_revision reports it.
     """
-    found = chart_with_digest(registry, app, version)
+    found = chart_with_digest(registry, app, version, timeout)
     if found is None:
         return None
     digest, config = found

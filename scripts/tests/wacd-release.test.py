@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -580,7 +581,7 @@ class RunningTests(unittest.TestCase):
         script = Script(*responses)
         reads = []
 
-        def read(app, version):
+        def read(app, version, timeout=30):
             reads.append((app, version))
             return copy.deepcopy(release)
 
@@ -684,7 +685,7 @@ class RunningTests(unittest.TestCase):
         calls = []
         with patch.object(wacd.chart, "chart_release", lambda *args: calls.append(args) or RELEASE):
             self.assertEqual(wacd.read_release("travel", VERSION), RELEASE)
-        self.assertEqual(calls, [("registry.network.svc.cluster.local:5000", "travel", VERSION)])
+        self.assertEqual(calls, [("registry.network.svc.cluster.local:5000", "travel", VERSION, 30.0)])
 
     def test_the_token_is_never_printed(self):
         def explode(body, trust, timeout):
@@ -696,40 +697,155 @@ class RunningTests(unittest.TestCase):
         self.assertNotIn(TOKEN, out + err)
 
 
+DRIVER = """
+import importlib.util, json, os, sys, time
+spec = importlib.util.spec_from_file_location("wacd_release_driver", sys.argv[1])
+wacd = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wacd)
+fixture = json.loads(os.environ["DRIVER_FIXTURE"])
+wacd.DEADLINE_MARGIN = fixture["margin"]
+wacd.POLL_SECONDS = 0.2
+wacd.trust_context = lambda: None
+wacd.transport = lambda body, trust, timeout: (200, fixture["status"])
+wacd.read_release = lambda app, version, timeout=30: fixture["release"]
+wacd.read_copy = lambda app, version: "7"
+argv = [a.replace("DEADLINE", str(time.time() + fixture["deadline"])) for a in sys.argv[2:]]
+sys.exit(wacd.main(["wacd-release.py", *argv]))
+"""
+
+
 class DeadlineTests(unittest.TestCase):
-    """--deadline is wall-clock: a read stuck past it ends the command, whatever its own timeouts."""
+    """One wall-clock deadline: the status wait decides before it, and the backstop never fires after a decision."""
+
+    def driver(self, tmp, *argv, margin=1, deadline=3.5, status=None, env=None):
+        path = Path(tmp) / "driver.py"
+        if not path.exists():
+            path.write_text(DRIVER)
+        fixture = {"margin": margin, "deadline": deadline, "status": status or unsteady(UNSTEADY["out of sync"]),
+                   "release": RELEASE}
+        return subprocess.Popen(
+            [sys.executable, "-I", str(path), str(SCRIPT), *argv],
+            env={**os.environ, **(env or {}), "DRIVER_FIXTURE": json.dumps(fixture)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    def test_an_app_that_never_settles_always_reaches_the_rollout_refusal(self):
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = [self.driver(tmp, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", "DEADLINE")
+                    for _ in range(24)]
+            results = [(run.wait(timeout=30), *run.communicate()) for run in runs]
+        for code, out, err in results:
+            self.assertEqual((code, out), (wacd.ROLLING_OUT_EXIT, ""), err)
+            self.assertIn("travel was rolling out 0.1.0", err)
+            self.assertNotIn("Traceback", err)
+        self.assertLess(time.monotonic() - started, 12, "every run decided inside its 3.5-second deadline")
+
+    def test_a_slow_drip_answer_cannot_outlast_the_deadline(self):
+        class Drip(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "100000")
+                self.end_headers()
+                try:
+                    for _ in range(200):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.2)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Drip)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        env = {"GITHUB_API_URL": f"http://127.0.0.1:{server.server_address[1]}",
+               "GITHUB_REPOSITORY": "willfell/travel", "GITHUB_TOKEN": "t0k"}
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.driver(tmp, "earlier-release", "--app", "travel", "--prefix", "v", "--revision", "7",
+                              "--running", "1.3.9", "--versions", "1.4.3", "--claimed", "", "--deadline", "DEADLINE",
+                              deadline=2, env=env)
+            code = run.wait(timeout=30)
+            out, err = run.communicate()
+        self.assertEqual((code, out), (1, ""), err)
+        self.assertIn("did not finish within the settings plan's deadline", err)
+        self.assertNotIn("t0k", err)
+        self.assertLess(time.monotonic() - started, 6, "a body dripping one byte at a time is cut off at the deadline")
 
     def test_a_stuck_status_read_ends_at_the_deadline(self):
         def stuck(body, trust, timeout):
             time.sleep(30)
 
         started = time.monotonic()
-        with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", stuck):
+        with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", stuck), \
+                patch.object(wacd, "DEADLINE_MARGIN", 0):
             code, out, err = CliTests.main(
-                self, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", str(int(time.time()) + 2))
+                self, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", str(time.time() + 2.5))
         self.assertEqual((code, out), (1, ""))
         self.assertIn("did not finish within the settings plan's deadline", err)
         self.assertLess(time.monotonic() - started, 5)
 
-    def test_a_deadline_already_past_reads_nothing(self):
-        calls = []
-        with patch.object(wacd, "trust_context", lambda: None), \
-                patch.object(wacd, "transport", lambda *a: calls.append(a) or (200, evidence())):
-            code, _, err = CliTests.main(
-                self, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", str(int(time.time()) - 1))
-        self.assertEqual(code, 1)
-        self.assertIn("deadline", err)
-        self.assertEqual(calls, [])
+    def test_a_deadline_already_past_or_too_close_reads_nothing(self):
+        for offset in (-1, 10):
+            with self.subTest(offset=offset):
+                calls = []
+                with patch.object(wacd, "trust_context", lambda: None), \
+                        patch.object(wacd, "transport", lambda *a: calls.append(a) or (200, evidence())):
+                    code, _, err = CliTests.main(self, "running", "--app", "travel", "--wait-timeout", "120",
+                                                 "--deadline", str(time.time() + offset))
+                self.assertEqual(code, 1)
+                self.assertIn("deadline", err)
+                self.assertEqual(calls, [])
+                self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
-    def test_the_wait_never_runs_past_the_deadline(self):
+    def test_the_wait_ends_a_margin_before_the_deadline(self):
         script = Script((503, {}))
         stack, clock = fake_clock()
         with stack, patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", script), \
-                patch.object(wacd, "arm_deadline", lambda deadline: max(0, deadline - 1000)):
+                patch.object(wacd, "arm_deadline", lambda deadline: (30.0, signal.getsignal(signal.SIGALRM))), \
+                patch.object(wacd, "disarm", lambda previous: None):
             code, _, err = CliTests.main(self, "running", "--app", "travel", "--wait-timeout", "120",
-                                         "--deadline", "1030")
+                                         "--deadline", "0")
         self.assertEqual(code, 1)
-        self.assertLessEqual(clock.now - 1000.0, 31, "the wait is the smaller of --wait-timeout and the deadline")
+        self.assertLessEqual(clock.now - 1000.0, 30 - wacd.DEADLINE_MARGIN, "the wait decides before the backstop")
+
+    def test_the_backstop_is_disarmed_and_the_handler_restored_once_a_command_decides(self):
+        def mine(signum, frame):
+            raise AssertionError("the backstop fired after the command decided")
+
+        steady_status = (200, evidence())
+        cases = (
+            ("released", ["running"], {"transport": Script(steady_status)}, 0),
+            ("rolling out", ["running"], {"transport": Script((200, unsteady(UNSTEADY["degraded"])))},
+             wacd.ROLLING_OUT_EXIT),
+            ("a fault", ["running"], {"transport": Script((500, {}))}, 1),
+            ("earlier, none", ["earlier-release"], {"read_copy": lambda app, v: "6"}, 0),
+            ("earlier, refused", ["earlier-release"],
+             {"read_copy": lambda app, v: "7", "release_exists": lambda tag: True}, wacd.ALREADY_RELEASED_EXIT),
+        )
+        previous = signal.signal(signal.SIGALRM, mine)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        for label, command, patches, expected in cases:
+            with self.subTest(case=label):
+                args = (["--app", "travel", "--wait-timeout", "120"] if command == ["running"] else
+                        ["--app", "travel", "--prefix", "v", "--revision", "7", "--running", "1.3.9",
+                         "--versions", "1.4.3", "--claimed", ""])
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(wacd, "trust_context", lambda: None))
+                    stack.enter_context(patch.object(wacd, "read_release", lambda app, version, timeout=30: RELEASE))
+                    stack.enter_context(patch.object(wacd, "DEADLINE_MARGIN", 1))
+                    stack.enter_context(patch.object(wacd, "POLL_SECONDS", 0.2))
+                    for name, value in patches.items():
+                        stack.enter_context(patch.object(wacd, name, value))
+                    code, _, err = CliTests.main(self, *command, *args, "--deadline", str(time.time() + 3.5))
+                self.assertEqual(code, expected, err)
+                self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+                self.assertIs(signal.getsignal(signal.SIGALRM), mine)
+        time.sleep(1.5)
 
 
 class EarlierReleaseTests(unittest.TestCase):

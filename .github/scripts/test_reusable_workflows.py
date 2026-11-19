@@ -1262,6 +1262,28 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertIn("::error::wac-cd: wacd release: GitHub answered HTTP 502", fault["settings"].stdout)
         self.assertEqual(fault["settings_outputs"], {})
 
+    def test_wac_cd_rerun_of_a_superseded_settings_run_after_a_rollback_is_none_before_rule_b(self):
+        """R (revision 7) patched 1.4.3 and was never proved; a rollback runs 1.3.9; the copy is now 9; R is re-run."""
+        plan = self.settings_plan(
+            revision="7", copy_revision="9", running="1.3.9", rollback=True,
+            extra_tags=(("v1.4.3", "code"),), charts={"1.4.3": {"revision": None, "images": None, "copy": "7"}},
+            earlier="refuse",
+        )
+        self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stderr)
+        self.assertEqual(plan["version_outputs"]["mode"], "none")
+        self.assertEqual((plan["version_outputs"]["version"], plan["version_outputs"]["tag"]), ("", ""))
+        self.assertIn("mode: none (a newer revision is live; its own release follows)", plan["summary"].read_text())
+        self.assertEqual(plan["log"].read_text(), "",
+                         "no status read, no rule B Release read, no registry read and no tag claim")
+        jobs = self.wac_cd()["jobs"]
+        self.assertFalse(self.runs(jobs["retag"], "none"), "nothing is retagged")
+        self.assertFalse(self.runs(jobs["publish"], "none"))
+        steps = [s.get("name") for s in jobs["plan"]["steps"]]
+        settings = jobs["plan"]["steps"][steps.index("Plan the settings release")]["run"]
+        self.assertLess(settings.index("(( COPY_REVISION > SETTINGS_REVISION ))"), settings.index("earlier-release"),
+                        "the superseded check comes before rule B")
+
     def test_wac_cd_settings_release_while_the_app_rolls_out_is_refused_by_its_own_step(self):
         plan = self.settings_plan(status_exit=3)
         self.assertEqual(plan["settings"].returncode, 0, "the planning step records the refusal and succeeds")

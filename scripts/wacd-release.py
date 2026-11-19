@@ -37,12 +37,12 @@ copy_revision= (the copy revision it ships).
 
 `earlier-release --app A --prefix P --revision N --running V --versions L
 --claimed X` is the settings plan's rule B over L, the versions on main above
-V, newest first. A version counts as released only with evidence that it ran:
+V, newest first. A version counts as released only with evidence that it was proved running:
 its GitHub Release, which wac-cd's github-release job creates only after
 deploy proved the served build. A rollback creates no Release for the
 version it leaves, so the evidence survives it. One that carries N and has a
 Release exits ALREADY_RELEASED_EXIT (4) with ALREADY_RELEASED; one that
-carries N and has none never ran, and is taken again when it is X (the claim
+carries N and has none was never proved running, and is taken again when it is X (the claim
 on the running code), as is an X with no chart yet. Copy revisions only grow
 with versions, so the scan stops at the first chart with an older revision or
 none; at most MAX_EARLIER charts are read, and running out of them fails
@@ -51,8 +51,13 @@ fails, never counting as absent. It prints reuse=<X or empty>. Only the
 candidates' Releases are read, never V's.
 
 Both settings reads take `--deadline <epoch seconds>`, the plan step's one
-wall-clock deadline: every read in them stops when it passes, however slowly
-an answer trickles in (SIGALRM), and the status wait never runs past it.
+wall-clock deadline. The status wait ends DEADLINE_MARGIN seconds before it,
+starts no request with under MIN_READ_SECONDS of that wait left, and bounds
+each read by the time left, so an app that never settles always reaches the
+rollout refusal (exit 3) with its sentence. A hard backstop (SIGALRM) at the
+deadline itself stops a read that trickles past every socket timeout; each
+command disarms it and restores the previous handler in a finally, so it
+cannot fire once the command has decided.
 
 The gateway contract (Plan 2, "Chart releases (wac-cd)") is isolated in
 RELEASE_BODY, STATUS_BODY and ready(). After the proof, github-release creates
@@ -105,6 +110,8 @@ REASON_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 ROLLING_OUT_EXIT = 3
 ALREADY_RELEASED_EXIT = 4
 MAX_EARLIER = 25
+DEADLINE_MARGIN = 15
+MIN_READ_SECONDS = 2
 ALREADY_RELEASED = (
     "Revision {revision} was released as {earlier}, and {running} runs now after a rollback. To put those "
     "settings on the running code, make them live again in hemi; they are released as a new revision."
@@ -439,10 +446,10 @@ def proved(version, images, wait_timeout, request=None, mode=None):
     raise ReleaseError("release evidence deadline exceeded")
 
 
-def read_release(app, version):
+def read_release(app, version, timeout=chart.TIMEOUT):
     """deploy/<app>:<version> as the registry holds it, at the push address."""
     try:
-        return chart.chart_release(chart.PUSH_REGISTRY, app, version)
+        return chart.chart_release(chart.PUSH_REGISTRY, app, version, timeout)
     except chart.ChartError as error:
         raise ReleaseError(str(error)) from None
 
@@ -509,18 +516,29 @@ def earlier_release(revision, running, versions, claimed, prefix, app):
     return reuse
 
 
+def expire(signum, frame):
+    raise Deadline("a read did not finish within the settings plan's deadline, so nothing was tagged")
+
+
 def arm_deadline(deadline):
-    """Seconds left until the wall-clock deadline; a read still running then raises Deadline."""
+    """Arm the hard backstop at the wall-clock deadline: (seconds left, previous handler).
+
+    It is the last resort for a read that trickles past every socket timeout.
+    The caller decides before it (the status wait ends DEADLINE_MARGIN seconds
+    earlier) and always calls disarm() in a finally, so the alarm cannot fire
+    once a command has decided.
+    """
     left = deadline - time.time()
     if left <= 0:
         raise Deadline("the settings plan's deadline had passed before this read")
-
-    def expire(signum, frame):
-        raise Deadline("a read did not finish within the settings plan's deadline, so nothing was tagged")
-
-    signal.signal(signal.SIGALRM, expire)
+    previous = signal.signal(signal.SIGALRM, expire)
     signal.setitimer(signal.ITIMER_REAL, left)
-    return left
+    return left, previous
+
+
+def disarm(previous):
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, previous)
 
 
 def image_digest(ref):
@@ -575,8 +593,8 @@ def running_release(app, wait_timeout, request=None):
         trust = None
     deadline = time.monotonic() + wait_timeout
     seen = None
-    while time.monotonic() < deadline:
-        code, value = request(STATUS_BODY(), trust, max(1, deadline - time.monotonic()))
+    while deadline - time.monotonic() >= MIN_READ_SECONDS:
+        code, value = request(STATUS_BODY(), trust, deadline - time.monotonic())
         if code == 200:
             version = value.get("version")
             if semver(version) is None:
@@ -585,7 +603,7 @@ def running_release(app, wait_timeout, request=None):
                     f"the gateway reports {shown!r} running, which is not a released X.Y.Z (an unknown "
                     "chart digest or a lost ledger), so there is no running code to release settings on"
                 )
-            release = read_release(app, version)
+            release = read_release(app, version, max(1, min(chart.TIMEOUT, deadline - time.monotonic())))
             if release is None:
                 raise ReleaseError(f"deploy/{app}:{version}, which the gateway reports running, is not in the registry")
             if value.get("chart_digest") != release["digest"]:
@@ -603,7 +621,7 @@ def running_release(app, wait_timeout, request=None):
         time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
     if seen is not None:
         raise RollingOut(
-            f"{app} was rolling out {seen} for the whole {wait_timeout} seconds: the gateway never "
+            f"{app} was rolling out {seen} for the whole {int(wait_timeout)} seconds: the gateway never "
             "reported it synced, healthy and fully rolled out with only its own images, so no settings "
             "were released; dispatch again once it settles"
         )
@@ -781,16 +799,30 @@ def run(args):
         versions = [v for v in args.versions.split(",") if v]
         if any(not VERSION_PATTERN.fullmatch(v) for v in versions + ([args.claimed] if args.claimed else [])):
             raise ReleaseError("--versions and --claimed must be X.Y.Z")
-        if args.deadline is not None:
-            arm_deadline(args.deadline)
-        return "reuse=" + earlier_release(
-            args.revision, args.running, versions, args.claimed, args.prefix, args.app
-        )
+        if args.deadline is None:
+            return "reuse=" + earlier_release(
+                args.revision, args.running, versions, args.claimed, args.prefix, args.app
+            )
+        _, previous = arm_deadline(args.deadline)
+        try:
+            return "reuse=" + earlier_release(
+                args.revision, args.running, versions, args.claimed, args.prefix, args.app
+            )
+        finally:
+            disarm(previous)
     timeout = wait_bound(args.wait_timeout)
     if args.command == "running":
+        previous = None
         if args.deadline is not None:
-            timeout = max(0, min(timeout, arm_deadline(args.deadline)))
-        version, release = running_release(args.app, timeout)
+            left, previous = arm_deadline(args.deadline)
+            timeout = min(timeout, left - DEADLINE_MARGIN)
+        try:
+            if timeout < MIN_READ_SECONDS:
+                raise Deadline("too little of the settings plan's deadline was left to read the status")
+            version, release = running_release(args.app, timeout)
+        finally:
+            if previous is not None:
+                disarm(previous)
         images = json.dumps(release["images"], separators=(",", ":"), sort_keys=True)
         return (
             f"running={version}\ncommit={release['revision']}\nimages={images}\n"
