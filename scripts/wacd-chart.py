@@ -4,7 +4,11 @@
 The deploy chart is the app's values nested under the vendored wac-app chart.
 It is pushed to registry repo deploy/<app> at tag <version>, and the release
 gateway reads it back from the Helm config blob (the Chart.yaml as JSON), so the
-revision and image annotations written here are the contract.
+revision and image annotations written here are the contract. A chart rendered
+from hemi's copy of the settings (or released while a copy says the files are
+the truth) also names that copy: `wacwini.com/revision`, the copy's revision as
+a decimal string, and `wacwini.com/fleet-commit`, the wac.fleet commit the copy
+was read at. The gateway holds such a chart to the copy it names.
 
 Every CLI prints single-line key=value output for $GITHUB_OUTPUT, except
 build-args, which prints the validated KEY=VALUE build args one per line. Any
@@ -29,6 +33,9 @@ PUSH_REGISTRY = "registry.network.svc.cluster.local:5000"
 PULL_REGISTRY = "localhost:30500"
 REVISION_ANNOTATION = "org.opencontainers.image.revision"
 IMAGES_ANNOTATION = "wacwini.com/images"
+CONTRACT_REVISION_ANNOTATION = "wacwini.com/revision"
+FLEET_COMMIT_ANNOTATION = "wacwini.com/fleet-commit"
+COPY_ANNOTATIONS = (CONTRACT_REVISION_ANNOTATION, FLEET_COMMIT_ANNOTATION)
 HELM_CONFIG_TYPE = "application/vnd.cncf.helm.config.v1+json"
 MANIFEST_ACCEPT = ", ".join(
     (
@@ -59,6 +66,7 @@ TOP_LEVEL_KEY = re.compile(
 )
 TOP_LEVEL_ITEM = re.compile(r"-(\s|$)")
 BUILD_ARG_KEY = re.compile(r"[A-Z_][A-Z0-9_]*")
+DECIMAL = re.compile(r"[1-9][0-9]*", re.ASCII)
 
 
 class ChartError(Exception):
@@ -69,6 +77,44 @@ def check(value, pattern, what):
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise ChartError(f"{what} is invalid: {str(value)[:80]!r}")
     return value
+
+
+def revision_annotation(revision):
+    """The copy's revision (a JSON number) as the chart annotation's decimal string.
+
+    This and revision_from_annotation are the only place the two spellings
+    meet; the gateway reads the annotation back with int().
+    """
+    if type(revision) is not int or revision < 1:
+        raise ChartError(f"the copy's revision must be a whole number of at least 1, not {str(revision)[:20]!r}")
+    return str(revision)
+
+
+def revision_from_annotation(text):
+    """The inverse of revision_annotation; refuses any other spelling of the number."""
+    if not isinstance(text, str) or not DECIMAL.fullmatch(text):
+        raise ChartError(f"{CONTRACT_REVISION_ANNOTATION} must be a decimal of at least 1, not {str(text)[:20]!r}")
+    return int(text)
+
+
+def copy_annotations(pairs):
+    """The --annotation key=value pairs: exactly the copy's two annotations, or none."""
+    annotations = {}
+    for pair in pairs or ():
+        key, sep, value = pair.partition("=")
+        if not sep:
+            raise ChartError(f"--annotation must be key=value, not {pair[:60]!r}")
+        if key not in COPY_ANNOTATIONS:
+            raise ChartError(f"--annotation {key[:60]!r} is not one of {', '.join(COPY_ANNOTATIONS)}")
+        if key in annotations:
+            raise ChartError(f"--annotation {key} is given twice")
+        annotations[key] = value
+    if annotations and set(annotations) != set(COPY_ANNOTATIONS):
+        raise ChartError(f"{' and '.join(COPY_ANNOTATIONS)} are given together or not at all")
+    if annotations:
+        revision_annotation(revision_from_annotation(annotations[CONTRACT_REVISION_ANNOTATION]))
+        check(annotations[FLEET_COMMIT_ANNOTATION], SHA40, FLEET_COMMIT_ANNOTATION)
+    return annotations
 
 
 def deploy_values(app_values, app, images):
@@ -109,11 +155,15 @@ def parse_image_refs(text):
     return images
 
 
-def chart_metadata(app, version, chart_version, source_sha, images):
-    """Chart.yaml content; images is None only for the wac-ci render."""
+def chart_metadata(app, version, chart_version, source_sha, images, extra=None):
+    """Chart.yaml content; images is None only for the wac-ci render.
+
+    extra holds the copy's annotations from copy_annotations, never any other key.
+    """
     annotations = {REVISION_ANNOTATION: source_sha}
     if images is not None:
         annotations[IMAGES_ANNOTATION] = image_refs(images)
+    annotations.update(extra or {})
     return {
         "apiVersion": "v2",
         "name": app,
@@ -193,8 +243,15 @@ def render_values(text, app, images):
     return json.dumps(deploy_values(parsed, app, images), indent=2) + "\n"
 
 
-def write_chart(out, profile, values_path, version, source_sha, images, wac_app_tgz, ci=False):
-    """Write out/<app>/{Chart.yaml,values.yaml,charts/wac-app-<chart_version>.tgz}."""
+def write_chart(
+    out, profile, values_path, version, source_sha, images, wac_app_tgz, ci=False,
+    values_json=False, annotations=None,
+):
+    """Write out/<app>/{Chart.yaml,values.yaml,charts/wac-app-<chart_version>.tgz}.
+
+    values_json reads values_path as a JSON object only (hemi's runtime, which
+    plan wrote), never falling back to the YAML reading a repository file gets.
+    """
     app = check(profile["app"], APP, "app")
     chart_version = check(profile["chart_version"], VERSION, "chart_version")
     check(version, RELEASE_VERSION, "version")
@@ -223,8 +280,19 @@ def write_chart(out, profile, values_path, version, source_sha, images, wac_app_
         text = Path(values_path).read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as err:
         raise ChartError(f"cannot read the values file {values_path}: {err}") from err
-    values = render_values(text, app, images)
-    meta = chart_metadata(app, version, chart_version, source_sha, None if ci else images)
+    if values_json:
+        try:
+            parsed = json.loads(text)
+        except ValueError as err:
+            raise ChartError(f"the values file {values_path} is not JSON") from err
+        if not isinstance(parsed, dict):
+            raise ChartError(f"the values file {values_path} must be a JSON object")
+        values = json.dumps(deploy_values(parsed, app, images), indent=2) + "\n"
+    else:
+        values = render_values(text, app, images)
+    meta = chart_metadata(
+        app, version, chart_version, source_sha, None if ci else images, copy_annotations(annotations)
+    )
     chart_dir = Path(out) / app
     try:
         if chart_dir.exists():
@@ -449,6 +517,8 @@ def build_parser():
     package.add_argument("--wac-app-tgz", required=True)
     package.add_argument("--out", required=True)
     package.add_argument("--ci", action="store_true")
+    package.add_argument("--values-json")
+    package.add_argument("--annotation", action="append", default=[])
     for command in ("chart-revision", "chart-images", "chart-state"):
         one = sub.add_parser(command)
         one.add_argument("--registry", required=True)
@@ -471,7 +541,10 @@ def build_parser():
 def run(args):
     if args.command == "package":
         profile = load_profile(args.profile)
-        values_path = Path(args.profile).parent.parent / profile["values_file"]
+        if args.values_json is not None:
+            values_path = Path(args.values_json)
+        else:
+            values_path = Path(args.profile).parent.parent / profile["values_file"]
         chart_dir = write_chart(
             Path(args.out),
             profile,
@@ -481,6 +554,8 @@ def run(args):
             parse_images_arg(args.images),
             Path(args.wac_app_tgz),
             ci=args.ci,
+            values_json=args.values_json is not None,
+            annotations=args.annotation,
         )
         return f"chart_dir={chart_dir}"
     if args.command == "build-args":

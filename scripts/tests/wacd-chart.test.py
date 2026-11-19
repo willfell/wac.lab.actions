@@ -653,6 +653,139 @@ class CliPackageTests(unittest.TestCase):
 
 
 
+FLEET_COMMIT = "f" * 40
+
+
+class RevisionAnnotationTests(unittest.TestCase):
+    """The copy's revision is a JSON number; the chart annotation is its decimal string."""
+
+    def test_revision_converts_both_ways(self):
+        for number, text in ((1, "1"), (7, "7"), (120, "120")):
+            with self.subTest(number=number):
+                self.assertEqual(chart.revision_annotation(number), text)
+                self.assertEqual(chart.revision_from_annotation(text), number)
+
+    def test_revision_refuses_what_the_gateway_would_misread(self):
+        for bad in (0, -1, True, 1.0, "7", None):
+            with self.subTest(number=bad), self.assertRaises(chart.ChartError):
+                chart.revision_annotation(bad)
+        for bad in ("", "0", "07", "-1", "1.0", " 7", "7\n", "seven", "\u0667", 7):
+            with self.subTest(text=bad), self.assertRaises(chart.ChartError):
+                chart.revision_from_annotation(bad)
+
+
+class CopyPackageTests(unittest.TestCase):
+    """package --values-json renders hemi's runtime; --annotation names the copy."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        repo = self.base / "repo"
+        (repo / ".github").mkdir(parents=True)
+        (repo / "deploy").mkdir()
+        (repo / "deploy" / "values.yaml").write_text("name: from-the-files\nimage: travel-app\n")
+        self.profile = repo / ".github" / "wacd.json"
+        self.profile.write_text(json.dumps(PROFILE))
+        self.values = self.base / "values.json"
+        self.values.write_text(json.dumps({"name": "from-the-copy", "image": "travel-app", "replicas": 2}))
+        self.tgz = self.base / "wac-app-1.0.0.tgz"
+        self.tgz.write_bytes(b"fake")
+        self.out = self.base / "out"
+
+    def package(self, *extra):
+        return run_cli(
+            "package", "--profile", str(self.profile), "--version", "0.1.0", "--source-sha", SHA,
+            "--images", json.dumps(IMAGES), "--wac-app-tgz", str(self.tgz), "--out", str(self.out),
+            *extra,
+        )
+
+    def test_values_json_and_annotations_reach_the_chart(self):
+        result = self.package(
+            "--values-json", str(self.values),
+            "--annotation", "wacwini.com/revision=7",
+            "--annotation", f"wacwini.com/fleet-commit={FLEET_COMMIT}",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        meta = json.loads((self.out / "travel" / "Chart.yaml").read_text())
+        self.assertEqual(meta["annotations"]["wacwini.com/revision"], "7")
+        self.assertEqual(meta["annotations"]["wacwini.com/fleet-commit"], FLEET_COMMIT)
+        self.assertEqual(meta["annotations"]["org.opencontainers.image.revision"], SHA)
+        values = json.loads((self.out / "travel" / "values.yaml").read_text())
+        self.assertEqual(values["wac-app"]["name"], "from-the-copy")
+        self.assertEqual(values["wac-app"]["replicas"], 2)
+        self.assertEqual(values["wac-app"]["images"], IMAGES)
+
+    def test_annotations_alone_keep_the_files_values(self):
+        result = self.package(
+            "--annotation", "wacwini.com/revision=7",
+            "--annotation", f"wacwini.com/fleet-commit={FLEET_COMMIT}",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("from-the-files", (self.out / "travel" / "values.yaml").read_text())
+
+    def test_without_annotations_the_chart_is_as_before(self):
+        result = self.package()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        meta = json.loads((self.out / "travel" / "Chart.yaml").read_text())
+        self.assertEqual(sorted(meta["annotations"]), ["org.opencontainers.image.revision", "wacwini.com/images"])
+
+    def test_bad_values_json_and_annotations_are_refused(self):
+        text = self.base / "values.txt"
+        text.write_text("name: yaml-is-not-json\n")
+        listed = self.base / "list.json"
+        listed.write_text("[1]")
+        owned = self.base / "owned.json"
+        owned.write_text(json.dumps({"app": "other"}))
+        revision = "wacwini.com/revision=7"
+        commit = f"wacwini.com/fleet-commit={FLEET_COMMIT}"
+        cases = (
+            ("yaml values", ("--values-json", str(text)), "JSON"),
+            ("non-object values", ("--values-json", str(listed)), "object"),
+            ("owned key", ("--values-json", str(owned)), "'app'"),
+            ("missing values", ("--values-json", str(self.base / "absent.json")), "absent.json"),
+            ("revision alone", ("--annotation", revision), "together"),
+            ("commit alone", ("--annotation", commit), "together"),
+            ("unknown key", ("--annotation", revision, "--annotation", commit,
+                             "--annotation", "wacwini.com/images=x"), "wacwini.com/images"),
+            ("duplicate", ("--annotation", revision, "--annotation", "wacwini.com/revision=8",
+                           "--annotation", commit), "twice"),
+            ("no separator", ("--annotation", "wacwini.com/revision"), "key=value"),
+            ("zero-padded revision", ("--annotation", "wacwini.com/revision=07", "--annotation", commit), "revision"),
+            ("short commit", ("--annotation", revision, "--annotation", "wacwini.com/fleet-commit=abc"), "fleet-commit"),
+        )
+        for label, extra, expected in cases:
+            with self.subTest(case=label):
+                result = self.package(*extra)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertTrue(result.stderr.startswith("wacd chart: "), result.stderr)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertIn(expected, result.stderr)
+
+    @unittest.skipUnless(HAVE_HELM or os.environ.get("WACD_REQUIRE_HELM"), "helm is not installed")
+    def test_helm_packages_the_copy_and_shows_its_annotations(self):
+        helm_case = HelmTests("test_packaged_chart_renders_through_helm")
+        helm_case.base = self.base
+        self.tgz = helm_case.fake_wac_app()
+        result = self.package(
+            "--values-json", str(self.values),
+            "--annotation", "wacwini.com/revision=7",
+            "--annotation", f"wacwini.com/fleet-commit={FLEET_COMMIT}",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pkg = self.base / "pkg"
+        pkg.mkdir()
+        subprocess.run(["helm", "package", str(self.out / "travel"), "--destination", str(pkg)],
+                       check=True, capture_output=True)
+        shown = subprocess.run(["helm", "show", "chart", str(pkg / "travel-0.1.0.tgz")],
+                               check=True, capture_output=True, text=True).stdout
+        self.assertIn("wacwini.com/revision: \"7\"", shown)
+        self.assertIn(f"wacwini.com/fleet-commit: {FLEET_COMMIT}", shown)
+        rendered = subprocess.run(["helm", "template", "travel", str(pkg / "travel-0.1.0.tgz")],
+                                  check=True, capture_output=True, text=True).stdout
+        self.assertIn("name: from-the-copy", rendered)
+
+
 class BuildArgsTests(unittest.TestCase):
     def test_build_args_accepts_key_value_lines_and_skips_blank_ones(self):
         self.assertEqual(chart.build_args(""), [])
