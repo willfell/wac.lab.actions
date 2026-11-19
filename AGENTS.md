@@ -41,7 +41,7 @@ python3 scripts/tests/wacd-profile.test.py  # the wacd.json validator
 python3 scripts/tests/wacd-version.test.py  # wac-cd version planning, against temp git repos
 WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-chart.test.py  # deploy chart packaging; needs helm
 python3 scripts/tests/wacd-release.test.py  # wac-cd's gateway client, against a stub gateway
-python3 scripts/tests/wacd-contract.test.py  # wac-cd's settings read from the gateway's copy, against a stub gateway
+python3 scripts/tests/wacd-contract.test.py  # wac-cd's settings read from the gateway's copy and wac-ci's from hemi, against stub servers and temp git repos
 uv run --with pyyaml python scripts/tests/wacd-parity.test.py  # kustomize and Helm render parity
 python3 scripts/tests/wacd-tag.test.py  # wac-cd's tag push, against a local bare remote
 python3 scripts/tests/wacd-retag.test.py  # wac-cd's settings-release retag, against a stand-in registry

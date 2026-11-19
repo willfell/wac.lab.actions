@@ -496,5 +496,392 @@ class CliTests(unittest.TestCase):
         )
 
 
+
+PROFILE = ".github/wacd.json"
+VALUES = "deploy/values.yaml"
+FILES = {
+    PROFILE: (FIXTURES / "wacd.json").read_text(),
+    VALUES: (FIXTURES / "values.yaml").read_text(),
+}
+REPOSITORY = "wacwini/wac.app.travel"
+NO_ANSWER = "hemi did not answer; re-run when it does."
+
+
+class Hemi:
+    """A stand-in for hemi's GET /api/v1/contract.
+
+    Each response is (status, body), (status, body, delay seconds) or "drop",
+    which closes the connection without an answer. The last one repeats.
+    """
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.seen = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.seen.append((self.command, self.path, self.headers["Authorization"]))
+                response = outer.responses.pop(0) if len(outer.responses) > 1 else outer.responses[0]
+                if response == "drop":
+                    self.close_connection = True
+                    self.connection.shutdown(2)
+                    return
+                if response == "trickle":
+                    raw = json.dumps(fixture_copy("hemi")).encode()
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        size = len(raw) // 8 + 1
+                        for start in range(0, len(raw), size):
+                            threading.Event().wait(0.2)
+                            self.wfile.write(raw[start:start + size])
+                            self.wfile.flush()
+                    except OSError:
+                        pass
+                    return
+                status, body, *delay = response
+                if delay:
+                    threading.Event().wait(delay[0])
+                raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def git(*args, cwd):
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+class PullRequestCase(unittest.TestCase):
+    """wac-ci's contract job: main's tree and the merge commit's, read the way actions/checkout leaves them."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.remote = self.root / "remote.git"
+        git("init", "-q", "--bare", str(self.remote), cwd=self.root)
+        git("config", "uploadpack.allowFilter", "true", cwd=self.remote)
+        self.work = self.root / "work"
+        git("init", "-q", str(self.work), cwd=self.root)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.out = self.workspace / ".wacd-contract"
+        self.summary = self.root / "summary.md"
+        self.minted = []
+        self.repository_id = REPOSITORY_ID
+        self.grant = True
+
+    def branch(self, name, files):
+        """Push a branch whose tree is a README plus exactly these files."""
+        self.commits = getattr(self, "commits", 0) + 1
+        git("checkout", "-q", "--orphan", f"commit-{self.commits}", cwd=self.work)
+        git("rm", "-rq", "--cached", "--ignore-unmatch", ".", cwd=self.work)
+        for child in self.work.iterdir():
+            if child.name != ".git":
+                subprocess.run(["rm", "-rf", str(child)], check=True)
+        (self.work / "README.md").write_text(name + "\n")
+        for path, text in files.items():
+            target = self.work / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+        git("add", "-A", cwd=self.work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", name, cwd=self.work)
+        git("push", "-q", "--force", str(self.remote), f"HEAD:refs/heads/{name}", cwd=self.work)
+
+    def checkout(self, name, path):
+        """actions/checkout with fetch-depth 1, filter blob:none and a sparse .github/wacd.json.
+
+        Its remote is then pointed nowhere, as persist-credentials: false leaves
+        a private repository: a read that needs any further object fails.
+        """
+        target = self.workspace / path
+        subprocess.run(["rm", "-rf", str(target)], check=True)
+        git("init", "-q", str(target), cwd=self.root)
+        git("remote", "add", "origin", self.remote.as_uri(), cwd=target)
+        git("sparse-checkout", "set", "--no-cone", PROFILE, cwd=target)
+        git("fetch", "-q", "--no-tags", "--filter=blob:none", "--depth=1", "origin",
+            f"+refs/heads/{name}:refs/remotes/origin/{name}", cwd=target)
+        git("checkout", "-q", "--force", "-B", name, f"refs/remotes/origin/{name}", cwd=target)
+        git("remote", "set-url", "origin", str(self.root / "gone"), cwd=target)
+
+    def mint(self):
+        value = token(len(self.minted), self.repository_id)
+        self.minted.append(value)
+        return value
+
+    def run_pr(self, *responses, main=None, head=None):
+        self.branch("main", FILES if main is None else main)
+        self.branch("pr", FILES if head is None else head)
+        self.checkout("main", ".wacd-main")
+        self.checkout("pr", ".wacd-head")
+        return self.invoke(*responses)
+
+    def invoke(self, *responses):
+        hemi = Hemi(*responses)
+        self.addCleanup(hemi.close)
+        self.hemi = hemi
+        self.sleeps = []
+        self.minted = []
+        env = {"GITHUB_STEP_SUMMARY": str(self.summary), "GITHUB_REPOSITORY": REPOSITORY}
+        if self.grant:
+            env.update({"ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.actions.githubusercontent.com/t",
+                        "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "runner-bearer"})
+        stdout, stderr = io.StringIO(), io.StringIO()
+        cwd = os.getcwd()
+        os.chdir(self.workspace)
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(contract.shadow, "URL", hemi.url))
+                stack.enter_context(patch.object(contract.shadow, "oidc_token", self.mint))
+                stack.enter_context(patch.object(contract.time, "sleep", self.sleeps.append))
+                stack.enter_context(patch.object(contract, "PR_ATTEMPT_SECONDS", 0.3))
+                stack.enter_context(patch.dict(os.environ, env))
+                if not self.grant:
+                    for name in ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
+                        stack.enter_context(patch.dict(os.environ, {name: ""}))
+                stack.enter_context(contextlib.redirect_stdout(stdout))
+                stack.enter_context(contextlib.redirect_stderr(stderr))
+                code = contract.main(
+                    ["wacd-contract.py", "pr", "--out", ".wacd-contract", "--main", ".wacd-main", "--head", ".wacd-head"]
+                )
+        finally:
+            os.chdir(cwd)
+        self.stdout, self.stderr = stdout.getvalue(), stderr.getvalue()
+        self.summary_text = self.summary.read_text() if self.summary.exists() else ""
+        everything = self.stdout + self.stderr + self.summary_text
+        for minted in self.minted:
+            self.assertNotIn(minted, everything, "a job token was printed")
+            self.assertNotIn(minted.split(".")[1], everything, "a job token's claims were printed")
+        self.assertNotIn(BODY_MARKER, everything, "hemi's body was printed raw")
+        self.assertNotIn("runner-bearer", everything)
+        return code
+
+    def outputs(self):
+        return dict(line.split("=", 1) for line in self.stdout.splitlines())
+
+    def assertSource(self, code, source):
+        self.assertEqual(code, 0, self.stdout + self.stderr)
+        self.assertEqual(self.outputs()["source"], source)
+        if source == "files":
+            self.assertFalse(self.out.exists(), "a run on the files leaves nothing for a later job")
+
+    def assertFails(self, code, sentence):
+        self.assertEqual(code, 1, self.stdout + self.stderr)
+        self.assertEqual(self.stdout, "", "no step output on a failure")
+        self.assertEqual(self.stderr, "wacd contract: " + sentence + "\n")
+        self.assertIn(sentence, self.summary_text)
+        self.assertFalse(self.out.exists(), "nothing may be left for a later job to act on")
+
+    def hemi_answer(self, source="hemi", **changes):
+        value = fixture_copy(source)
+        value.update(changes)
+        return 200, value
+
+
+class PullRequestDecisionTests(PullRequestCase):
+    """One test per row of the decision table in docs/reference/wac-ci.md."""
+
+    def test_hemi_and_files_added_back_by_the_pull_request_fails(self):
+        for label, head, added in (
+            ("both", FILES, [PROFILE, VALUES]),
+            ("the profile", {PROFILE: FILES[PROFILE]}, [PROFILE]),
+            ("the values", {VALUES: FILES[VALUES]}, [VALUES]),
+        ):
+            with self.subTest(added=label):
+                self.summary.unlink(missing_ok=True)
+                code = self.run_pr(self.hemi_answer(), main={}, head=head)
+                self.assertFails(code, " ".join(f"{path} was added back; travel's settings live in hemi." for path in added))
+
+    def test_hemi_with_the_files_still_on_main_uses_hemi_and_says_so(self):
+        code = self.run_pr(self.hemi_answer(), main=FILES, head=FILES)
+        self.assertSource(code, "hemi")
+        for path in (PROFILE, VALUES):
+            self.assertIn(
+                f"{path} is still on main until hemi's clean-up pull request merges; hemi's settings were used.",
+                self.summary_text,
+            )
+        self.assertEqual(json.loads((self.out / "contract.json").read_text()), fixture_copy("hemi"))
+        self.assertEqual(json.loads((self.out / "values.json").read_text()), fixture_copy("hemi")["runtime"])
+        self.assertEqual(json.loads((self.out / "profile.json").read_text())["values_file"], ".wacd-contract/values.json")
+
+    def test_hemi_with_no_files_uses_hemi_with_nothing_to_say(self):
+        for label, main in (("cut over", {}), ("the clean-up pull request itself", FILES)):
+            with self.subTest(case=label):
+                self.summary.unlink(missing_ok=True)
+                code = self.run_pr(self.hemi_answer(), main=main, head={})
+                self.assertSource(code, "hemi")
+                self.assertNotIn("still on main", self.summary_text)
+                self.assertNotIn("added back", self.summary_text)
+                self.assertEqual(sorted(p.name for p in self.out.iterdir()),
+                                 ["contract.json", "profile.json", "values.json"])
+
+    def test_files_copy_and_a_restore_pull_request_runs_on_its_own_files(self):
+        code = self.run_pr(self.hemi_answer("files"), main={}, head=FILES)
+        self.assertSource(code, "files")
+        self.assertNotIn("added back", self.summary_text)
+
+    def test_files_copy_with_no_files_on_main_or_in_the_pull_request_fails(self):
+        code = self.run_pr(self.hemi_answer("files"), main={}, head={})
+        self.assertFails(code, contract.PR_SENTENCES["returning"].format(app="travel"))
+        self.assertIn("restore pull request", self.stderr)
+
+    def test_files_copy_with_files_on_main_runs_on_the_pull_requests_files(self):
+        for label, head in (("present", FILES), ("absent", {})):
+            with self.subTest(head=label):
+                self.summary.unlink(missing_ok=True)
+                self.out.mkdir(exist_ok=True)
+                (self.out / "contract.json").write_text(json.dumps(fixture_copy("hemi")))
+                self.assertSource(self.run_pr(self.hemi_answer("files"), main=FILES, head=head), "files")
+
+    def test_any_answer_but_200_with_files_on_main_runs_on_the_files(self):
+        for label, response, said in (
+            ("401", (401, {"error": BODY_MARKER}), "hemi answered 401; using the repository's files"),
+            ("403", (403, {"error": "not registered"}), "hemi answered 403; using the repository's files"),
+            ("404", (404, {"error": "not found"}), "hemi answered 404; using the repository's files"),
+            ("422", (422, {"error": BODY_MARKER}), "hemi answered 422; using the repository's files"),
+            ("500", (500, {}), "hemi did not answer; using the repository's files"),
+            ("503", (503, {"error": "not connected"}), "hemi did not answer; using the repository's files"),
+            ("no answer", "drop", "hemi did not answer; using the repository's files"),
+            ("timeout", (200, fixture_copy("hemi"), 1), "hemi did not answer; using the repository's files"),
+        ):
+            for head_label, head in (("present", FILES), ("absent", {})):
+                with self.subTest(answer=label, head=head_label):
+                    self.summary.unlink(missing_ok=True)
+                    self.assertSource(self.run_pr(response, main=FILES, head=head), "files")
+                    self.assertIn(said, self.summary_text)
+
+    def test_a_refused_token_with_no_files_on_main_fails(self):
+        for status in (401, 403):
+            for head_label, head in (("absent", {}), ("both added", FILES)):
+                with self.subTest(status=status, head=head_label):
+                    self.summary.unlink(missing_ok=True)
+                    code = self.run_pr((status, {"error": BODY_MARKER}), main={}, head=head)
+                    self.assertFails(code, f"hemi refused this pull request's token (HTTP {status}); "
+                                           f"{REPOSITORY}'s settings live in hemi, so the checks cannot run.")
+                    self.assertEqual(len(self.hemi.seen), 1, "a refusal is not asked again")
+
+    def test_no_answer_with_no_files_on_main_fails(self):
+        for label, response in (("no answer", "drop"), ("timeout", (200, fixture_copy("hemi"), 1)),
+                                ("500", (500, {})), ("503", (503, {"error": "not connected"}))):
+            for head_label, head in (("absent", {}), ("both added", FILES)):
+                with self.subTest(answer=label, head=head_label):
+                    self.summary.unlink(missing_ok=True)
+                    self.assertFails(self.run_pr(response, main={}, head=head), NO_ANSWER)
+                    self.assertEqual(len(self.hemi.seen), contract.PR_ATTEMPTS, "silence is asked again")
+
+    def test_not_found_or_unprocessable_with_no_files_on_main_fails_naming_the_status(self):
+        for status in (404, 422):
+            with self.subTest(status=status):
+                self.summary.unlink(missing_ok=True)
+                code = self.run_pr((status, {"error": BODY_MARKER}), main={}, head={})
+                self.assertFails(code, f"hemi answered HTTP {status}; {REPOSITORY}'s settings live in hemi, "
+                                       "so the checks cannot run.")
+
+
+class PullRequestTests(PullRequestCase):
+    def test_a_pull_request_that_drops_the_token_grant_and_adds_the_files_back_fails(self):
+        """A pull request can drop id-token from its own ci.yml to force hemi's silence; main decides."""
+        self.grant = False
+        code = self.run_pr((200, fixture_copy("hemi")), main={}, head=FILES)
+        self.assertFails(code, contract.PR_SENTENCES["no_grant"].format(app=REPOSITORY))
+        self.assertEqual(self.hemi.seen, [], "nothing is asked without a token")
+
+    def test_without_the_token_grant_a_repository_on_its_files_runs_as_today(self):
+        self.grant = False
+        self.assertSource(self.run_pr((200, fixture_copy("hemi")), main=FILES, head=FILES), "files")
+        self.assertIn("no job token for hemi; using the repository's files", self.summary_text)
+
+    def test_a_stacked_pull_request_is_judged_by_main_not_by_its_base(self):
+        self.branch("base", FILES)
+        for label, response, sentence in (
+            ("401", (401, {}), f"hemi refused this pull request's token (HTTP 401); {REPOSITORY}'s settings "
+                               "live in hemi, so the checks cannot run."),
+            ("hemi", (200, fixture_copy("hemi")),
+             f"{PROFILE} was added back; travel's settings live in hemi. {VALUES} was added back; travel's "
+             "settings live in hemi."),
+        ):
+            with self.subTest(answer=label):
+                self.summary.unlink(missing_ok=True)
+                self.assertFails(self.run_pr(response, main={}, head=FILES), sentence)
+
+    def test_each_attempt_asks_with_its_own_token_and_backs_off(self):
+        busy = (503, {"error": "not connected"})
+        code = self.run_pr(busy, busy, (200, fixture_copy("hemi")), main={}, head={})
+        self.assertSource(code, "hemi")
+        self.assertEqual([(method, path) for method, path, _ in self.hemi.seen], [("GET", "/api/v1/contract")] * 3)
+        self.assertEqual([auth for _, _, auth in self.hemi.seen], ["Bearer " + value for value in self.minted])
+        self.assertEqual(len(set(self.minted)), 3)
+        self.assertEqual(self.sleeps, list(contract.PR_BACKOFF))
+
+    def test_silence_is_asked_at_most_the_attempt_count(self):
+        self.assertFails(self.run_pr((503, {}), main={}, head={}), NO_ANSWER)
+        self.assertEqual(len(self.hemi.seen), contract.PR_ATTEMPTS)
+        self.assertEqual(len(self.minted), contract.PR_ATTEMPTS)
+
+    def test_an_answer_that_trickles_in_past_the_attempt_bound_is_silence(self):
+        """Each read meets the socket timeout; only the attempt's own bound stops it."""
+        self.assertFails(self.run_pr("trickle", main={}, head={}), NO_ANSWER)
+        self.assertEqual(len(self.hemi.seen), contract.PR_ATTEMPTS)
+
+    def test_the_values_path_on_main_comes_from_mains_profile(self):
+        moved = json.loads(FILES[PROFILE])
+        moved["values_file"] = "deploy/other.yaml"
+        main = {PROFILE: json.dumps(moved), "deploy/other.yaml": FILES[VALUES]}
+        code = self.run_pr((200, fixture_copy("hemi")), main=main, head=main)
+        self.assertSource(code, "hemi")
+        self.assertIn("deploy/other.yaml is still on main", self.summary_text)
+
+    def test_an_answer_that_cannot_be_read_is_not_hemis_settings(self):
+        for label, response in (
+            ("not JSON", (200, BODY_MARKER.encode())),
+            ("not an object", (200, [BODY_MARKER])),
+            ("another repository", (200, {**fixture_copy(), "identity": {**fixture_copy()["identity"],
+                                                                         "repositoryId": "111"}})),
+            ("version 2", (200, {**fixture_copy(), "version": 2})),
+            ("unknown source", (200, {**fixture_copy(), "flags": {"source": BODY_MARKER}})),
+            ("no values path", (200, {**fixture_copy(), "delivery": {
+                key: value for key, value in fixture_copy()["delivery"].items() if key != "valuesFile"}})),
+            ("profile does not derive", (200, {**fixture_copy(), "gates": []})),
+        ):
+            with self.subTest(answer=label, main="files"):
+                self.summary.unlink(missing_ok=True)
+                self.assertSource(self.run_pr(response, main=FILES, head=FILES), "files")
+                self.assertIn("hemi's answer could not be read; using the repository's files", self.summary_text)
+            with self.subTest(answer=label, main="cut over"):
+                self.summary.unlink(missing_ok=True)
+                code = self.run_pr(response, main={}, head={})
+                self.assertFails(code, contract.PR_SENTENCES["unreadable"].format(app=REPOSITORY))
+
+    def test_pr_takes_no_address_for_hemi(self):
+        usage = subprocess.run(
+            [sys.executable, str(SCRIPT), "pr", "--help"], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(usage.returncode, 0, usage.stderr)
+        self.assertEqual(
+            {word for word in usage.stdout.split() if word.startswith("--")},
+            {"--help", "--out", "--main", "--head"},
+        )
+        self.assertEqual(contract.shadow.URL, "http://hemi-app.hemi.svc.cluster.local:3000")
+        self.assertEqual(contract.shadow.AUDIENCE, "wacwini:hemi")
+
+
 if __name__ == "__main__":
     unittest.main()

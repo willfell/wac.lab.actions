@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ask Lab's gateway for an app's settings copy and decide where wac-cd reads its settings.
+"""Ask for an app's settings copy and decide where wac-cd and wac-ci read their settings.
 
 wac-cd's `plan` job runs `fetch --out .wacd-contract` once. It posts
 `{"operation": "contract"}` to the release gateway with a fresh GitHub OIDC
@@ -50,19 +50,64 @@ printed; only a sentence is. The request is wacd-release.py's post(), and the
 code-to-sentence map is wacd-release.py's REFUSALS with its two defaults, so a
 refused contract and a refused release read alike. The gateway's address is
 ci-release.py's constant, never an input, and no token is ever printed.
+
+wac-ci's `contract` job runs `pr --out .wacd-contract --main <checkout>
+--head <checkout>` once per pull request. `--main` is the default branch's
+head and `--head` the pull request's merge commit, each checked out by
+actions/checkout at depth 1 with no blobs but `.github/wacd.json`'s. Their
+trees are read with `git ls-tree` and main's profile with `git cat-file`, as
+data: nothing in either checkout is run or followed. It asks hemi (wacd-shadow.py's
+address and audience, the same constants the shadow job uses) with
+`GET /api/v1/contract` and a token minted for each attempt. Hemi answers a
+pull request's job with its repository's active copy as it stands. Whether a
+repository is cut over is read from main, never from the pull request, which
+could otherwise put the files back with gates of its own and silence hemi by
+dropping `id-token` from its own ci.yml:
+
+| hemi | files on main | files in the merge commit | result |
+| --- | --- | --- | --- |
+| 200 `hemi` | absent | present | fails: `<path> was added back` |
+| 200 `hemi` | present | present | hemi's settings, and a line per file still on main |
+| 200 `hemi` | absent | absent | hemi's settings |
+| 200 `files` | absent | present | the files: the restore pull request |
+| 200 `files` | absent | absent | fails: wait for the restore pull request |
+| 200 `files` | present | any | the files, as before |
+| anything else | present | any | the files, as before; the summary names hemi's status |
+| 401 or 403 | absent | any | fails: hemi refused the token |
+| no answer, a timeout or 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
+| any other status | absent | any | fails, naming the status |
+
+"Files on main" is `.github/wacd.json` on main, the profile that holds the
+gates; the paths checked in the merge commit are that file, the values path
+main's profile names and the copy's `delivery.valuesFile`. A 200 that cannot be
+read, names another repository than the token's or does not derive a profile
+is treated as an answer but a 200, and so is a job with no `id-token` grant.
+No answer and a 5xx are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
+apart; each attempt, token mint included, is bounded at PR_ATTEMPT_SECONDS by
+a worker thread, so a reply that trickles in counts as silence. On success it prints
+`source=hemi|files` and `revision=<n>|`, and with source `hemi` leaves
+`contract.json`, `profile.json` and `values.json` under `<out>` as `fetch`
+does; otherwise `<out>` is removed. A failure prints one `wacd contract:`
+line to stderr and exits 1. Either way the job summary says why, naming hemi's
+status and never its body.
 """
 
 import argparse
 import base64
 import binascii
+import http.client
 import importlib.util
 import json
 import os
 import re
 import shutil
 import ssl
+import subprocess
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -77,6 +122,7 @@ release = _load("wacd_contract_release", "wacd-release.py")
 ci = release.ci
 profile = _load("wacd_contract_profile", "wacd-profile.py")
 chart = _load("wacd_contract_chart", "wacd-chart.py")
+shadow = _load("wacd_contract_shadow", "wacd-shadow.py")
 
 CONTRACT_BODY = {"operation": "contract"}
 FIRST_POLL_SECONDS = 5
@@ -96,6 +142,50 @@ SHA40 = re.compile(r"[0-9a-f]{40}")
 REPOSITORY_ID = re.compile(r"[0-9]{1,20}")
 
 REFUSALS = release.REFUSALS
+
+CONTRACT_ROUTE = "/api/v1/contract"
+PR_ATTEMPTS = 3
+PR_BACKOFF = (5, 10)
+PR_ATTEMPT_SECONDS = 15
+GIT_SECONDS = 30
+MAX_ANSWER = 1048576
+REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+GRANT_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+CUT_OVER = "{app}'s settings live in hemi, so the checks cannot run."
+
+PR_SENTENCES = {
+    "added_back": "{path} was added back; {app}'s settings live in hemi.",
+    "still_on_main": (
+        "{path} is still on main until hemi's clean-up pull request merges; hemi's settings were used."
+    ),
+    "hemi": "Settings come from hemi's copy, revision {revision}.",
+    "files": (
+        "hemi's copy (revision {revision}) says {app}'s settings live in its files, so the pull "
+        "request's own files were used."
+    ),
+    "restore": (
+        "hemi's copy (revision {revision}) says {app} is returning to its files and this pull "
+        "request puts them back, so its own files were used."
+    ),
+    "returning": (
+        "hemi says {app} is returning to its files, and neither main nor this pull request has "
+        ".github/wacd.json; wait for hemi's restore pull request and re-run after it merges."
+    ),
+    "status_files": "hemi answered {status}; using the repository's files.",
+    "silent_files": "hemi did not answer; using the repository's files.",
+    "no_grant_files": "no job token for hemi; using the repository's files.",
+    "unreadable_files": "hemi's answer could not be read; using the repository's files.",
+    "refused": "hemi refused this pull request's token (HTTP {status}); " + CUT_OVER,
+    "silent": "hemi did not answer; re-run when it does.",
+    "status": "hemi answered HTTP {status}; " + CUT_OVER,
+    "no_grant": (
+        "GitHub would not mint a job token for hemi: the caller's ci.yml must grant "
+        "id-token: write, and " + CUT_OVER
+    ),
+    "unreadable": "hemi's answer could not be read; " + CUT_OVER,
+    "tree": "The {which} could not be read, so the settings' source cannot be decided.",
+    "unexpected": "Reading the settings stopped unexpectedly, so the checks did not run.",
+}
 
 SENTENCES = {
     "unverified": (
@@ -320,6 +410,186 @@ def fetch(out, wait_text):
     return "hemi", revision, commit, reason
 
 
+def tree_entries(checkout, paths, which):
+    """The paths among these that are files in the tree at checkout's HEAD.
+
+    Only trees are read, so a checkout fetched with no blobs answers; the
+    names are compared exactly, never as patterns.
+    """
+    wanted = sorted(set(paths))
+    output = git(checkout, ["ls-tree", "-z", "HEAD", "--", *wanted], which)
+    found = set()
+    for entry in output.split(b"\0"):
+        meta, tab, name = entry.partition(b"\t")
+        if tab and meta.split(b" ")[1:2] == [b"blob"]:
+            found.add(name.decode("utf-8", "replace"))
+    return {path for path in wanted if path in found}
+
+
+def git(checkout, args, which):
+    """git's stdout in checkout; no prompt, no lazy fetch, bounded."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_NO_LAZY_FETCH": "1"}
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(checkout), *args], capture_output=True, env=env, timeout=GIT_SECONDS, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise Refusal(PR_SENTENCES["tree"].format(which=which)) from None
+    if result.returncode != 0:
+        raise Refusal(PR_SENTENCES["tree"].format(which=which))
+    return result.stdout
+
+
+def main_values_path(checkout):
+    """The values path main's .github/wacd.json names, or None when it names none readable."""
+    raw = git(checkout, ["cat-file", "blob", f"HEAD:{FILES_PROFILE.as_posix()}"], "default branch's tree")
+    try:
+        value = json.loads(raw).get("values_file")
+        profile.check_relative(value, "values_file")
+    except (ValueError, AttributeError, profile.ProfileError):
+        return None
+    return value
+
+
+def granted():
+    return all(os.environ.get(name) for name in GRANT_ENV)
+
+
+def hemi_attempt():
+    """(status, body, token) for one GET with a token minted for it; status None when unanswered."""
+    try:
+        token = shadow.oidc_token()
+    except shadow.Unanswered:
+        return None, None, None
+    request = urllib.request.Request(
+        shadow.URL + CONTRACT_ROUTE, headers={"Authorization": "Bearer " + token}, method="GET"
+    )
+    opener = urllib.request.build_opener(shadow.NoRedirect(), urllib.request.ProxyHandler({}))
+    try:
+        response = opener.open(request, timeout=PR_ATTEMPT_SECONDS)
+    except urllib.error.HTTPError as error:
+        error.close()
+        return error.code, None, token
+    except (OSError, ValueError, http.client.HTTPException):
+        return None, None, token
+    try:
+        with response:
+            raw = response.read(MAX_ANSWER + 1)
+    except (OSError, ValueError, http.client.HTTPException):
+        return None, None, token
+    return response.status, raw, token
+
+
+def bounded_attempt():
+    """hemi_attempt, or an unanswered attempt once PR_ATTEMPT_SECONDS have passed."""
+    result = []
+    worker = threading.Thread(target=lambda: result.append(hemi_attempt()), daemon=True)
+    worker.start()
+    worker.join(PR_ATTEMPT_SECONDS + 1)
+    return result[0] if result else (None, None, None)
+
+
+def ask_hemi():
+    """("ok", copy), ("status", code) or (silent | no_grant | unreadable, None)."""
+    if not granted():
+        return "no_grant", None
+    for attempt in range(PR_ATTEMPTS):
+        if attempt:
+            time.sleep(PR_BACKOFF[min(attempt, len(PR_BACKOFF)) - 1])
+        status, raw, token = bounded_attempt()
+        if status is None or 500 <= status <= 599:
+            continue
+        if status != 200:
+            return "status", status
+        copy = read_pr_copy(raw, token)
+        return ("ok", copy) if copy is not None else ("unreadable", None)
+    return "silent", None
+
+
+def read_pr_copy(raw, token):
+    """hemi's answer to a pull request's job, checked as fetch checks the gateway's copy, or None."""
+    if raw is None or len(raw) > MAX_ANSWER:
+        return None
+    try:
+        copy = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(copy, dict):
+        return None
+    identity, flags, delivery = copy.get("identity"), copy.get("flags"), copy.get("delivery")
+    if (
+        type(copy.get("version")) is not int
+        or copy["version"] != 1
+        or not isinstance(identity, dict)
+        or not isinstance(identity.get("repositoryId"), str)
+        or not isinstance(identity.get("app"), str)
+        or not profile.APP.fullmatch(identity["app"])
+        or type(identity.get("revision")) is not int
+        or not 1 <= identity["revision"] <= chart.MAX_REVISION
+        or not isinstance(flags, dict)
+        or flags.get("source") not in SOURCES
+        or not isinstance(copy.get("runtime"), dict)
+        or not isinstance(delivery, dict)
+    ):
+        return None
+    owner = token_repository_id(token) if token else None
+    if owner is None or identity["repositoryId"] != owner:
+        return None
+    try:
+        profile.check_relative(delivery.get("valuesFile"), "contract.delivery.valuesFile")
+        if flags["source"] == "hemi":
+            profile.from_contract(copy, profile.DERIVED_VALUES)
+    except profile.ProfileError:
+        return None
+    return copy
+
+
+def repository_name():
+    name = os.environ.get("GITHUB_REPOSITORY", "")
+    return name if REPOSITORY.fullmatch(name) else "this repository"
+
+
+def pull_request(out, main, head):
+    """Decide a pull request's settings source; returns (source, revision, sentences)."""
+    clear(out)
+    profile_path = FILES_PROFILE.as_posix()
+    on_main = tree_entries(main, [profile_path], "default branch's tree")
+    paths = [profile_path]
+    if profile_path in on_main:
+        values = main_values_path(main)
+        if values is not None:
+            paths.append(values)
+    outcome, answer = ask_hemi()
+    files_on_main = profile_path in on_main
+    if outcome != "ok":
+        if files_on_main:
+            return "files", "", [PR_SENTENCES[f"{outcome}_files"].format(status=answer)]
+        app = repository_name()
+        if outcome == "status":
+            key = "refused" if answer in (401, 403) else "status"
+            raise Refusal(PR_SENTENCES[key].format(status=answer, app=app))
+        raise Refusal(PR_SENTENCES[outcome].format(app=app))
+    copy = answer
+    app, revision = copy["identity"]["app"], chart.revision_annotation(copy["identity"]["revision"])
+    paths.append(copy["delivery"]["valuesFile"])
+    on_main = tree_entries(main, paths, "default branch's tree")
+    in_head = tree_entries(head, paths, "pull request's tree")
+    if copy["flags"]["source"] == "files":
+        if files_on_main:
+            return "files", revision, [PR_SENTENCES["files"].format(revision=revision, app=app)]
+        if profile_path in in_head:
+            return "files", revision, [PR_SENTENCES["restore"].format(revision=revision, app=app)]
+        raise Refusal(PR_SENTENCES["returning"].format(app=app))
+    ordered = list(dict.fromkeys(paths))
+    added = [path for path in ordered if path in in_head and path not in on_main]
+    if added:
+        raise Refusal(" ".join(PR_SENTENCES["added_back"].format(path=path, app=app) for path in added))
+    derived = profile.from_contract(copy, profile.DERIVED_VALUES)
+    write(out, {"contract.json": copy, "profile.json": derived, "values.json": copy["runtime"]})
+    notes = [PR_SENTENCES["still_on_main"].format(path=path) for path in ordered if path in on_main and path in in_head]
+    return "hemi", revision, [PR_SENTENCES["hemi"].format(revision=revision), *notes]
+
+
 def summarize(source, revision, commit, sentence):
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -340,17 +610,61 @@ def summarize(source, revision, commit, sentence):
         pass
 
 
+def summarize_pr(source, revision, sentences):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    lines = [
+        "### wac-ci settings",
+        "",
+        "| source | revision |",
+        "| --- | --- |",
+        f"| {source or '-'} | {revision or '-'} |",
+        "",
+        *sentences,
+    ]
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="wacd-contract.py", description=__doc__.split("\n", 1)[0])
     commands = parser.add_subparsers(dest="command", required=True)
     fetch_parser = commands.add_parser("fetch", help="ask the gateway for the copy (wac-cd plan)")
     fetch_parser.add_argument("--out", required=True)
     fetch_parser.add_argument("--wait-timeout", required=True)
+    pr_parser = commands.add_parser("pr", help="ask hemi for a pull request's settings (wac-ci contract)")
+    pr_parser.add_argument("--out", required=True)
+    pr_parser.add_argument("--main", required=True, help="checkout of the default branch's head")
+    pr_parser.add_argument("--head", required=True, help="checkout of the pull request's merge commit")
     return parser
+
+
+def main_pr(args):
+    out = Path(args.out)
+    try:
+        source, revision, sentences = pull_request(out, Path(args.main), Path(args.head))
+    except Exception as error:
+        sentence = str(error) if isinstance(error, Refusal) else PR_SENTENCES["unexpected"]
+        try:
+            clear(out)
+        except OSError:
+            pass
+        summarize_pr(None, None, [sentence])
+        print("wacd contract: " + sentence, file=sys.stderr)
+        return 1
+    print(f"source={source}\nrevision={revision}")
+    summarize_pr(source, revision, sentences)
+    return 0
 
 
 def main(argv):
     args = build_parser().parse_args(argv[1:])
+    if args.command == "pr":
+        return main_pr(args)
     out = Path(args.out)
     try:
         source, revision, commit, reason = fetch(out, args.wait_timeout)
