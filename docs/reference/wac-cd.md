@@ -26,7 +26,7 @@ on:
 permissions:
   contents: read
 jobs:
-  wac-cd:
+  cd:
     uses: willfell/wac.lab.actions/.github/workflows/wac-cd.yml@vX.Y.Z
     permissions:
       contents: write
@@ -59,7 +59,10 @@ and whose `revision` input is passed as `settings_revision`; on a push both are
 empty, and a dispatch sets exactly one. hemi dispatches `revision` and reads
 the run by its name, so the `run-name` above is part of the contract: a
 settings run is named exactly `settings revision <n>`. `wac-cd` does not set
-the name; the caller does.
+the name; the caller does. So are the job names: the calling job's id is `cd`
+and it has no `name:`, and no `wac-cd` job has one, so the jobs API shows
+`cd / plan`, `cd / retag`, `cd / publish`, `cd / deploy` and the rest, which
+is what hemi reads.
 
 | Input | Meaning | Default |
 | --- | --- | --- |
@@ -195,7 +198,11 @@ seconds (35 minutes) whatever the input, while `deploy` honours the full
 `wait_timeout`: `plan` has `timeout-minutes: 40`, the cap plus five minutes
 for its other steps (GitHub expressions have no arithmetic, so it cannot be
 sized from the input), and the cap makes a long outage end in `plan`'s own
-summary line rather than the job timeout. The interval starts at 5 seconds and
+summary line rather than the job timeout. In `settings` mode the status read's
+120 seconds come out of those five minutes, leaving three for the other steps;
+`.github/scripts/test_reusable_workflows.py` holds the sum. Each step also has
+its own kill switch (one to six minutes), and those add up to more than the
+five minutes, as they did before: they stop a stalled step, not a slow run. The interval starts at 5 seconds and
 doubles up to 30, so a long outage costs about two requests a minute. Each
 request may wait the whole time left for its answer, as `deploy`'s requests
 do, because the gateway checks the caller against `main` with several GitHub
@@ -512,30 +519,56 @@ copy as for any run, and then, in `Plan the settings release`:
    line `mode: none (a newer revision is live; its own release follows)`: that
    save dispatched its own run. A copy older than the dispatched revision
    fails, since the save has not reached the fleet copy yet.
-2. Reads the running version V from the gateway's `status`
-   (`wacd-release.py running`, 503 retried for at most 240 seconds). After a
-   rollback V is the rolled-back version, never the newest tag. A running
-   version that is not `X.Y.Z` fails.
-3. Reads V's image digests and source commit C from V's chart annotations at
-   the push address, as `deploy` reads them, and fails when the copy names
-   other images than V runs (that needs a build: release code first).
+2. Reads the running version V from a steady gateway `status`
+   (`wacd-release.py running`, within 120 seconds). The status's `version` is
+   the version the gateway last pointed the Application at, which mid-sync or
+   right after a rollback dispatch is already the new target, so it counts
+   only when the same answer is Synced at its `chart_digest` and Healthy, every
+   Deployment is rolled out (observed generation, and updated, ready and
+   available replicas all equal to replicas; a Deployment listed by name only
+   is not), and every image the Deployments run is one of V's
+   `wacwini.com/images` references by repository and digest, with at least
+   one. The status lists only the Deployments' containers, so this is
+   containment, not equality. V's chart is read at the push address, and
+   `chart_digest` must be its manifest digest. An unsteady answer is read
+   again; one that never settles is refused (below). A `version` that is not
+   a bare `X.Y.Z` (an unknown digest or a lost ledger), a `chart_digest` the
+   registry does not hold, or a 403 without a reason (the app is not
+   onboarded) fails `plan` at once; a 503 (the gateway cannot read Kubernetes)
+   is retried within the bound. After a rollback V is the rolled-back version,
+   never the newest tag. C, V's source commit, and V's digests come from the
+   same chart.
+3. Fails when the copy names other images than V runs (that needs a build:
+   release code first).
 4. Takes V' as the next patch above the highest `<tag_prefix>X.Y.Z` tag merged
    into `origin/main` (`wacd-version.py --mode settings`), with the tag on C,
    which must be on `main`. The tag goes on C, not on `main`'s head, because a
    tagged head counts as released: a settings tag there would make the next
    code release resume onto old images. On C, the next merge versions above V'.
-5. Never spends a second version on one revision: when V's chart already
-   carries `settings_revision`, V' is V (a re-run after the release went
-   live; releasing it again changes nothing), and when `main`'s newest tag
-   already sits on C above V and its chart is absent or carries
-   `settings_revision`, V' is that version (a re-run, or a fresh dispatch,
-   after an earlier attempt claimed it and never went live).
-6. Compares `.github/workflows` at C with `origin/main` (below).
+5. Never spends a second version on one revision, and never undoes a
+   rollback:
+   - when V's chart already carries `settings_revision`, V' is V (a re-run
+     after the release went live; releasing it again changes nothing);
+   - when `main`'s newest tag sits on C above V and has no chart yet, V' is
+     that version (an earlier attempt claimed it and never published);
+   - when any version on `main` above V (newest first, at most 25) already
+     carries `settings_revision`, `plan` fails with `Revision <n> was released
+     as <V'old>, and <V> runs now after a rollback; save the settings again to
+     release them on the running code.` Nothing is tagged or retagged. A
+     re-run nobody dispatched must not put those settings back over a
+     deliberate rollback, and a new save gets a new revision. The same
+     sentence answers a "Re-run all jobs" of a settings run whose `deploy` was
+     refused after `publish` (V' published, never released); "Re-run failed
+     jobs" re-releases the same V' instead.
+6. Unless V' is V, compares `.github/workflows` at C with `origin/main`
+   (below). Re-proving the live version claims no new tag, so it needs no
+   check.
 
 `Plan the version` then claims V' on C with `wacd-tag.py claim-tag --commit`.
 A refused tag push in `settings` mode fails `plan`; it is never `superseded`
 and never mode `none`. The summary says `mode: settings` and
-`settings revision <n> on <V>'s code (<C short>), released as <V'>`.
+`settings revision <n> on <V>'s code (<C short>), released as <V'>`, also
+when V' is V.
 
 `build` never runs in this mode. `retag` runs in its place, and only in this
 mode: `scripts/wacd-retag.py` reads each of V's image manifests by digest from
@@ -546,36 +579,76 @@ copied. `retag` holds no `id-token`: the registry takes no credential.
 `publish` renders the chart from the copy `plan` read, as for any release from
 hemi's copy, with source commit C, both `wacwini.com/` annotations and image
 references `localhost:30500/<name>:<V'>@<digest>`, and accepts the tag on C.
-`deploy` and `github-release` run as for `release`, and the health check
-expects C.
+`deploy` (which needs `retag`) and `github-release` run as for `release`, and
+the health check expects C.
 
-**The workflow refusal is its own step.** GitHub refuses a `GITHUB_TOKEN` tag
-push at a commit whose `.github/workflows` differ from the default branch's
-(**Why the tag comes first** below), and C is usually behind `main`. So when
-`git diff --quiet <C> origin/main -- .github/workflows` reports a difference,
-`Plan the settings release` records the refusal and succeeds, and the next
-step, named exactly `Refuse a settings release behind a workflow change`,
-writes `Release code first: <app>'s workflow files changed since <V>, so its
-settings cannot be released on <C short>.` to stderr, an annotation and the
-run summary, and exits 1, before any tag is claimed. It runs only in
-`settings` mode and only then, and is skipped in every other run. It sits
-beside `Refuse to replay an old version`; hemi reads both by job `cd / plan`,
-step name and conclusion. Do not rename either.
+**The refusals are their own steps.** Each is the C3 pattern: `Plan the
+settings release` records the refusal as a step output and succeeds, setting
+no mode, version or tag, and the named step writes the sentence to stderr, an
+`::error::wac-cd:` annotation and the run summary, and exits 1, before
+anything is tagged or retagged. Both run only in `settings` mode and only
+then, and are skipped in every other run. They sit beside `Refuse to replay an
+old version`; hemi reads all three by job `cd / plan`, step name and
+conclusion. Do not rename any of them.
+
+- `Refuse a settings release while the app is rolling out`: the status never
+  became steady within 120 seconds. The sentence names V and says no settings
+  were released; dispatch again once the app settles.
+- `Refuse a settings release behind a workflow change`: GitHub refuses a
+  `GITHUB_TOKEN` tag push at a commit whose `.github/workflows` differ from the
+  default branch's (**Why the tag comes first** below), and C is usually
+  behind `main`. When `git diff --quiet <C> origin/main -- .github/workflows`
+  reports a difference, the step writes `Release code first: <app>'s workflow
+  files changed since <V>, so its settings cannot be released on <C short>.`
+
+Every other failure in planning (a fault in the status, a copy that cannot be
+released on its own, an earlier release of the revision, a refused tag claim)
+fails `Plan the settings release` or `Plan the version` itself.
 
 **How hemi reads the outcome.** A settings run released if and only if its
-`cd / retag` and `cd / deploy` jobs concluded `success`. A run that ended as
-mode `none` is green with `retag` skipped. The run summary says
-`mode: settings` or `mode: none (<reason>)`.
+`cd / retag` and `cd / deploy` jobs concluded `success`. The run summary says
+`mode: settings` or `mode: none (<reason>)`. A green run that released
+nothing means exactly one thing, superseded. `wac-cd` never undoes the
+gateway's patch: after `Release through the gateway` succeeds the Application
+points at V' whatever happens next.
+
+| Outcome | Run conclusion | Decided by | Tagged | Retagged | Cluster patched |
+| --- | --- | --- | --- | --- | --- |
+| Superseded | `success` | `cd / plan` `success`, and `cd / shadow`, `cd / retag`, `cd / publish`, `cd / deploy` and `cd / github-release` all `skipped`; summary `mode: none (a newer revision is live; its own release follows)` | no | no | no |
+| Behind a workflow change | `failure` | `cd / plan`, step `Refuse a settings release behind a workflow change` `failure` | no | no | no |
+| Mid-rollout | `failure` | `cd / plan`, step `Refuse a settings release while the app is rolling out` `failure` | no | no | no |
+| Already released, then rolled back | `failure` | `cd / plan`, step `Plan the settings release` `failure`, sentence `Revision <n> was released as <V'old>, and <V> runs now after a rollback; save the settings again to release them on the running code.` | no | no | no |
+| Failed before deploying | `failure` | `cd / plan`, `cd / retag` or `cd / publish` `failure` with `cd / deploy` `skipped`; or `cd / deploy` `failure` at step `Release through the gateway` | if `cd / plan` succeeded | if `cd / retag` succeeded | no, when the gateway refused the release or never accepted it (see the note below) |
+| Failed after deploying | `failure` | `cd / deploy` step `Release through the gateway` `success`, then step `Prove the served build` `failure` | yes | yes | yes, and it stays |
+| Cancelled | `cancelled` | the run's conclusion; `cd / deploy` `success` or its step `Release through the gateway` `success` says the patch landed | if `cd / plan` succeeded | if `cd / retag` succeeded | only if `Release through the gateway` succeeded |
+| Released | `success` | `cd / retag` `success` and `cd / deploy` `success` | yes | yes | yes |
+
+`Release through the gateway` asks for the release and then waits, within
+`wait_timeout`, for the gateway's proof that it rolled out. A refused release
+(403), a refused downgrade or a gateway unavailable for the whole wait patches
+nothing. If the gateway accepted the release and the proof did not arrive in
+time, the step fails too, although the Application was already pointed at V'.
+That failure reads `release evidence deadline exceeded`, the same line as a
+gateway unavailable for the whole wait, so neither the step's conclusion nor
+its line tells the two apart; the gateway's `status` does.
 
 **Re-runs and rollbacks.** "Re-run failed jobs" reuses `plan`, so it releases
 the same V'; the retag PUTs the same bytes again and `publish` finds its chart.
-"Re-run all jobs" plans again and lands on the same V' by rule 5. A settings
-release after a rollback ships the rolled-back version's digests on its code,
-above every published version. A re-run of C's own code-release run then sees
-V' on its HEAD: while V' is the newest it resumes V', a harmless re-release of
-the current settings; once anything newer exists, **No replay of an old
-version** refuses it. When C was `main`'s head, HEAD carries both V and V',
-and counts by V'.
+"Re-run all jobs" plans again and lands on the same V' by rule 5, or refuses
+by it after a rollback. A settings release after a rollback ships the
+rolled-back version's digests on its code, above every published version. A
+re-run of C's own code-release run then sees V' on its HEAD: while V' is the
+newest it resumes V', a harmless re-release of the current settings; once
+anything newer exists, **No replay of an old version** refuses it. When C was
+`main`'s head, HEAD carries both V and V', and counts by V'.
+
+**The next code release may over-bump.** After a settings tag V' on a
+rolled-back commit C1, the next merge counts its commits from V', the highest
+tag it contains, so the range reaches back over commits that the newer
+version already released. A `feat` already shipped there bumps the minor
+version again. The invariant holds: the next merge always releases above V'.
+Only the size of the step can be larger than the commits since the last
+release call for.
 
 ## Where releases live
 

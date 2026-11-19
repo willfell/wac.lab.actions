@@ -269,12 +269,20 @@ jobs:
           if (( COPY_REVISION < SETTINGS_REVISION )); then
             fail "hemi's copy is at revision $COPY_REVISION, older than the dispatched revision $SETTINGS_REVISION; re-run once the save has reached the fleet copy."
           fi
-          call line wacd-release.py running --wait-timeout 240
-          running="${line#running=}"
-          call line wacd-chart.py chart-revision --registry "$registry" --app "$APP" --version "$running"
-          commit="${line#revision=}"
-          call line wacd-chart.py chart-images --registry "$registry" --app "$APP" --version "$running"
-          images="${line#images=}"
+          code=0
+          status="$(python3 "$WACD_SCRIPTS"/wacd-release.py running --app "$APP" --wait-timeout 120 \
+            2> "$RUNNER_TEMP/settings.err")" || code=$?
+          if [[ "$code" -eq 3 ]]; then
+            reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
+            printf 'rollout_refused=%s\n' "$reason" >> "$GITHUB_OUTPUT"
+            echo "wac-cd: settings release refused while the app rolls out; the next step reports it"
+            exit 0
+          elif [[ "$code" -ne 0 ]]; then
+            fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/ *$//')"
+          fi
+          running="$(sed -n 's/^running=//p' <<< "$status")"
+          commit="$(sed -n 's/^commit=//p' <<< "$status")"
+          images="$(sed -n 's/^images=//p' <<< "$status")"
           if ! python3 -c 'import json, sys
           running = sorted(json.loads(sys.argv[1]))
           wanted = sorted(image["name"] for image in json.loads(sys.argv[2]))
@@ -284,27 +292,35 @@ jobs:
           call planned wacd-version.py --mode settings --prefix "$TAG_PREFIX" --commit "$commit" --running "$running"
           version="$(sed -n 's/^version=//p' <<< "$planned")"
           claimed="$(sed -n 's/^claimed=//p' <<< "$planned")"
+          above="$(sed -n 's/^above=//p' <<< "$planned")"
           call line wacd-chart.py chart-copy-revision --registry "$registry" --app "$APP" --version "$running"
           if [[ "${line#copy_revision=}" == "$SETTINGS_REVISION" ]]; then
             version="$running"
-            summary="settings revision $SETTINGS_REVISION is already released as $running on its code (${commit:0:12}); releasing it again changes nothing"
           else
-            if [[ -n "$claimed" ]]; then
-              call line wacd-chart.py chart-copy-revision --registry "$registry" --app "$APP" --version "$claimed"
-              case "${line#copy_revision=}" in
-                absent|"$SETTINGS_REVISION") version="$claimed" ;;
-              esac
-            fi
-            summary="settings revision $SETTINGS_REVISION on $running's code (${commit:0:12}), released as $version"
+            reuse=""
+            IFS=, read -r -a newer <<< "$above"
+            for earlier in ${newer[@]+"${newer[@]:0:25}"}; do
+              call line wacd-chart.py chart-copy-revision --registry "$registry" --app "$APP" --version "$earlier"
+              shipped="${line#copy_revision=}"
+              if [[ "$earlier" == "$claimed" && "$shipped" == absent ]]; then
+                reuse="$claimed"
+              elif [[ "$shipped" == "$SETTINGS_REVISION" ]]; then
+                fail "Revision $SETTINGS_REVISION was released as $earlier, and $running runs now after a rollback; save the settings again to release them on the running code."
+              fi
+            done
+            version="${reuse:-$version}"
           fi
-          code=0
-          git diff --quiet "$commit" origin/main -- .github/workflows || code=$?
-          if [[ "$code" -eq 1 ]]; then
-            printf 'workflow_refused=%s\n' "Release code first: $APP's workflow files changed since $running, so its settings cannot be released on ${commit:0:12}." >> "$GITHUB_OUTPUT"
-            echo "wac-cd: settings release refused; the next step reports it"
-            exit 0
-          elif [[ "$code" -ne 0 ]]; then
-            fail "could not compare $commit's workflow files with origin/main"
+          summary="settings revision $SETTINGS_REVISION on $running's code (${commit:0:12}), released as $version"
+          if [[ "$version" != "$running" ]]; then
+            code=0
+            git diff --quiet "$commit" origin/main -- .github/workflows || code=$?
+            if [[ "$code" -eq 1 ]]; then
+              printf 'workflow_refused=%s\n' "Release code first: $APP's workflow files changed since $running, so its settings cannot be released on ${commit:0:12}." >> "$GITHUB_OUTPUT"
+              echo "wac-cd: settings release refused; the next step reports it"
+              exit 0
+            elif [[ "$code" -ne 0 ]]; then
+              fail "could not compare $commit's workflow files with origin/main"
+            fi
           fi
           {
             echo "mode=settings"
@@ -314,6 +330,21 @@ jobs:
             echo "images=$images"
             echo "summary=$summary"
           } | tee -a "$GITHUB_OUTPUT"
+      - name: Refuse a settings release while the app is rolling out
+        timeout-minutes: 1
+        if: ${{ steps.settings.outputs.rollout_refused != '' }}
+        shell: bash
+        env:
+          REASON: ${{ steps.settings.outputs.rollout_refused }}
+        run: |
+          echo "wac-cd: $REASON" >&2
+          echo "::error::wac-cd: $REASON"
+          {
+            echo "### wac-cd plan"
+            echo
+            echo "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - name: Refuse a settings release behind a workflow change
         timeout-minutes: 1
         if: ${{ steps.settings.outputs.workflow_refused != '' }}
@@ -827,7 +858,7 @@ jobs:
           python3 "$WACD_SCRIPTS"/wacd-tag.py push-tag --tag "$TAG" --sha "$source_sha"
 
   deploy:
-    needs: [plan, build, publish]
+    needs: [plan, build, retag, publish]
     if: >-
       !cancelled() && !failure() && (
       needs.plan.outputs.mode == 'release' ||

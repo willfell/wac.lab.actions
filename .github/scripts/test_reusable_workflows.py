@@ -980,16 +980,23 @@ class ReusableWorkflowTests(unittest.TestCase):
         names = [s.get("name") or s.get("uses") for s in steps]
         settings = steps[names.index("Plan the settings release")]
         refusal = steps[names.index("Refuse a settings release behind a workflow change")]
+        rollout = steps[names.index("Refuse a settings release while the app is rolling out")]
         self.assertEqual(settings["id"], "settings")
         self.assertEqual(settings["if"], "inputs.settings_revision != ''")
         self.assertEqual(refusal["if"], "${{ steps.settings.outputs.workflow_refused != '' }}")
         self.assertEqual(refusal["env"], {"REASON": "${{ steps.settings.outputs.workflow_refused }}"})
+        self.assertEqual(rollout["if"], "${{ steps.settings.outputs.rollout_refused != '' }}")
+        self.assertEqual(rollout["env"], {"REASON": "${{ steps.settings.outputs.rollout_refused }}"})
         self.assertEqual(
             names.index("Read the wacd profile") + 1, names.index("Plan the settings release"),
             "the settings plan reads the copy's profile",
         )
         self.assertEqual(
-            names.index("Plan the settings release") + 1, names.index("Refuse a settings release behind a workflow change")
+            names.index("Plan the settings release") + 1, names.index("Refuse a settings release while the app is rolling out")
+        )
+        self.assertEqual(
+            names.index("Refuse a settings release while the app is rolling out") + 1,
+            names.index("Refuse a settings release behind a workflow change"),
         )
         self.assertEqual(
             names.index("Refuse a settings release behind a workflow change") + 1, names.index("Plan the version"),
@@ -1005,7 +1012,7 @@ class ReusableWorkflowTests(unittest.TestCase):
 
     def settings_plan(self, *, running="1.4.2", copy_revision="7", revision="7", source="hemi", charts=None,
                       workflow_change=False, rollback=False, extra_tags=(), claim="pushed", profile_images=None,
-                      running_copy="6"):
+                      running_copy="6", status_exit=0):
         """Run plan's settings steps against a temp repo, real wacd-version.py and stub gateway and registry reads."""
         import os
         import shutil
@@ -1016,6 +1023,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         by_name = {s.get("name"): s for s in steps}
         settings_step = by_name["Plan the settings release"]
         refusal_step = by_name["Refuse a settings release behind a workflow change"]
+        rollout_step = by_name["Refuse a settings release while the app is rolling out"]
         version_step = by_name["Plan the version"]
 
         def git(repo, *args):
@@ -1051,14 +1059,24 @@ class ReusableWorkflowTests(unittest.TestCase):
         head = git(repo, "rev-parse", "HEAD")
         git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
         source_commit = old if rollback else code
-        images = {"web": {"repository": "localhost:30500/web", "tag": running, "digest": "sha256:" + "e" * 64}}
+        images = {"web": {"repository": "localhost:30500/web", "tag": running,
+                          "digest": "sha256:" + ("d" if rollback else "e") * 64}}
         charts = {**(charts or {}), running: {"revision": source_commit, "images": images, "copy": running_copy}}
         log = tmp / "log"
         log.write_text("")
         (scripts / "wacd-release.py").write_text(
-            "import os, sys\n"
+            "import json, os, sys\n"
             "open(os.environ['STUB_LOG'], 'a').write('wacd-release.py ' + ' '.join(sys.argv[1:]) + '\\n')\n"
-            "print('running=' + os.environ['STUB_RUNNING'])\n"
+            "code = int(os.environ['STUB_STATUS_EXIT'])\n"
+            "if code == 3:\n"
+            "    sys.exit(print('wacd release: app was rolling out 1.4.2 for the whole 120 seconds', file=sys.stderr) or 3)\n"
+            "if code:\n"
+            "    sys.exit(print('wacd release: the gateway reports an unknown version', file=sys.stderr) or 1)\n"
+            "running = os.environ['STUB_RUNNING']\n"
+            "chart = json.loads(os.environ['STUB_CHARTS'])[running]\n"
+            "print('running=' + running)\n"
+            "print('commit=' + chart['revision'])\n"
+            "print('images=' + json.dumps(chart['images'], separators=(',', ':'), sort_keys=True))\n"
         )
         (scripts / "wacd-chart.py").write_text(
             "import json, os, sys\n"
@@ -1090,7 +1108,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_SHA": head, "SETTINGS_REVISION": revision,
                "SOURCE": source, "COPY_REVISION": copy_revision, "APP": "app", "TAG_PREFIX": "v",
                "PROFILE_IMAGES": json.dumps(profile), "STUB_LOG": str(log), "STUB_RUNNING": running,
-               "STUB_CHARTS": json.dumps(charts), "STUB_CLAIM": claim}
+               "STUB_CHARTS": json.dumps(charts), "STUB_CLAIM": claim, "STUB_STATUS_EXIT": str(status_exit)}
         self.assertEqual(set(settings_step["env"]), {"SETTINGS_REVISION", "SOURCE", "COPY_REVISION", "APP",
                                                      "TAG_PREFIX", "PROFILE_IMAGES"})
 
@@ -1103,6 +1121,12 @@ class ReusableWorkflowTests(unittest.TestCase):
         if result.returncode != 0:
             return plan
         settings_outputs = outputs()
+        if settings_outputs.get("rollout_refused"):
+            plan["refusal"] = subprocess.run(
+                ["bash", "-c", rollout_step["run"]], env={**env, "REASON": settings_outputs["rollout_refused"]},
+                capture_output=True, text=True,
+            )
+            return plan
         if settings_outputs.get("workflow_refused"):
             plan["refusal"] = subprocess.run(
                 ["bash", "-c", refusal_step["run"]], env={**env, "REASON": settings_outputs["workflow_refused"]},
@@ -1132,7 +1156,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(plan["settings_outputs"]["images"])["web"]["digest"], "sha256:" + "e" * 64)
         calls = plan["log"].read_text().splitlines()
-        self.assertEqual(calls[0], "wacd-release.py running --wait-timeout 240", "the running version comes from the gateway")
+        self.assertEqual(calls[0], "wacd-release.py running --app app --wait-timeout 120",
+                         "the running version comes from a steady gateway status")
         self.assertIn(f"wacd-tag.py claim-tag --tag v1.4.3 --commit {code}", calls)
         summary = plan["summary"].read_text()
         self.assertIn("mode: settings", summary)
@@ -1145,8 +1170,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         outputs = plan["version_outputs"]
         self.assertEqual((outputs["mode"], outputs["version"], outputs["expected_sha"]), ("settings", "1.4.3", old))
         self.assertIn(f"wacd-tag.py claim-tag --tag v1.4.3 --commit {old}", plan["log"].read_text())
-        self.assertIn("wacd-chart.py chart-images --registry registry.network.svc.cluster.local:5000 --app app --version 1.3.9",
-                      plan["log"].read_text())
+        self.assertEqual(json.loads(plan["settings_outputs"]["images"])["web"]["digest"], "sha256:" + "d" * 64,
+                         "the rolled-back version's digests, not the newest tag's")
         self.assertIn(f"settings revision 7 on 1.3.9's code ({old[:12]}), released as 1.4.3", plan["summary"].read_text())
 
     def test_wac_cd_settings_release_ends_as_none_when_a_newer_revision_is_live(self):
@@ -1189,14 +1214,57 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(live["settings"].returncode, 0, live["settings"].stdout + live["settings"].stderr)
         self.assertEqual(live["version"].returncode, 0, live["version"].stdout + live["version"].stderr)
         self.assertEqual(live["version_outputs"]["version"], "1.4.3", "already live: the same version again")
-        self.assertIn("already released as 1.4.3", live["summary"].read_text())
-        for copy, expected in (("absent", "1.4.3"), ("7", "1.4.3"), ("6", "1.4.4"), ("none", "1.4.4")):
+        self.assertIn(f"settings revision 7 on 1.4.3's code ({live['code'][:12]}), released as 1.4.3",
+                      live["summary"].read_text())
+        for copy, expected in (("absent", "1.4.3"), ("6", "1.4.4"), ("none", "1.4.4")):
             with self.subTest(claimed_chart=copy):
                 charts = {} if copy == "absent" else {"1.4.3": {"revision": None, "images": None, "copy": copy}}
                 plan = self.settings_plan(extra_tags=(("v1.4.3", "code"),), charts=charts)
                 self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
                 self.assertEqual(plan["version_outputs"]["version"], expected)
                 self.assertEqual(plan["version_outputs"]["expected_sha"], plan["code"])
+
+    def test_wac_cd_settings_rerun_after_a_rollback_refuses_instead_of_undoing_it(self):
+        sentence = ("Revision 7 was released as {v}, and {running} runs now after a rollback; "
+                    "save the settings again to release them on the running code.")
+        for label, kw, earlier, running in (
+            ("rolled back to other code", {"running": "1.3.9", "rollback": True,
+                                           "extra_tags": (("v1.4.3", "code"),)}, "1.4.3", "1.3.9"),
+            ("rolled back on the same code", {"extra_tags": (("v1.4.3", "code"),)}, "1.4.3", "1.4.2"),
+            ("a later code release shipped it", {"running": "1.3.9", "rollback": True,
+                                                 "extra_tags": (("v1.4.3", "code"), ("v1.4.4", "code"))}, "1.4.4", "1.3.9"),
+        ):
+            with self.subTest(case=label):
+                kw["charts"] = {tag.removeprefix("v"): {"revision": None, "images": None, "copy": "7"}
+                                for tag, _ in kw["extra_tags"]}
+                plan = self.settings_plan(**kw)
+                self.assertEqual(plan["settings"].returncode, 1, plan["settings"].stdout)
+                expected = sentence.format(v=earlier, running=running)
+                self.assertIn(f"::error::wac-cd: {expected}", plan["settings"].stdout)
+                self.assertIn(expected, plan["summary"].read_text())
+                self.assertNotIn("wacd-tag.py", plan["log"].read_text(), "nothing tagged or retagged")
+
+    def test_wac_cd_settings_release_while_the_app_rolls_out_is_refused_by_its_own_step(self):
+        plan = self.settings_plan(status_exit=3)
+        self.assertEqual(plan["settings"].returncode, 0, "the planning step records the refusal and succeeds")
+        self.assertEqual(set(plan["settings_outputs"]), {"rollout_refused"}, "no mode, version or tag is left")
+        refusal = plan["refusal"]
+        self.assertEqual(refusal.returncode, 1)
+        self.assertIn("::error::wac-cd: app was rolling out 1.4.2 for the whole 120 seconds", refusal.stdout)
+        self.assertIn("app was rolling out 1.4.2", plan["summary"].read_text())
+        self.assertNotIn("wacd-tag.py", plan["log"].read_text())
+        fault = self.settings_plan(status_exit=1)
+        self.assertEqual(fault["settings"].returncode, 1, "an unknown running version is a fault, not a rollout")
+        self.assertIn("::error::wac-cd: wacd release: the gateway reports an unknown version", fault["settings"].stdout)
+        self.assertEqual(fault["settings_outputs"], {})
+
+    def test_wac_cd_settings_rerun_of_the_live_version_needs_no_workflow_check(self):
+        plan = self.settings_plan(running="1.4.3", running_copy="7", extra_tags=(("v1.4.3", "code"),),
+                                  workflow_change=True)
+        self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stderr)
+        self.assertNotIn("workflow_refused", plan["settings_outputs"])
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stderr)
+        self.assertEqual(plan["version_outputs"]["version"], "1.4.3")
 
     def test_wac_cd_settings_release_fails_on_any_tag_claim_but_pushed_or_exists(self):
         plan = self.settings_plan(claim="exists")
@@ -1222,6 +1290,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(runs[0]["env"], {"SOURCE_IMAGES": "${{ needs.plan.outputs.source_images }}",
                                           "VERSION": "${{ needs.plan.outputs.version }}"})
         self.assertEqual(retag["outputs"], {"images": "${{ steps.retag.outputs.images }}"})
+        self.assertEqual(jobs["deploy"]["needs"], ["plan", "build", "retag", "publish"])
         publish = jobs["publish"]
         self.assertEqual(publish["needs"], ["plan", "build", "retag"])
         self.assertEqual(
@@ -1289,6 +1358,72 @@ class ReusableWorkflowTests(unittest.TestCase):
                         f"push-tag --tag v1.4.3 --sha {source_sha}",
                     ],
                 )
+
+    def runs(self, job, mode, source="hemi", deploy_result="success"):
+        """Whether a job's if: lets it run in a plan of this mode, with every earlier job succeeded."""
+        condition = str(job.get("if", "true"))
+        python = (
+            condition.replace("${{", "").replace("}}", "")
+            .replace("!cancelled()", "True").replace("!failure()", "True")
+            .replace("needs.plan.outputs.mode", repr(mode)).replace("needs.plan.outputs.source", repr(source))
+            .replace("needs.deploy.result", repr(deploy_result))
+            .replace("&&", " and ").replace("||", " or ")
+        )
+        self.assertNotRegex(python, r"needs\.|steps\.|inputs\.|\(\)", f"the test cannot read {condition!r}")
+        return eval(python)
+
+    def test_wac_cd_jobs_that_run_in_each_mode(self):
+        """The outcome markers hemi reads: which jobs a settings run, a superseded run and a release run."""
+        jobs = self.wac_cd()["jobs"]
+        names = ("shadow", "build", "retag", "publish", "deploy", "github-release")
+        expected = {
+            ("settings", "hemi"): {"retag", "publish", "deploy", "github-release"},
+            ("none", "hemi"): set(),
+            ("release", "files"): {"shadow", "build", "publish", "deploy", "github-release"},
+            ("release", "hemi"): {"build", "publish", "deploy", "github-release"},
+            ("publish", "files"): {"shadow", "build", "publish"},
+            ("resume", "files"): {"shadow", "deploy", "github-release"},
+            ("rollback", "files"): {"shadow", "deploy", "github-release"},
+        }
+        for (mode, source), running in expected.items():
+            with self.subTest(mode=mode, source=source):
+                self.assertEqual({n for n in names if self.runs(jobs[n], mode, source)}, running)
+        self.assertFalse(self.runs(jobs["github-release"], "settings", deploy_result="failure"))
+
+    def test_wac_cd_names_hemi_reads_are_the_job_ids_and_these_steps(self):
+        """Hemi reads cd / plan, cd / retag, cd / publish, cd / deploy and two deploy steps by display name."""
+        jobs = self.wac_cd()["jobs"]
+        for name in ("plan", "shadow", "retag", "publish", "deploy", "github-release"):
+            with self.subTest(job=name):
+                self.assertNotIn("name", jobs[name], "a name: key would change the display name hemi reads")
+        steps = [s.get("name") for s in jobs["deploy"]["steps"]]
+        release, prove = steps.index("Release through the gateway"), steps.index("Prove the served build")
+        self.assertLess(release, prove)
+        self.assertIn("wacd-release.py release", jobs["deploy"]["steps"][release]["run"])
+        self.assertIn("wacd-release.py health", jobs["deploy"]["steps"][prove]["run"])
+        for step in jobs["deploy"]["steps"][release + 1:]:
+            with self.subTest(after=step.get("name")):
+                self.assertNotIn("wacd-release.py release", step.get("run", ""), "only one step patches the cluster")
+        plan = [s.get("name") for s in jobs["plan"]["steps"]]
+        for name in ("Refuse a settings release behind a workflow change",
+                     "Refuse a settings release while the app is rolling out", "Refuse to replay an old version"):
+            self.assertIn(name, plan)
+
+    def test_wac_cd_the_status_read_comes_out_of_plan_s_budget(self):
+        """The contract's capped wait, the status read's wait and the other steps' allowance fit plan's bound."""
+        doc = self.wac_cd()
+        plan = doc["jobs"]["plan"]
+        settings = next(s for s in plan["steps"] if s.get("name") == "Plan the settings release")
+        status = int(re.search(r"wacd-release\.py running --app \"\$APP\" --wait-timeout (\d+)", settings["run"]).group(1))
+        spec = importlib.util.spec_from_file_location(
+            "wacd_contract_budget", Path(__file__).resolve().parents[2] / "scripts" / "wacd-contract.py"
+        )
+        contract = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(contract)
+        other_steps = 180
+        self.assertEqual(contract.PLAN_WAIT_CAP + status + other_steps, plan["timeout-minutes"] * 60,
+                         "docs/reference/wac-cd.md states this budget")
+        self.assertLess(status + 60, settings["timeout-minutes"] * 60, "the step's own bound leaves time for its registry reads")
 
     def test_wac_ci_setup_go_takes_the_version_or_the_version_file_from_the_profile(self):
         import yaml
