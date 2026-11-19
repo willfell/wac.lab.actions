@@ -10,9 +10,12 @@ file listed here was read from its repository's default branch; code-search
 results and open PRs were not used as evidence. The table records merged
 default-branch pins; an open bump PR does not change a row.
 
-`wac.app.travel`, `wac.app.finance`, `wac`, `wac.app.wealth`, `mcp.argo` and
-`baton` deploy through the `wac-ci` and `wac-cd` reusable workflows at
-`v1.27.0`. Their own `lab-gitops-deploy` and `lab-build` usages are gone, and
+`wac.app.travel`, `wac.app.finance`, `wac`, `wac.app.wealth`, `wac.hemi`,
+`mcp.argo` and `baton` deploy through the `wac-ci` and `wac-cd` reusable
+workflows. On 2026-11-19 UTC the first five were re-read at `v1.33.0`, each
+passing `build_runner` and no `runner`, `mcp.argo` at `v1.32.0` (it keeps
+`runner`, because its `CI_RUNNER_SMALL` is a hosted label), and `baton`, shut
+down, stays at `v1.27.0`. Their own `lab-gitops-deploy` and `lab-build` usages are gone, and
 baton's `deploy.yml` was deleted at its cutover, so none of them has such rows;
 `baton` keeps `lab-kubeconform`, `actionlint`, `agents-md` and `techdocs` in
 `ci.yml` at `v1.27.0`. The other wacwini repositories were bumped to `v1.28.0`
@@ -93,17 +96,19 @@ wacwini/wac.lab `.github/workflows/warehouse-image.yml` and
 | `techdocs` | wacwini/wac.lab.remote | `.github/workflows/ci.yml` | `v1.28.0` |
 | `techdocs` | wacwini/wac.plugins | `.github/workflows/ci.yml` | `v1.28.0` |
 | `wac-cd` | wacwini/baton | `.github/workflows/cd.yml` | `v1.27.0` |
-| `wac-cd` | wacwini/mcp.argo | `.github/workflows/cd.yml` | `v1.31.0` |
-| `wac-cd` | wacwini/wac | `.github/workflows/cd.yml` | `v1.27.0` |
-| `wac-cd` | wacwini/wac.app.finance | `.github/workflows/cd.yml` | `v1.27.0` |
-| `wac-cd` | wacwini/wac.app.travel | `.github/workflows/cd.yml` | `v1.27.0` |
-| `wac-cd` | wacwini/wac.app.wealth | `.github/workflows/cd.yml` | `v1.27.0` |
+| `wac-cd` | wacwini/mcp.argo | `.github/workflows/cd.yml` | `v1.32.0` |
+| `wac-cd` | wacwini/wac | `.github/workflows/cd.yml` | `v1.33.0` |
+| `wac-cd` | wacwini/wac.app.finance | `.github/workflows/cd.yml` | `v1.33.0` |
+| `wac-cd` | wacwini/wac.app.travel | `.github/workflows/cd.yml` | `v1.33.0` |
+| `wac-cd` | wacwini/wac.app.wealth | `.github/workflows/cd.yml` | `v1.33.0` |
+| `wac-cd` | wacwini/wac.hemi | `.github/workflows/cd.yml` | `v1.33.0` |
 | `wac-ci` | wacwini/baton | `.github/workflows/ci.yml` | `v1.27.0` |
-| `wac-ci` | wacwini/mcp.argo | `.github/workflows/ci.yml` | `v1.31.0` |
-| `wac-ci` | wacwini/wac | `.github/workflows/ci.yml` | `v1.27.0` |
-| `wac-ci` | wacwini/wac.app.finance | `.github/workflows/ci.yml` | `v1.27.0` |
-| `wac-ci` | wacwini/wac.app.travel | `.github/workflows/ci.yml` | `v1.27.0` |
-| `wac-ci` | wacwini/wac.app.wealth | `.github/workflows/ci.yml` | `v1.27.0` |
+| `wac-ci` | wacwini/mcp.argo | `.github/workflows/ci.yml` | `v1.32.0` |
+| `wac-ci` | wacwini/wac | `.github/workflows/ci.yml` | `v1.33.0` |
+| `wac-ci` | wacwini/wac.app.finance | `.github/workflows/ci.yml` | `v1.33.0` |
+| `wac-ci` | wacwini/wac.app.travel | `.github/workflows/ci.yml` | `v1.33.0` |
+| `wac-ci` | wacwini/wac.app.wealth | `.github/workflows/ci.yml` | `v1.33.0` |
+| `wac-ci` | wacwini/wac.hemi | `.github/workflows/ci.yml` | `v1.33.0` |
 
 ## Consumers that are not maintained here
 
