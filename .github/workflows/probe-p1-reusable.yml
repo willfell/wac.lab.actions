@@ -1,0 +1,31 @@
+name: probe-p1-reusable
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  claims:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+      - name: Print the pull-request job token's claims, never the token
+        env:
+          CTX_SHA: ${{ github.sha }}
+          CTX_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CTX_JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: python3 scripts/probe/p1-claims.py

@@ -1,0 +1,24 @@
+name: probe-p1
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/probe-p1.yml
+      - .github/workflows/probe-p1-reusable.yml
+      - scripts/probe/p1-claims.py
+
+permissions:
+  contents: read
+
+jobs:
+  local-path:
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/probe-p1-reusable.yml
+
+  pinned-ref:
+    permissions:
+      contents: read
+      id-token: write
+    uses: willfell/wac.lab.actions/.github/workflows/probe-p1-reusable.yml@probe/p1-pr-token
