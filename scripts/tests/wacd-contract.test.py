@@ -649,6 +649,11 @@ FILES = {
 }
 REPOSITORY = "wacwini/wac.app.travel"
 NO_ANSWER = "hemi did not answer; re-run when it does."
+NEW_OR_CUT_OVER = (f"if {REPOSITORY} is new, register it with lab first and re-run; if it is cut over, its "
+                   "settings live in hemi and the checks cannot run until hemi admits this run.")
+NOT_REGISTERED = (f"hemi does not know {REPOSITORY}: it is not registered with lab, or hemi holds no active copy "
+                  "of its settings. If it is new, register it (lab:lab-onboard-app), wait for hemi to list it, "
+                  "then re-run the checks.")
 
 
 class Hemi:
@@ -998,13 +1003,13 @@ class PullRequestDecisionTests(PullRequestCase):
         for label, response, sentence in (
             ("503", (503, {}), f"hemi did not answer, {removes}; re-run when hemi answers."),
             ("no answer", "drop", f"hemi did not answer, {removes}; re-run when hemi answers."),
-            ("401", (401, {}), f"hemi refused the job token (HTTP 401), {removes}; if this app is new, register it "
-                               "with lab first."),
-            ("403", (403, {}), f"hemi refused the job token (HTTP 403), {removes}; if this app is new, register it "
-                               "with lab first."),
-            ("404", (404, {}), f"hemi answered HTTP 404, {removes}; re-run when hemi answers."),
-            ("unreadable", (200, BODY_MARKER.encode()), f"hemi's answer could not be read, {removes}; re-run when "
-                                                         "hemi answers."),
+            ("401", (401, {}), f"hemi refused this pull request's token (HTTP 401), {removes}; if {REPOSITORY} "
+                               "is new, register it with lab first and re-run."),
+            ("403", (403, {}), f"hemi refused this pull request's token (HTTP 403), {removes}; if {REPOSITORY} "
+                               "is new, register it with lab first and re-run."),
+            ("404", (404, {}), f"hemi answered HTTP 404, {removes}; re-run once hemi serves this repository."),
+            ("unreadable", (200, BODY_MARKER.encode()), f"hemi's answer could not be read, {removes}; re-run once "
+                                                         "hemi serves this repository."),
         ):
             for head_label, head in (("both", {}), ("the values file", {PROFILE: FILES[PROFILE]}),
                                      ("the profile", {VALUES: FILES[VALUES]})):
@@ -1040,10 +1045,41 @@ class PullRequestDecisionTests(PullRequestCase):
                 with self.subTest(status=status, head=head_label):
                     self.summary.unlink(missing_ok=True)
                     code = self.run_pr((status, {"error": BODY_MARKER}), main={}, head=head)
-                    self.assertFails(code, f"hemi refused this pull request's token (HTTP {status}); "
-                                           f"{REPOSITORY}'s settings live in hemi, so the checks cannot run; "
-                                           "if this app is new, register it with lab first.")
+                    self.assertFails(code, f"hemi refused this pull request's token (HTTP {status}): "
+                                           + NEW_OR_CUT_OVER)
                     self.assertEqual(len(self.hemi.seen), 1, "a refusal is not asked again")
+
+    def test_hemis_not_registered_refusal_says_hemi_does_not_know_the_app(self):
+        """hemi answers {"error":"not registered"} for an unregistered app and for one with no active copy."""
+        for event in ("pull_request", "push"):
+            for head_label, head in (("absent", {}), ("both added", FILES)):
+                with self.subTest(event=event, head=head_label):
+                    self.event = event
+                    self.summary.unlink(missing_ok=True)
+                    self.assertFails(self.run_pr((403, {"error": "not registered"}), main={}, head=head),
+                                     NOT_REGISTERED)
+                    self.assertEqual(len(self.hemi.seen), 1, "a refusal is not asked again")
+
+    def test_any_other_403_body_reads_as_an_uncoded_refusal(self):
+        """The body is parsed defensively and bounded: anything but hemi's exact code is the generic sentence."""
+        oversized = json.dumps({"error": "not registered", "pad": "x" * contract.MAX_REFUSAL_BODY}).encode()
+        for label, response in (
+            ("no body", (403, b"")),
+            ("not JSON", (403, b"not registered")),
+            ("a list", (403, [{"error": "not registered"}])),
+            ("another code", (403, {"error": "forbidden"})),
+            ("the code in another case", (403, {"error": "Not Registered"})),
+            ("the code under another key", (403, {"reason": "not registered"})),
+            ("past the bound", (403, oversized)),
+            ("deeply nested", (403, b"[" * 4000)),
+            ("not UTF-8", (403, b"\xff\xfe")),
+            ("the code on a 401", (401, {"error": "not registered"})),
+        ):
+            with self.subTest(body=label):
+                self.summary.unlink(missing_ok=True)
+                status = response[0]
+                self.assertFails(self.run_pr(response, main={}, head={}),
+                                 f"hemi refused this pull request's token (HTTP {status}): " + NEW_OR_CUT_OVER)
 
     def test_no_answer_with_no_files_on_main_fails(self):
         for label, response in (("no answer", "drop"), ("reset after the request", "reset"),
@@ -1080,9 +1116,7 @@ class PullRequestTests(PullRequestCase):
     def test_a_stacked_pull_request_is_judged_by_main_not_by_its_base(self):
         self.branch("base", FILES)
         for label, response, sentence in (
-            ("401", (401, {}), f"hemi refused this pull request's token (HTTP 401); {REPOSITORY}'s settings "
-                               "live in hemi, so the checks cannot run; if this app is new, register it with lab "
-                               "first."),
+            ("401", (401, {}), "hemi refused this pull request's token (HTTP 401): " + NEW_OR_CUT_OVER),
             ("hemi", (200, fixture_copy("hemi")),
              f"{PROFILE} was added back; travel's settings live in hemi. {VALUES} was added back; travel's "
              "settings live in hemi."),
@@ -1190,9 +1224,15 @@ class PullRequestTests(PullRequestCase):
         """hemi admits wac-ci only for pull_request runs; a push run's 401 is about the event."""
         self.event = "push"
         code = self.run_pr((401, {"error": "unauthorized"}), main={}, head={})
-        self.assertFails(code, f"hemi refused the job token of this push run (HTTP 401): it admits wac-ci only "
-                               f"for pull_request runs, and {REPOSITORY}'s settings live in hemi, so the checks "
-                               "cannot run; if this app is new, register it with lab first.")
+        self.assertFails(code, "hemi refused the job token of this push run (HTTP 401): it admits wac-ci only "
+                               "for pull_request runs; " + NEW_OR_CUT_OVER)
+        self.assertNotIn("pull request's", self.stderr)
+
+    def test_a_clean_up_refused_outside_a_pull_request_names_the_event(self):
+        self.event = "push"
+        code = self.run_pr((401, {"error": "unauthorized"}), main=FILES, head={})
+        self.assertFails(code, "hemi refused the job token of this push run (HTTP 401): it admits wac-ci only "
+                               f"for pull_request runs, and this pull request removes {REPOSITORY}'s files.")
         self.assertNotIn("pull request's", self.stderr)
 
     def test_an_answer_that_trickles_in_past_the_attempt_bound_is_silence(self):
