@@ -82,7 +82,7 @@ whichever the source:
 | `chart_version`, `tag_prefix`, `health_url`, `health_expect_db_ok` | `delivery.chartVersion`, `delivery.tagPrefix`, `delivery.healthUrl`, `delivery.healthExpectDbOk` |
 | `values_file` | `delivery.valuesFile`, the path the repository's values file had; the file need not exist |
 | `images[].name`, `dockerfile`, `context`, `sha_build_arg` | `build.images[].name`, `dockerfile`, `context`, `shaBuildArg` |
-| `ci.stack`, `node_version`, `go_version`, `go_version_file`, `apt_packages` | `build.stack`, `nodeVersion`, `goVersion`, `goVersionFile`, `aptPackages` (left out when empty) |
+| `ci.stack`, `node_version`, `go_version`, `go_version_file`, `apt_packages` | `build.stack`, `nodeVersion`, `goVersion`, `goVersionFile`, `aptPackages` (left out when it is `[]` or absent; any other value that is not a non-empty list of names, `0`, `null` and `""` included, is refused as `ci.apt_packages: must be a non-empty list`) |
 | `ci.commands` | every gate's `commands`, in order |
 | the values file | `runtime` |
 

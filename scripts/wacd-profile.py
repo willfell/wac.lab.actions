@@ -234,7 +234,9 @@ def from_contract(contract, values_file):
     settings to the top level, build to images and ci, and the gates' commands,
     in order, to ci.commands. Unknown fields inside build and its images are
     refused rather than dropped, so a setting the copy carries is never
-    silently ignored. An empty aptPackages is left out, as the profile writes it.
+    silently ignored. An aptPackages of [] is left out, as the profile writes
+    it; any other value goes on to ci.apt_packages and its check, so 0, null
+    and "" are refused there rather than dropped.
     """
     contract_object(contract, "contract")
     version = contract_field(contract, "version", "contract")
@@ -277,7 +279,7 @@ def from_contract(contract, values_file):
         if source in build:
             ci[target] = build[source]
     ci["commands"] = commands
-    if build.get("aptPackages"):
+    if "aptPackages" in build and build["aptPackages"] != []:
         ci["apt_packages"] = build["aptPackages"]
     return {
         "schema_version": 1,
