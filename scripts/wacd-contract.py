@@ -144,7 +144,7 @@ CONTRACT_BODY = {"operation": "contract"}
 FIRST_POLL_SECONDS = 5
 MAX_POLL_SECONDS = 30
 MAX_WAIT = release.MAX_WAIT
-# plan's job timeout (40 minutes) is sized for this wait plus its other steps,
+# plan's job timeout (68 minutes) is sized for this wait plus its other steps,
 # and a workflow test ties the two. A larger wait_timeout still bounds deploy,
 # but plan stops here so it fails with its summary line, not the job timeout.
 PLAN_WAIT_CAP = 2100

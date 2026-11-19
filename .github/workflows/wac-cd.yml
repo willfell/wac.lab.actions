@@ -67,7 +67,7 @@ concurrency:
 jobs:
   plan:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
-    timeout-minutes: 40
+    timeout-minutes: 68
     env:
       PYTHONSAFEPATH: "1"
     permissions:
@@ -456,14 +456,13 @@ jobs:
                   echo "wac-cd: replay refused; the next step reports it"
                   exit 0
                 fi
-                echo "wac-cd: $reason" >&2
                 echo "::error::wac-cd: $reason"
                 {
                   echo "### wac-cd plan"
                   echo
                   echo "$reason"
                 } >> "$GITHUB_STEP_SUMMARY"
-                exit 1
+                exit "$code"
               fi
               mode="$(sed -n 's/^mode=//p' <<< "$planned")"
               version="$(sed -n 's/^version=//p' <<< "$planned")"

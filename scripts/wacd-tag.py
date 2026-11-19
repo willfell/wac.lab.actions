@@ -35,7 +35,9 @@ NETWORK_TIMEOUT seconds: plan holds the repository's cd concurrency group, so
 a stalled remote must fail the run rather than hold it. git runs in its own
 session and the whole group is killed on a timeout, because git's transport
 helpers (ssh, git-remote-https, a hook behind receive-pack) would otherwise
-keep its pipes open. A timed-out push is a failure, never "superseded".
+keep its pipes open. A helper that left git's group (a daemonizing credential
+helper) survives the kill; its pipes are let go DRAIN_TIMEOUT seconds later.
+A timed-out push is a failure, never "superseded".
 """
 
 import argparse
@@ -48,6 +50,7 @@ import sys
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 REMOTE_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
 NETWORK_TIMEOUT = 60
+DRAIN_TIMEOUT = 5
 
 
 class TagError(Exception):
@@ -78,7 +81,14 @@ def git(*args, check=True, timeout=None):
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        process.communicate()
+        try:
+            process.communicate(timeout=DRAIN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # A helper that left git's group (a daemonizing credential
+            # helper) still holds the pipes; git itself is dead, so let go.
+            process.stdout.close()
+            process.stderr.close()
+            process.wait()
         raise TagError(f"git {args[0]} did not finish within {timeout} seconds") from None
     result = subprocess.CompletedProcess(["git", *args], process.returncode, stdout, stderr)
     if check and result.returncode != 0:

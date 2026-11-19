@@ -252,14 +252,16 @@ seconds (default `2100`), the bound `deploy` gives a `release`, passed to the
 script as `--wait-timeout` and parsed by the same function `deploy` uses, so
 both jobs accept exactly the same values. `plan`'s wait is capped at 2100
 seconds (35 minutes) whatever the input, while `deploy` honours the full
-`wait_timeout`: `plan` has `timeout-minutes: 40`, the cap plus five minutes
-for its other steps (GitHub expressions have no arithmetic, so it cannot be
-sized from the input), and the cap makes a long outage end in `plan`'s own
-summary line rather than the job timeout. In `settings` mode the status read's
-120 seconds come out of those five minutes, leaving three for the other steps;
-`.github/scripts/test_reusable_workflows.py` holds the sum. Each step also has
-its own kill switch (one to six minutes), and those add up to more than the
-five minutes, as they did before: they stop a stalled step, not a slow run. The interval starts at 5 seconds and
+`wait_timeout`: `plan` has `timeout-minutes: 68` (GitHub expressions have no
+arithmetic, so it cannot be sized from the input), and the cap makes a long
+outage end in `plan`'s own summary line rather than the job timeout. The 68 is
+a strict sum: 35 minutes for the capped wait, one for its last request (a token
+mint and a connection), and 32 for every other step's own kill switch (one to
+six minutes each; `Plan the settings release`'s six hold the status read's 120
+seconds), so even a run in which every step uses its whole bound ends at a
+step's kill switch, never at the job's.
+`.github/scripts/test_reusable_workflows.py` holds the sum. A push release is
+unaffected unless a step hangs. The interval starts at 5 seconds and
 doubles up to 30, so a long outage costs about two requests a minute. Each
 request may wait the whole time left for its answer, as `deploy`'s requests
 do, because the gateway checks the caller against `main` with several GitHub
@@ -282,10 +284,12 @@ network (`EHOSTUNREACH`, `ENETUNREACH`); `wacd-release.py`'s
 of these still fails at once.
 
 Every other `plan` step has its own `timeout-minutes` (one to six minutes), so
-only the gateway wait can use the job's 40 minutes: a stalled checkout,
+only the gateway wait can use most of the job's 68 minutes: a stalled checkout,
 upload or tag push fails within minutes instead. `wacd-tag.py` bounds each
 call that reaches the remote (`ls-remote`, `push`) at 60 seconds and kills git
-and its transport helpers when it passes; a timed-out push fails the plan and
+and its transport helpers when it passes, and lets go of git's output 5 seconds
+later even when a helper that left git's process group (a daemonizing
+credential helper) still holds it; a timed-out push fails the plan and
 is never read as superseded. `Check the trigger` runs before the gateway is
 asked, so a malformed dispatch fails at once, even during an outage.
 

@@ -532,6 +532,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(refusal["if"], "${{ steps.version.outputs.replay_refused != '' }}")
         self.assertEqual(refusal["env"], {"REASON": "${{ steps.version.outputs.replay_refused }}"})
         self.assertIsInstance(refusal["timeout-minutes"], int)
+        self.assertNotIn("continue-on-error", refusal, "a refusal fails plan, never a green run")
+        self.assertNotIn("continue-on-error", doc["jobs"]["plan"], "a refusal fails plan, never a green run")
         self.assertEqual(names[-1], refusal["name"], "nothing runs between the planning step and the refusal")
 
         def git(repo, *args):
@@ -541,13 +543,18 @@ class ReusableWorkflowTests(unittest.TestCase):
                 cwd=repo, check=True, capture_output=True, text=True,
             ).stdout.strip()
 
-        def run(case_head, rollback="", extra_commit=False, origin=True, untagged_old=False):
+        def remote_refs(bare):
+            return git(bare, "for-each-ref", "--format=%(refname) %(objectname)")
+
+        def run(case_head, rollback="", extra_commit=False, origin=True, untagged_old=False, version_source="commits"):
             with tempfile.TemporaryDirectory() as tmp:
                 tmp = Path(tmp)
-                repo, scripts = tmp / "repo", tmp / "scripts"
+                repo, scripts, bare = tmp / "repo", tmp / "scripts", tmp / "origin.git"
                 repo.mkdir()
                 scripts.mkdir()
                 shutil.copy(root / "scripts" / "wacd-version.py", scripts / "wacd-version.py")
+                shutil.copy(root / "scripts" / "wacd-tag.py", scripts / "wacd-tag.py")
+                git(tmp, "init", "-q", "--bare", str(bare))
                 git(repo, "-c", "init.defaultBranch=main", "init", "-q")
                 git(repo, "commit", "--allow-empty", "-q", "-m", "feat: first")
                 first = git(repo, "rev-parse", "HEAD")
@@ -556,8 +563,10 @@ class ReusableWorkflowTests(unittest.TestCase):
                 old = git(repo, "rev-parse", "HEAD")
                 git(repo, "commit", "--allow-empty", "-q", "-m", "feat: second")
                 git(repo, "tag", "v0.2.0")
-                if origin:
-                    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+                git(repo, "remote", "add", "origin", str(bare))
+                git(repo, "push", "-q", "origin", "main", "refs/tags/*")
+                if not origin:
+                    git(repo, "update-ref", "-d", "refs/remotes/origin/main")
                 if case_head == "first":
                     git(repo, "checkout", "-q", first)
                 if untagged_old:
@@ -569,12 +578,12 @@ class ReusableWorkflowTests(unittest.TestCase):
                     "import sys\n"
                     f"print('revision={first}' if sys.argv[1] == 'chart-revision' else 'state=present')\n"
                 )
-                (scripts / "wacd-tag.py").write_text("print('claim=pushed')\n")
                 out, summary = tmp / "out", tmp / "summary"
                 env = {**os.environ, "WACD_SCRIPTS": str(scripts), "RUNNER_TEMP": str(tmp),
                        "GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_SHA": head,
-                       "ROLLBACK_VERSION": rollback, "VERSION_SOURCE": "commits", "CALLER_VERSION": "",
+                       "ROLLBACK_VERSION": rollback, "VERSION_SOURCE": version_source, "CALLER_VERSION": "",
                        "DEPLOY": "true", "APP": "app", "TAG_PREFIX": "v"}
+                before = remote_refs(bare)
                 result = subprocess.run(["bash", "-c", step["run"]], env=env, cwd=repo,
                                         capture_output=True, text=True)
                 outputs = dict(line.split("=", 1) for line in out.read_text().splitlines()) if out.exists() else {}
@@ -585,6 +594,10 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertFalse(summary.exists(), "the refusal step writes the summary")
                     result = subprocess.run(["bash", "-c", refusal["run"]], env={**env, "REASON": reason},
                                             capture_output=True, text=True)
+                pushed = sorted(set(remote_refs(bare).splitlines()) - set(before.splitlines()))
+                if result.returncode != 0:
+                    self.assertEqual(pushed, [], "a refused or failed plan pushed a ref to the remote")
+                self.pushed = [line.split()[0] for line in pushed]
                 return result, outputs, summary.read_text() if summary.exists() else ""
 
         sentence = ("This run is for v0.1.0, but v0.2.0 is already published. "
@@ -604,11 +617,19 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(outputs, {})
         self.assertIn("origin/main is not in the checkout", summary)
-        self.assertIn("origin/main is not in the checkout", result.stderr)
+        self.assertEqual((result.stdout + result.stderr).count("origin/main is not in the checkout"), 1,
+                         "the planning step's failure is said once, as its annotation")
+        self.assertIn("::error::wac-cd: origin/main is not in the checkout", result.stdout)
+
+        result, outputs, summary = run("main", version_source="bogus")
+        self.assertEqual(result.returncode, 2, "a usage error keeps wacd-version.py's own exit code")
+        self.assertEqual(outputs, {})
+        self.assertEqual((result.stdout + result.stderr).count("invalid choice: 'bogus'"), 1)
 
         result, outputs, _ = run("main", extra_commit=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((outputs["mode"], outputs["version"]), ("release", "0.2.1"))
+        self.assertEqual(self.pushed, ["refs/tags/v0.2.1"], "the harness sees a tag the step pushes")
 
         result, outputs, summary = run("main", untagged_old=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -1317,8 +1338,30 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(plan["timeout-minutes"], math.ceil(contract.PLAN_WAIT_CAP / 60) + 5,
                                 "a capped wait still ends inside the job, with its summary line")
 
+    def test_wac_cd_plan_ends_inside_its_job_bound_even_when_every_step_uses_its_own(self):
+        """35 + 1 + 32 = 68: the gateway wait's cap, a minute for its last request, and every other step's bound.
+
+        The gateway wait has no kill switch of its own: it ends PLAN_WAIT_CAP seconds after it starts,
+        plus one last request (a token mint and a connection), allowed a minute. Every other step stops at
+        its own timeout-minutes, so the job's bound is their strict sum and a step's kill switch, never the
+        job's, is what stops a stalled step. docs/reference/wac-cd.md states this sum.
+        """
+        import math
+
+        plan = self.wac_cd()["jobs"]["plan"]
+        spec = importlib.util.spec_from_file_location(
+            "wacd_contract_sum", Path(__file__).resolve().parents[2] / "scripts" / "wacd-contract.py"
+        )
+        contract = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(contract)
+        wait = math.ceil(contract.PLAN_WAIT_CAP / 60) + 1
+        others = sum(step["timeout-minutes"] for step in plan["steps"] if step.get("id") != "contract")
+        self.assertEqual((wait, others, plan["timeout-minutes"]), (36, 32, 68),
+                         "the sum the docstring and docs/reference/wac-cd.md state")
+        self.assertEqual(wait + others, plan["timeout-minutes"], f"{wait} + {others} is plan's bound")
+
     def test_wac_cd_plan_bounds_every_step_but_the_gateway_wait(self):
-        """With 40 minutes for the job, a stalled checkout or git push must not use them all."""
+        """With 68 minutes for the job, a stalled checkout or git push must not use them all."""
         steps = self.wac_cd()["jobs"]["plan"]["steps"]
         for step in steps:
             name = step.get("name") or step.get("uses")
@@ -1335,6 +1378,9 @@ class ReusableWorkflowTests(unittest.TestCase):
         names = [s.get("name") or s.get("uses") for s in steps]
         contract_index = next(i for i, s in enumerate(steps) if s.get("id") == "contract")
         self.assertLess(names.index("Check the trigger"), contract_index)
+        checkouts = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout@")]
+        self.assertEqual(len(checkouts), 2, "the app's checkout and the shared scripts'")
+        self.assertLess(names.index("Check the trigger"), min(checkouts), "nor wait out a stalled checkout first")
 
     def test_wac_cd_dispatch_takes_exactly_one_of_a_rollback_and_a_settings_revision(self):
         import os
@@ -2045,9 +2091,6 @@ class ReusableWorkflowTests(unittest.TestCase):
         )
         contract = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(contract)
-        other_steps = 180
-        self.assertEqual(contract.PLAN_WAIT_CAP + status + other_steps, plan["timeout-minutes"] * 60,
-                         "docs/reference/wac-cd.md states this budget")
         deadline = int(re.search(r"deadline=\$\(\( \$\(date \+%s\) \+ (\d+) \)\)", settings["run"]).group(1))
         self.assertEqual(deadline, status, "one wall-clock deadline bounds every read in the step")
         self.assertLess(status + 60, settings["timeout-minutes"] * 60, "the step's kill switch is never what stops it")
