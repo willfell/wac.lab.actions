@@ -129,10 +129,36 @@ artifact and packages the chart from `profile.json` with
 the repository is deleted before `plan` writes and before `publish` downloads,
 so it is never acted on.
 
+**Every mode waits on that answer.** `plan` asks before it knows the mode, so
+while the gateway refuses, or still answers 503 after the 120 seconds below,
+`plan` fails in every mode, `publish` and `none` included, and nothing is
+built, published or tagged. Re-run the run once the gateway answers.
+
+**A re-run of failed jobs reuses the copy.** "Re-run failed jobs" skips a
+`plan` that succeeded, so a re-run `publish` downloads the `wac-cd-contract`
+artifact the earlier attempt's `plan` uploaded in the same run, and never
+reads the copy again. "Re-run all jobs" runs `plan` again, which reads the copy
+afresh and replaces the artifact.
+
+**What runs beside the token.** `plan` holds `id-token: write`, and a GitHub
+OIDC token does not say which step minted it, so `plan` runs nothing fetched
+at run time. It uses the runner image's own `python3`, which its first step
+requires to be 3.12 or later, failing with the runner's name, OS and
+architecture and the `python3` path and version it found, and it uses only
+actions pinned by full commit SHA, with the tag in each step's name.
+`.github/scripts/test_reusable_workflows.py` holds every job of `wac-cd` and
+`wac-ci` that holds `id-token: write` to an allowlist of commit-pinned actions
+and refuses a step that runs `install-tools.sh`, `pip`, `npm`, `npx`, `uvx`,
+`curl` piped to a shell, or `get-helm`. `install-helm.sh` is allowed: it checks
+a committed digest before it runs anything. `deploy` and `shadow` are the
+known exceptions, still on tag-pinned actions and `setup-python`; that list
+only shrinks.
+
 A 503 (`release dependency unavailable`: GitHub slow, rate-limited or down
 behind the gateway) is retried every 5 seconds within 120 seconds, each
-request bounded at 30 seconds, like a `release`. A 403 is not retried. A denial is told apart from a 503 by
-its status, never by its body, and the body is never printed: a 403 without a
+request bounded at 30 seconds, like a `release`. A 403 is not retried. A
+denial is told apart from a 503 by its status, never by its body, and the body
+is never printed: a 403 without a
 `reason` means the gateway did not verify the caller, and a 403 with one of the
 gateway's codes gets this sentence in the run summary:
 

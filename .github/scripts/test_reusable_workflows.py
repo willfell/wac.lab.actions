@@ -10,6 +10,30 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 GUARD_RUN = '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+
+# A GitHub OIDC token does not say which step minted it, so any code that runs
+# in a job holding id-token: write can mint a gateway token. Such a job may use
+# only these actions, pinned by commit (the tag goes in the step's name), and
+# may not run a fetched installer. install-helm.sh is allowed: it checks a
+# committed digest before it runs anything.
+PINNED_ACTIONS = {
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262": "v4",
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02": "v4",
+    "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093": "v4",
+}
+FETCHED_INSTALLERS = (
+    ("install-tools.sh", re.compile(r"install-tools\.sh")),
+    ("pip", re.compile(r"\bpip3?\b")),
+    ("npm", re.compile(r"\bnpm\b")),
+    ("npx", re.compile(r"\bnpx\b")),
+    ("uvx", re.compile(r"\buvx\b")),
+    ("curl piped to a shell", re.compile(r"\bcurl\b[^\n]*\|\s*(sudo\s+)?(ba|z|da)?sh\b")),
+    ("get-helm", re.compile(r"get-helm")),
+)
+# Known exceptions, owned by the coordinator and raised with the owner: these
+# jobs held id-token: write with tag-pinned actions and setup-python before the
+# rule existed. This list may only shrink; a job fixed here must leave it.
+KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE = (("wac-cd.yml", "deploy"), ("wac-cd.yml", "shadow"))
 SHA = "${{ job.workflow_sha }}"
 
 
@@ -42,6 +66,33 @@ def nested_call(**overrides):
     job = {"uses": "./.github/workflows/actionlint.yml", "with": {"runner": "${{ inputs.runner }}"}}
     job.update(overrides)
     return job
+
+
+def holds_id_token(doc, job):
+    permissions = job.get("permissions") if "permissions" in (job or {}) else doc.get("permissions")
+    if permissions == "write-all":
+        return True
+    return isinstance(permissions, dict) and permissions.get("id-token") == "write"
+
+
+def id_token_problems(doc, job_name, job):
+    """What lets code other than wac-cd's own run in a job that can mint a gateway token."""
+    problems = []
+    if "uses" in job:
+        problems.append(f"{job_name}: calls {job['uses']} while holding id-token: write")
+    for index, step in enumerate(job.get("steps") or []):
+        where = f"{job_name} steps[{index}]"
+        uses = step.get("uses")
+        if uses is not None:
+            tag = PINNED_ACTIONS.get(uses)
+            if tag is None:
+                problems.append(f"{where}: {uses} is not a commit-pinned action on the allowlist")
+            elif f"{uses.split('@')[0]} {tag}" not in str(step.get("name", "")):
+                problems.append(f"{where}: the step name does not say {uses.split('@')[0]} {tag}")
+        for label, pattern in FETCHED_INSTALLERS:
+            if pattern.search(str(step.get("run", ""))):
+                problems.append(f"{where}: runs {label}")
+    return problems
 
 
 def runner_problems(jobs, name="wac-ci.yml"):
@@ -304,7 +355,9 @@ class ReusableWorkflowTests(unittest.TestCase):
         doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-cd.yml").read_text())
         plan = doc["jobs"]["plan"]
         self.assertEqual(plan["permissions"], {"contents": "write", "id-token": "write"})
-        self.assertNotIn("persist-credentials", plan["steps"][0].get("with") or {})
+        app = next(s for s in plan["steps"] if str(s.get("uses", "")).startswith("actions/checkout@")
+                   and "repository" not in (s.get("with") or {}))
+        self.assertNotIn("persist-credentials", app.get("with") or {}, "plan pushes the release tag")
         step = next(s for s in plan["steps"] if s.get("name") == "Plan the version")
         stubs = {
             "wacd-version.py": "import os\nprint('mode=' + os.environ['STUB_MODE'])\nprint('version=0.2.0')\nprint('tag=v0.2.0')\n",
@@ -454,7 +507,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(upload["with"]["path"], ".wacd-contract/")
         self.assertIs(upload["with"]["include-hidden-files"], True, "upload-artifact skips dot directories")
         self.assertEqual(upload["with"]["if-no-files-found"], "error")
-        self.assertLess(names.index(ask["name"]), names.index(upload["uses"]))
+        self.assertLess(names.index(ask["name"]), names.index(upload["name"]))
         for key in ("source", "revision", "fleet_commit"):
             self.assertEqual(plan["outputs"][key], f"${{{{ steps.contract.outputs.{key} }}}}")
         profile = next(s for s in steps if s.get("name") == "Read the wacd profile")
@@ -473,6 +526,104 @@ class ReusableWorkflowTests(unittest.TestCase):
                 result = subprocess.run(["bash", "-e", "-c", profile["run"]], env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(out.read_text(), f"argv={expected}\n")
+
+    def test_jobs_holding_id_token_run_only_pinned_actions_and_no_fetched_installer(self):
+        import yaml
+
+        root = Path(__file__).resolve().parents[1] / "workflows"
+        checked = []
+        for name in ("wac-cd.yml", "wac-ci.yml"):
+            doc = yaml.safe_load((root / name).read_text())
+            for job_name, job in doc["jobs"].items():
+                if not holds_id_token(doc, job) or (name, job_name) in KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE:
+                    continue
+                checked.append((name, job_name))
+                with self.subTest(workflow=name, job=job_name):
+                    self.assertEqual(id_token_problems(doc, job_name, job), [])
+        self.assertIn(("wac-cd.yml", "plan"), checked)
+
+    def test_the_known_id_token_exposures_only_shrink(self):
+        import yaml
+
+        self.assertLessEqual(
+            set(KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE), {("wac-cd.yml", "deploy"), ("wac-cd.yml", "shadow")},
+            "a job holding id-token: write may never be added as an exception",
+        )
+        root = Path(__file__).resolve().parents[1] / "workflows"
+        for name, job_name in KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE:
+            doc = yaml.safe_load((root / name).read_text())
+            job = doc["jobs"][job_name]
+            with self.subTest(workflow=name, job=job_name):
+                self.assertTrue(holds_id_token(doc, job), "no longer holds id-token: remove it from the list")
+                self.assertTrue(id_token_problems(doc, job_name, job), "now passes the rule: remove it from the list")
+
+    def test_the_id_token_rule_names_each_way_in(self):
+        pinned = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+        good = {"name": "Check out (actions/checkout v4)", "uses": pinned}
+        cases = (
+            ("tag-pinned action", {"name": "x (actions/checkout v4)", "uses": "actions/checkout@v4"}, "allowlist"),
+            ("setup-python", {"name": "x", "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"},
+             "allowlist"),
+            ("unnamed pin", {"uses": pinned}, "step name"),
+            ("install-tools", {"run": 'bash "$WACD_SCRIPTS"/install-tools.sh helm'}, "install-tools.sh"),
+            ("pip", {"run": "pip install requests"}, "pip"),
+            ("pip3", {"run": "python3 -m pip3 install x"}, "pip"),
+            ("npm", {"run": "npm ci"}, "npm"),
+            ("npx", {"run": "npx something"}, "npx"),
+            ("uvx", {"run": "uvx mkdocs build"}, "uvx"),
+            ("curl to sh", {"run": "curl -fsSL https://example.invalid/i | sh"}, "curl"),
+            ("curl to sudo bash", {"run": "curl -fsSL https://example.invalid/i | sudo bash -s"}, "curl"),
+            ("get-helm", {"run": "./get-helm-3"}, "get-helm"),
+        )
+        for label, step, expected in cases:
+            with self.subTest(case=label):
+                problems = id_token_problems({}, "job", {"steps": [good, step]})
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(expected, problems[0])
+        allowed = [good, {"run": 'set -euo pipefail\nbash "$WACD_SCRIPTS"/install-helm.sh'},
+                   {"run": "curl -fsS -o out https://example.invalid/x"}]
+        self.assertEqual(id_token_problems({}, "job", {"steps": allowed}), [])
+        self.assertTrue(id_token_problems({}, "job", {"uses": "./.github/workflows/actionlint.yml"}))
+        inherited = {"permissions": {"id-token": "write"}}
+        self.assertTrue(holds_id_token(inherited, {"steps": []}))
+        self.assertFalse(holds_id_token(inherited, {"permissions": {"contents": "read"}}))
+        self.assertTrue(holds_id_token({}, {"permissions": "write-all"}))
+
+    def test_wac_cd_plan_first_requires_the_runners_python3_and_names_the_runner(self):
+        import os
+        import subprocess
+
+        plan = self.wac_cd()["jobs"]["plan"]
+        self.assertFalse([s for s in plan["steps"] if "setup-python" in str(s.get("uses", ""))],
+                         "setup-python fetches and runs a Python build in a job that can mint a gateway token")
+        step = plan["steps"][0]
+        self.assertEqual(step["env"], {"JOB_RUNNER_NAME": "${{ runner.name }}",
+                                       "JOB_RUNNER_OS": "${{ runner.os }}", "JOB_RUNNER_ARCH": "${{ runner.arch }}"})
+        fake = (
+            "#!/bin/bash\n"
+            'case "$2" in\n'
+            '  *sys.exit*) exit "$STUB_OLD" ;;\n'
+            '  *print*) echo "Python $STUB_VERSION" ;;\n'
+            "esac\n"
+        )
+        for label, old, version, code in (("3.12", "0", "3.12.3", 0), ("3.10", "1", "3.10.12", 1), ("absent", None, None, 1)):
+            with self.subTest(python=label), tempfile.TemporaryDirectory() as tmp:
+                bin_dir = Path(tmp)
+                if old is not None:
+                    (bin_dir / "python3").write_text(fake)
+                    (bin_dir / "python3").chmod(0o755)
+                env = {"PATH": str(bin_dir), "STUB_OLD": old or "", "STUB_VERSION": version or "",
+                       "JOB_RUNNER_NAME": "ci-light-abc12", "JOB_RUNNER_OS": "Linux", "JOB_RUNNER_ARCH": "ARM64"}
+                result = subprocess.run(["/bin/bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                if label == "3.10":
+                    self.assertEqual(
+                        result.stdout,
+                        "::error::wac-cd: plan needs python3 3.12 or later on the runner; found Python 3.10.12 "
+                        f"at {bin_dir}/python3 on ci-light-abc12 (Linux, ARM64).\n",
+                    )
+                if label == "absent":
+                    self.assertIn("found no python3 on ci-light-abc12 (Linux, ARM64).", result.stdout)
 
     def test_wac_cd_plan_fails_with_the_refusal_sentence(self):
         import os
