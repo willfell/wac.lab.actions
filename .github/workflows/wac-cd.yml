@@ -68,6 +68,8 @@ jobs:
   plan:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 40
+    env:
+      PYTHONSAFEPATH: "1"
     permissions:
       contents: write
       id-token: write
@@ -100,10 +102,10 @@ jobs:
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then
-            version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
+            version="$("$python" -I -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
             found="$version at $python"
-            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
-              if missing="$("$python" -c 'import importlib, sys
+            if "$python" -I -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              if missing="$("$python" -I -c 'import importlib, sys
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
@@ -285,7 +287,7 @@ jobs:
           commit="$(sed -n 's/^commit=//p' <<< "$status")"
           images="$(sed -n 's/^images=//p' <<< "$status")"
           live="$(sed -n 's/^copy_revision=//p' <<< "$status")"
-          if ! python3 -c 'import json, sys
+          if ! python3 -I -c 'import json, sys
           running = sorted(json.loads(sys.argv[1]))
           wanted = sorted(image["name"] for image in json.loads(sys.argv[2]))
           sys.exit(running != wanted)' "$images" "$PROFILE_IMAGES"; then
@@ -527,6 +529,8 @@ jobs:
     continue-on-error: true
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 2
+    env:
+      PYTHONSAFEPATH: "1"
     permissions:
       contents: read
       id-token: write
@@ -546,10 +550,10 @@ jobs:
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then
-            version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
+            version="$("$python" -I -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
             found="$version at $python"
-            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
-              if missing="$("$python" -c 'import importlib, sys
+            if "$python" -I -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              if missing="$("$python" -I -c 'import importlib, sys
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
@@ -867,6 +871,8 @@ jobs:
       needs.plan.outputs.mode == 'settings')
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 75
+    env:
+      PYTHONSAFEPATH: "1"
     permissions:
       contents: read
       id-token: write
@@ -883,10 +889,10 @@ jobs:
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then
-            version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
+            version="$("$python" -I -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
             found="$version at $python"
-            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
-              if missing="$("$python" -c 'import importlib, sys
+            if "$python" -I -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              if missing="$("$python" -I -c 'import importlib, sys
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)

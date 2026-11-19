@@ -705,6 +705,175 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertFalse(holds_id_token(inherited, {"permissions": {"contents": "read"}}))
         self.assertTrue(holds_id_token({}, {"permissions": "write-all"}))
 
+    def token_step_env(self, head):
+        """The env each run step of a token job gets in the planted-repository run, keyed by job and step."""
+        sha = "a" * 40
+        images = json.dumps({"web": {"repository": "localhost:30500/web", "tag": "1.4.2", "digest": "sha256:" + "e" * 64}},
+                            separators=(",", ":"))
+        runner = {"JOB_RUNNER_NAME": "ci-small-abc12", "JOB_RUNNER_OS": "Linux", "JOB_RUNNER_ARCH": "ARM64"}
+        guard = {"SHARED_WORKFLOW_SHA": sha}
+        code = {"ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "", "DEPLOY": "true",
+                "APP": "app", "TAG_PREFIX": "v", "SETTINGS_REVISION": "", "SETTINGS_MODE": "", "SETTINGS_VERSION": "",
+                "SETTINGS_TAG": "", "SETTINGS_COMMIT": "", "SETTINGS_SUMMARY": ""}
+        settings = {**code, "SETTINGS_REVISION": "7", "SETTINGS_MODE": "settings", "SETTINGS_VERSION": "1.4.3",
+                    "SETTINGS_TAG": "v1.4.3", "SETTINGS_COMMIT": head, "SETTINGS_SUMMARY": "settings revision 7"}
+        refusal = ({"REASON": "a refusal"}, 1)
+        return {
+            ("plan", "Require the runner's python3 3.12 or later"): [(runner, 0)],
+            ("plan", "Check the trigger"): [({"EVENT_NAME": "push", "ROLLBACK_VERSION": "", "SETTINGS_REVISION": "",
+                                              "DEPLOY": "true"}, 0)],
+            ("plan", "Require the defining workflow commit"): [(guard, 0)],
+            ("plan", "Move the shared checkout out of the workspace"): [({}, 0)],
+            ("plan", "Read the settings from the gateway"): [({"WAIT_TIMEOUT": "2100"}, 0)],
+            ("plan", "Read the wacd profile"): [({"SOURCE": "hemi"}, 0), ({"SOURCE": "files"}, 0)],
+            ("plan", "Plan the settings release"): [({
+                "SETTINGS_REVISION": "7", "SOURCE": "hemi", "COPY_REVISION": "7", "APP": "app", "TAG_PREFIX": "v",
+                "PROFILE_IMAGES": json.dumps([{"name": "web", "dockerfile": "Dockerfile", "context": "."}]),
+                "GITHUB_TOKEN": "job-token"}, 0)],
+            ("plan", "Refuse a settings release while the app is rolling out"): [refusal],
+            ("plan", "Refuse a settings release behind a workflow change"): [refusal],
+            ("plan", "Plan the version"): [(code, 0), ({**code, "ROLLBACK_VERSION": "1.4.2"}, 0), (settings, 0)],
+            ("plan", "Refuse to replay an old version"): [refusal],
+            ("shadow", "Start the clock"): [({}, 0)],
+            ("shadow", "Require the runner's python3 3.12 or later"): [(runner, 0)],
+            ("shadow", "Require the defining workflow commit"): [(guard, 0)],
+            ("shadow", "Move the shared checkout out of the workspace"): [({}, 0)],
+            ("shadow", "Install helm"): [({}, 0)],
+            ("shadow", "Compare hemi's copy with the files"): [({}, 0)],
+            ("deploy", "Require the runner's python3 3.12 or later"): [(runner, 0)],
+            ("deploy", "Require the defining workflow commit"): [(guard, 0)],
+            ("deploy", "Move the shared checkout out of the workspace"): [({}, 0)],
+            ("deploy", "Read the published images"): [({"APP": "app", "VERSION": "1.4.3"}, 0)],
+            ("deploy", "Summarize the release"): [({"MODE": "release", "VERSION": "1.4.3", "TAG": "v1.4.3",
+                                                    "EXPECTED_SHA": head}, 0)],
+            ("deploy", "Release through the gateway"): [({"MODE": "release", "VERSION": "1.4.3", "TAG": "v1.4.3",
+                                                          "EXPECTED_SHA": head, "IMAGES": images,
+                                                          "WAIT_TIMEOUT": "2100"}, 0)],
+            ("deploy", "Prove the served build"): [({"HEALTH_URL": "http://app.app.svc.cluster.local/api/health",
+                                                     "EXPECTED_SHA": head, "EXPECT_DB": "false"}, 0)],
+            ("deploy", "Record the proof"): [({}, 0)],
+            ("contract", "Require the runner's python3 3.12 or later"): [(runner, 0)],
+            ("contract", "Require the defining workflow commit"): [(guard, 0)],
+            ("contract", "Move the shared checkout out of the workspace"): [({}, 0)],
+            ("contract", "Ask hemi for the settings"): [({"JOB_RUNNER_NAME": "ci-small-abc12"}, 0)],
+        }
+
+    def test_jobs_holding_id_token_import_nothing_from_the_calling_repository(self):
+        """Every run step of a token job, run in a checkout that plants json.py, ssl.py and sitecustomize.py.
+
+        Each planted module writes a marker when it is imported. The scripts are
+        stand-ins that import the same standard modules, every python3 the steps
+        start is the real interpreter (logged by a PATH wrapper), and git, the
+        version check and the inline Python run for real.
+        """
+        import os
+        import shutil
+        import subprocess
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        repo, scripts, bin_dir = tmp / "repo", tmp / "scripts", tmp / "bin"
+        for directory in (repo, scripts, bin_dir):
+            directory.mkdir()
+
+        def git(*args):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                                   *args], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+        git("-c", "init.defaultBranch=main", "init", "-q")
+        (repo / ".github" / "workflows").mkdir(parents=True)
+        (repo / ".github" / "workflows" / "cd.yml").write_text("on: push\n")
+        (repo / ".github" / "wacd.json").write_text("{}\n")
+        planted = ("json", "ssl", "sitecustomize")
+        for name in planted:
+            (repo / f"{name}.py").write_text("open(__file__ + '.ran', 'w').close()\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "feat: planted")
+        head = git("rev-parse", "HEAD")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+        running = {"web": {"repository": "localhost:30500/web", "tag": "1.4.2", "digest": "sha256:" + "e" * 64}}
+        answers = {
+            "wacd-contract.py fetch": "source=hemi\nrevision=7\nfleet_commit=" + "f" * 40 + "\nreason=r",
+            "wacd-contract.py pr": "source=hemi\nrevision=7",
+            "wacd-profile.py": "app=app\ntag_prefix=v",
+            "wacd-release.py running": (f"running=1.4.2\ncommit={head}\nimages={json.dumps(running)}\n"
+                                        "copy_revision=6\nfleet_commit=" + "f" * 40),
+            "wacd-release.py earlier-release": "reuse=",
+            "wacd-release.py": "Verified",
+            "wacd-version.py --mode settings": "mode=settings\nversion=1.4.3\ntag=v1.4.3\nclaimed=\nabove=",
+            "wacd-version.py": "mode=release\nversion=1.4.3\ntag=v1.4.3",
+            "wacd-chart.py chart-revision": f"revision={head}",
+            "wacd-chart.py chart-images": "images=" + json.dumps(running),
+            "wacd-chart.py chart-copy-revision": "copy_revision=6",
+            "wacd-chart.py": "state=absent",
+            "wacd-tag.py": "claim=pushed",
+            "wacd-shadow.py": "",
+        }
+        stub = (
+            "import json, os, socket, ssl, sys\n"
+            "line = os.path.basename(sys.argv[0]) + ' ' + ' '.join(sys.argv[1:])\n"
+            "open(os.environ['STUB_LOG'], 'a').write(line + '\\n')\n"
+            "answers = json.loads(os.environ['STUB_ANSWERS'])\n"
+            "print(answers[max((key for key in answers if line.startswith(key)), key=len)])\n"
+        )
+        for name in ("wacd-contract.py", "wacd-profile.py", "wacd-release.py", "wacd-version.py", "wacd-chart.py",
+                     "wacd-tag.py", "wacd-shadow.py"):
+            (scripts / name).write_text(stub)
+        (scripts / "install-helm.sh").write_text("exit 0\n")
+        python_log, stub_log = tmp / "python.log", tmp / "stub.log"
+        (bin_dir / "python3").write_text(f'#!/bin/bash\necho "$*" >> "{python_log}"\nexec "{sys.executable}" "$@"\n')
+        (bin_dir / "python3").chmod(0o755)
+        base = {key: value for key, value in os.environ.items() if not key.startswith("PYTHON")}
+        base.update({"PATH": f"{bin_dir}:{base['PATH']}", "WACD_SCRIPTS": str(scripts), "RUNNER_TEMP": str(tmp),
+                     "GITHUB_OUTPUT": str(tmp / "out"), "GITHUB_STEP_SUMMARY": str(tmp / "summary"),
+                     "GITHUB_ENV": str(tmp / "env"), "GITHUB_SHA": head, "GITHUB_REF": "refs/heads/main",
+                     "STUB_LOG": str(stub_log), "STUB_ANSWERS": json.dumps(answers)})
+
+        def marks():
+            found = sorted(path.name for path in repo.glob("*.ran"))
+            for name in found:
+                (repo / name).unlink()
+            return found
+
+        def run(script, env):
+            (repo / ".wacd").mkdir(exist_ok=True)
+            return subprocess.run(["bash", "-c", script], env=env, cwd=repo, capture_output=True, text=True)
+
+        scenarios = self.token_step_env(head)
+        covered = set()
+        jobs = [("wac-cd", name, job) for name, job in self.wac_cd()["jobs"].items()]
+        jobs += [("wac-ci", name, job) for name, job in self.wac_ci()["jobs"].items()]
+        token_jobs = [(workflow, name, job) for workflow, name, job in jobs if holds_id_token({}, job)]
+        self.assertEqual(sorted(name for _, name, _ in token_jobs), ["contract", "deploy", "plan", "shadow"])
+        for workflow, job_name, job in token_jobs:
+            job_env = job.get("env") or {}
+            for key, value in job_env.items():
+                self.assertNotIn("${{", str(value), f"{job_name} env {key} must be a constant")
+            for step in job["steps"]:
+                if "run" not in step:
+                    continue
+                key = (job_name, step["name"])
+                self.assertIn(key, scenarios, f"{workflow} {job_name} step {step['name']!r} has no planted-repository run")
+                covered.add(key)
+                for step_env, expected in scenarios[key]:
+                    with self.subTest(job=job_name, step=step["name"], env=step_env):
+                        self.assertEqual(set(step_env), set(step.get("env") or {}))
+                        python_log.write_text("")
+                        result = run(step["run"], {**base, **{k: str(v) for k, v in job_env.items()}, **step_env})
+                        self.assertEqual(marks(), [], f"{step['name']} imported a module the checkout planted")
+                        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                        if "python3" in step["run"]:
+                            self.assertNotEqual(python_log.read_text(), "", "the step started no interpreter")
+        self.assertEqual(covered, set(scenarios), "a planted-repository run for a step that no longer exists")
+
+        probe = "python3 -c 'import json, ssl'"
+        plan_env = {k: str(v) for k, v in (self.wac_cd()["jobs"]["plan"].get("env") or {}).items()}
+        self.assertEqual(run(probe, {**base, **plan_env}).returncode, 0)
+        self.assertEqual(marks(), [], "the job's own env keeps a step that forgets -I from importing the checkout")
+        self.assertEqual(run(probe, base).returncode, 0)
+        self.assertEqual(marks(), ["json.py.ran", "ssl.py.ran"], "without it the plant is imported: the probe can see it")
+
     def test_wac_cd_jobs_holding_id_token_require_the_runners_python3_before_anything_else(self):
         jobs = self.wac_cd()["jobs"]
         for job_name, position in (("plan", 0), ("deploy", 0), ("shadow", 1)):
@@ -726,7 +895,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                                        "JOB_RUNNER_OS": "${{ runner.os }}", "JOB_RUNNER_ARCH": "${{ runner.arch }}"})
         fake = (
             "#!/bin/bash\n"
-            'case "$2" in\n'
+            'case "$*" in\n'
             "  *importlib*) exit 0 ;;\n"
             '  *sys.exit*) exit "$STUB_OLD" ;;\n'
             '  *print*) echo "Python $STUB_VERSION" ;;\n'
@@ -754,19 +923,16 @@ class ReusableWorkflowTests(unittest.TestCase):
         runner_env = {"JOB_RUNNER_NAME": "ci-light-abc12", "JOB_RUNNER_OS": "Linux", "JOB_RUNNER_ARCH": "ARM64"}
         for broken in (None, "ssl", "http.client", "uuid", "json"):
             with self.subTest(broken_module=broken), tempfile.TemporaryDirectory() as tmp:
-                bin_dir = Path(tmp) / "bin"
-                lib_dir = Path(tmp) / "lib"
-                bin_dir.mkdir()
-                lib_dir.mkdir()
-                (bin_dir / "python3").write_text(f'#!/bin/bash\nexec "{sys.executable}" "$@"\n')
-                (bin_dir / "python3").chmod(0o755)
+                venv = Path(tmp) / "venv"
+                subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
+                bin_dir = venv / "bin"
                 if broken is not None:
-                    target = lib_dir.joinpath(*broken.split("."))
-                    if "." in broken:
-                        target.parent.mkdir(parents=True)
-                        (target.parent / "__init__.py").write_text("")
-                    target.with_suffix(".py").write_text("raise ImportError('stripped out of this python3')\n")
-                env = {"PATH": str(bin_dir), "PYTHONPATH": str(lib_dir), **runner_env}
+                    site = subprocess.run(
+                        [str(bin_dir / "python3"), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                        check=True, capture_output=True, text=True,
+                    ).stdout.strip()
+                    (Path(site) / "stripped.pth").write_text(f"import sys; sys.modules[{broken!r}] = None\n")
+                env = {"PATH": str(bin_dir), **runner_env}
                 result = subprocess.run(["/bin/bash", "-c", step["run"]], env=env, capture_output=True, text=True)
                 if broken is None:
                     self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)

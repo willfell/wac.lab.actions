@@ -189,6 +189,24 @@ exempts none, and refuses a step that runs `install-tools.sh`, `pip`, `npm`,
 `npx`, `uvx`, `curl` piped to a shell, or `get-helm`. `install-helm.sh` is
 allowed: it checks a committed digest before it runs anything.
 
+Nor does anything in those jobs run code from the calling repository. In
+`plan` and `shadow` the working directory is the app's checkout, and a
+`python3 -c` puts the working directory first on the import path, so a
+`json.py` at the root of an app's `main` would be imported beside the token.
+So the jobs set `PYTHONSAFEPATH=1` for every step, and every inline
+`python3 -c` runs as `python3 -I -c`. A script is started by its path in the
+shared checkout, outside the workspace, and the scripts load each other by
+path, so `PYTHONSAFEPATH` costs them nothing. git reads the checkout as data:
+the hooks, filters and diff drivers it could run are configured only in git
+config, which `actions/checkout` and the runner write and a repository's tree
+cannot, and `.gitattributes` can only name a driver that config defines.
+Helm, in `shadow`, gets a scratch copy of the values, the probe chart from the
+shared checkout and empty Helm directories. No step sources a file, and none
+runs `npm`, `node` or `make`. `.github/scripts/test_reusable_workflows.py` runs
+every step of these jobs, and of `wac-ci`'s `contract`, in a checkout that
+plants `json.py`, `ssl.py` and `sitecustomize.py`, each of which leaves a
+marker when imported, and fails on any marker.
+
 A 503 (`release dependency unavailable`: GitHub slow, rate-limited or down
 behind the gateway) is retried with a fresh token within `wait_timeout`
 seconds (default `2100`), the bound `deploy` gives a `release`, passed to the

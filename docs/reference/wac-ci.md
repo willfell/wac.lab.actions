@@ -100,7 +100,9 @@ It is the only job in `wac-ci` that holds `id-token: write`, and it runs no
 repository code. It follows the rules `wac-cd`'s token jobs follow: its
 first step checks the runner's own `python3` (3.12 or later, with the modules
 the scripts import), it runs no `actions/setup-python`, every action is pinned
-by commit and every step is bounded. It checks out the default branch's head
+by commit and every step is bounded. It sets `PYTHONSAFEPATH=1` for every
+step and runs its inline Python as `python3 -I -c`, so no interpreter imports
+from the working directory. It checks out the default branch's head
 (`refs/heads/` plus `github.event.repository.default_branch`) and the pull
 request's merge commit, each at depth 1 with `filter: blob:none` and a sparse
 `.github/wacd.json`, without persisted credentials. `scripts/wacd-contract.py

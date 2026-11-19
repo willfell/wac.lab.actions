@@ -27,6 +27,8 @@ jobs:
   contract:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 10
+    env:
+      PYTHONSAFEPATH: "1"
     permissions:
       contents: read
       id-token: write
@@ -45,10 +47,10 @@ jobs:
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then
-            version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
+            version="$("$python" -I -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
             found="$version at $python"
-            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
-              if missing="$("$python" -c 'import importlib, sys
+            if "$python" -I -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              if missing="$("$python" -I -c 'import importlib, sys
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
