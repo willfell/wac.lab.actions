@@ -152,7 +152,7 @@ PLAN_WAIT_CAP = 2100
 # The gateway's Deployment is Recreate: a rollout leaves about 35 s with no
 # endpoint. A refused or reset connection is retried for at most this long
 # from the first refusal in a row, and never past the overall wait.
-RESTART_WINDOW = 90
+RESTART_WINDOW = release.RESTART_WINDOW
 # The gateway answers a token it could not check (a failed signing-key fetch,
 # a busy replay store) with the same uncoded 403 as a caller it refuses, so an
 # uncoded 403 is asked this many times in all, UNCODED_PAUSE seconds apart.

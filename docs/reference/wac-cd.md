@@ -280,15 +280,44 @@ unanswered at the deadline; all read `could not be reached`.
 **A gateway restart is ridden out.** The gateway's Deployment is `Recreate`,
 so a rollout leaves about 35 seconds with no endpoint, and from `v1.35.0`
 every release's first step calls it; the gateway also sheds load by closing a
-socket before the TLS handshake. In the `contract` call only, a connection
+socket before the TLS handshake. In the `contract` call, a connection
 nothing answered on is retried with a fresh token and the same back-off for
 at most 90 seconds from the first such failure in a row, and never past the
 wait above; after that it reads `could not be reached`. That is a connection
 refused or reset, one closed during the TLS handshake (`ssl.SSLEOFError`) or
 before the status line, a connect timeout, and no route to the host or
 network (`EHOSTUNREACH`, `ENETUNREACH`); `wacd-release.py`'s
-`no_connection()` names them. `deploy`'s own calls are unchanged: there each
-of these still fails at once.
+`no_connection()` names them.
+
+From `v1.36.0` `deploy` rides out a restart too, telling apart a request that
+never left the runner from one the gateway may have read
+(`wacd-release.py`'s `never_sent()`). A connection refused, reset or closed
+while connecting or in the TLS handshake, a connect timeout, or no route is
+nothing sent: the release call, the downgrade pre-check and every status read
+of the proof are asked again with a fresh token, backing off from 5 seconds
+doubling to 30, for at most 90 seconds from the first such failure in a row
+and never past `wait_timeout`, and then `Release through the gateway` fails
+with `The gateway could not be reached for <n> s, longer than a restart is
+waited out or than the time left; ...`. A status read changes nothing, so
+one whose connection was reset or closed after it was sent, or whose answer
+was cut off, is asked again the same way. A `release` lost after it was sent
+may have been acted on, so it is never re-sent blind: `deploy` reads `status`
+first. When the status's `version` is the version being released, the proof
+goes on from that status as if the release had answered, and the receipt's
+`released` record is `{"version", "chart_digest", "from_status": true}`,
+taken from it. When it is not, the release is sent once more with a fresh
+token, which the gateway admits as an idempotent repeat: each token's `jti`
+is consumed once, a version already in its ledger under the same chart digest
+skips the fleet checks and is not recorded again, and the Application is
+patched only when it is not already synced at that digest. A second loss
+fails with `The gateway dropped the release of <version> after it was sent,
+twice, and its status does not show <version> targeted, so the release
+stopped; run the deploy again.` A certificate that fails verification and
+every other transport failure still fail at once with `release transport
+failed; check TLS trust and service readiness`, a coded refusal is still
+final, and `wait_timeout` still bounds it all. When the release waited out a
+restart, the run summary gains one line after the `### wac-cd deploy` table:
+`The gateway was restarting; the release waited <n> s for it.`
 
 Every other `plan` step has its own `timeout-minutes` (one to six minutes), so
 only the gateway wait can use most of the job's 68 minutes: a stalled checkout,
@@ -454,8 +483,8 @@ pipeline, which never published a deploy chart, publishes one on its first
 **No downgrade by re-run.** "Re-run failed jobs" on an older run skips `plan`
 and reuses its mode, so a run that tagged V and failed at deploy, re-run after
 a later merge released V+1, would put V back. Before its `release` request,
-`deploy` asks the gateway for `status` once (retrying only 503, within
-`wait_timeout`), and when the running `version` is a strict `X.Y.Z` newer than
+`deploy` asks the gateway for `status` once (retrying 503 and a gateway
+restart, within `wait_timeout`), and when the running `version` is a strict `X.Y.Z` newer than
 the version being released, it fails naming both and pointing at a rollback
 dispatch. A rollback skips that refusal; an equal, older or non-`X.Y.Z`
 running version (the bootstrap tag before the first release) proceeds.

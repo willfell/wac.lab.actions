@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -1335,34 +1336,198 @@ class PostTests(unittest.TestCase):
         self.assertEqual(json.loads(request["body"]), wacd.STATUS_BODY())
 
 
-class UnansweredReleaseTests(unittest.TestCase):
-    """Only plan's contract call rides out a gateway that answers nothing; deploy's release fails at once."""
+class Silent:
+    """A listener that reads a whole request and closes without answering: "reset" sends an RST, "eof" a FIN."""
 
-    def test_a_release_nothing_answers_fails_at_once_with_one_token(self):
+    def __init__(self, how):
+        self.bodies = []
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen()
+        self.how = how
+        self.url = f"http://127.0.0.1:{self.server.getsockname()[1]}/v1/release"
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while True:
+            try:
+                connection, _ = self.server.accept()
+            except OSError:
+                return
+            with connection:
+                connection.settimeout(5)
+                received = b""
+                try:
+                    while b"\r\n\r\n" not in received:
+                        received += connection.recv(65536)
+                    head, body = received.split(b"\r\n\r\n", 1)
+                    length = int(next(line.split(b":", 1)[1] for line in head.split(b"\r\n")
+                                      if line.lower().startswith(b"content-length:")))
+                    while len(body) < length:
+                        body += connection.recv(65536)
+                    self.bodies.append(json.loads(body))
+                except (OSError, ValueError, StopIteration):
+                    pass
+                if self.how == "reset":
+                    connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+
+    def close(self):
+        self.server.close()
+
+
+class RestartTests(unittest.TestCase):
+    """deploy rides out the gateway's Recreate rollout, about 35 s with nothing listening, at the CLI."""
+
+    def setUp(self):
         closed = Gateway((200, {}))
         closed.close()
+        self.refused_url = closed.url
+        self.silent = {how: Silent(how) for how in ("reset", "eof")}
+        for silent in self.silent.values():
+            self.addCleanup(silent.close)
 
+    def deploy(self, gateway, plan, rest=None, timeout="600", trust=lambda: None, connect=None):
+        """Run `release`, sending attempt i as plan[i] says (rest after the plan): None reaches the gateway,
+        "refused" a closed port, "reset" or "eof" a listener that reads the request and drops it."""
+        real_post = wacd.post
+        attempts, minted = [], []
+
+        def mint():
+            minted.append(f"minted.token.{len(minted)}")
+            return minted[-1]
+
+        def post(body, trust, timeout, mint_timeout=None):
+            how = plan[len(attempts)] if len(attempts) < len(plan) else rest
+            attempts.append((how, body["operation"]))
+            url = {None: gateway.url, "refused": self.refused_url}.get(how) or self.silent[how].url
+            with patch.object(wacd.ci, "URL", url):
+                return real_post(body, trust, timeout, mint_timeout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            summary, receipt = Path(tmp) / "summary.md", Path(tmp) / "receipt.json"
+            out, err = io.StringIO(), io.StringIO()
+            stack, clock = fake_clock()
+            with stack, patch.object(wacd, "post", post), patch.object(wacd.ci, "oidc_token", mint), \
+                    patch.object(wacd, "trust_context", trust), contextlib.ExitStack() as connecting, \
+                    patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                if connect is not None:
+                    connecting.enter_context(patch.object(socket, "create_connection", connect))
+                code = wacd.main(["wacd-release.py", *CliTests.release_argv(self, str(receipt), timeout=timeout)])
+            self.summary = summary.read_text() if summary.exists() else ""
+            self.receipt = json.loads(receipt.read_text()) if receipt.exists() else None
+        self.attempts, self.minted, self.clock, self.err = attempts, minted, clock, err.getvalue()
+        for token in minted:
+            self.assertNotIn(token, out.getvalue() + self.err + self.summary)
+        return code
+
+    def gateway(self, *responses):
+        gateway = Gateway(*responses)
+        self.addCleanup(gateway.close)
+        return gateway
+
+    def assertFreshTokens(self, gateway):
+        self.assertEqual(len(self.minted), len(self.attempts), "each attempt mints its own token")
+        self.assertEqual(len(set(self.minted)), len(self.minted))
+        self.assertEqual(len({auth for auth, _ in gateway.seen}), len(gateway.seen))
+
+    def test_refused_connections_on_the_release_and_a_status_read_are_waited_out(self):
+        gateway = self.gateway((200, running("0.0.9")), (200, released(not_ready())), (200, evidence()))
+        code = self.deploy(gateway, [None, "refused", "refused", None, "refused", None])
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual([op for _, op in self.attempts], ["status", "release", "release", "release", "status", "status"])
+        self.assertEqual([body for _, body in gateway.seen],
+                         [wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION), wacd.STATUS_BODY()])
+        self.assertFreshTokens(gateway)
+        self.assertEqual(self.clock.sleeps, [5, 10, 5])
+        self.assertEqual(self.summary, "\nThe gateway was restarting; the release waited 20 s for it.\n")
+
+    def test_no_line_when_the_gateway_answered_every_request(self):
+        gateway = self.gateway((200, running("0.0.9")), (200, released()))
+        self.assertEqual(self.deploy(gateway, []), 0, self.err)
+        self.assertEqual(self.summary, "")
+
+    def test_a_gateway_that_stays_away_past_the_window_could_not_be_reached(self):
         def no_route(*args, **kwargs):
             raise OSError(errno.EHOSTUNREACH, "No route to host")
 
-        for label, url, connect in (("refused", closed.url, None), ("no route to host", "http://127.0.0.1:9/v1/release",
-                                                                     no_route)):
-            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
-                minted = []
-                stack, clock = fake_clock()
-                out, err = io.StringIO(), io.StringIO()
-                with stack, patch.object(wacd.ci, "URL", url), \
-                        patch.object(wacd.ci, "oidc_token", lambda: minted.append(TOKEN) or TOKEN), \
-                        patch.object(wacd, "trust_context", lambda: None), \
-                        contextlib.ExitStack() as connecting, \
-                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                    if connect is not None:
-                        connecting.enter_context(patch.object(socket, "create_connection", connect))
-                    code = wacd.main(["wacd-release.py", *CliTests.release_argv(self, str(Path(tmp) / "r.json"))])
+        for label, how, connect in (("refused", "refused", None), ("no route to host", None, no_route)):
+            with self.subTest(case=label):
+                gateway = self.gateway((200, released()))
+                code = self.deploy(gateway, [], rest=how, connect=connect)
                 self.assertEqual(code, 1)
-                self.assertEqual(err.getvalue(), "wacd release: release transport failed; check TLS trust and "
-                                                 "service readiness\n")
-                self.assertEqual((len(minted), clock.sleeps), (1, []), "nothing is retried on the release path")
+                self.assertEqual(self.err, "wacd release: " + wacd.UNREACHABLE.format(seconds=90) + "\n")
+                self.assertIn("could not be reached", self.err)
+                self.assertEqual(gateway.seen, [])
+                self.assertGreater(len(self.minted), 2)
+                self.assertEqual(self.clock.now - 1000.0, sum(self.clock.sleeps))
+                self.assertGreaterEqual(sum(self.clock.sleeps), 90)
+                self.assertLess(sum(self.clock.sleeps), 90.1)
+                self.assertEqual(self.summary, "")
+
+    def test_the_window_never_outlasts_the_wait(self):
+        gateway = self.gateway((200, released()))
+        self.assertEqual(self.deploy(gateway, [], rest="refused", timeout="20"), 1)
+        self.assertIn("could not be reached for 20 s", self.err)
+        self.assertLessEqual(self.clock.now - 1000.0, 20.1)
+
+    def test_a_release_dropped_after_it_was_sent_goes_on_when_the_status_shows_it(self):
+        for how in ("reset", "eof"):
+            with self.subTest(drop=how):
+                self.silent[how].bodies.clear()
+                gateway = self.gateway((200, running("0.0.9")), (200, not_ready()), (200, evidence()))
+                code = self.deploy(gateway, [None, how])
+                self.assertEqual(code, 0, self.err)
+                self.assertEqual(self.silent[how].bodies, [wacd.RELEASE_BODY(VERSION)])
+                self.assertEqual([body for _, body in gateway.seen], [wacd.STATUS_BODY()] * 3,
+                                 "the release is never sent again")
+                self.assertEqual(self.receipt["released"],
+                                 {"version": VERSION, "chart_digest": CHART_DIGEST, "from_status": True})
+                self.assertFreshTokens(gateway)
+                self.assertEqual(self.summary, "")
+
+    def test_a_status_read_dropped_after_it_was_sent_is_asked_again(self):
+        gateway = self.gateway((200, running("0.0.9")), (200, released(not_ready())), (200, evidence()))
+        self.assertEqual(self.deploy(gateway, [None, None, "reset", None]), 0, self.err)
+        self.assertEqual(len(gateway.seen), 3)
+        self.assertIn("waited 5 s", self.summary)
+
+    def test_a_release_dropped_with_the_status_not_showing_it_is_sent_again_once(self):
+        gateway = self.gateway((200, running("0.0.9")), (200, running("0.0.9")), (200, released()))
+        code = self.deploy(gateway, [None, "reset"])
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual([body for _, body in gateway.seen],
+                         [wacd.STATUS_BODY(), wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION)])
+        self.assertEqual(self.silent["reset"].bodies, [wacd.RELEASE_BODY(VERSION)])
+        self.assertFreshTokens(gateway)
+        self.assertEqual(self.receipt["released"], released()["released"])
+
+    def test_a_release_dropped_twice_without_the_status_showing_it_stops(self):
+        gateway = self.gateway((200, running("0.0.9")))
+        code = self.deploy(gateway, [None, "reset", None, "reset", None])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.err, "wacd release: " + wacd.RESEND_LOST.format(version=VERSION) + "\n")
+        self.assertEqual(self.silent["reset"].bodies, [wacd.RELEASE_BODY(VERSION)] * 2)
+        self.assertEqual(len(self.attempts), 5)
+        self.assertIsNone(self.receipt)
+
+    def test_a_tls_failure_still_fails_at_once(self):
+        def unverified(*args, **kwargs):
+            raise ssl.SSLCertVerificationError(1, "certificate verify failed: self-signed certificate")
+
+        for label, patches in (("wrong protocol", ()), ("certificate", ((ssl.SSLContext, "wrap_socket", unverified),))):
+            with self.subTest(case=label), contextlib.ExitStack() as stack:
+                for target, name, value in patches:
+                    stack.enter_context(patch.object(target, name, value))
+                gateway = self.gateway((200, released()))
+                tls = Gateway.__new__(Gateway)
+                tls.url = gateway.url.replace("http://", "https://")
+                code = self.deploy(tls, [], trust=ssl.create_default_context)
+                self.assertEqual(code, 1)
+                self.assertEqual(self.err, "wacd release: release transport failed; check TLS trust and "
+                                           "service readiness\n")
+                self.assertEqual((len(self.minted), self.clock.sleeps), (1, []))
+                self.assertEqual(gateway.seen, [])
 
 
 class RefusalTests(unittest.TestCase):

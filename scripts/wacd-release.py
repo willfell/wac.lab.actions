@@ -89,6 +89,25 @@ deadline itself stops a read that trickles past every socket timeout; each
 command disarms it and restores the previous handler in a finally, so it
 cannot fire once the command has decided.
 
+`release` rides out a gateway restart. The gateway's Deployment is Recreate,
+so a rollout leaves about 35 s with nothing listening. A request that never
+left the runner (never_sent(): a connection refused, reset or closed in the
+TLS handshake, a connect timeout, no route to the host or network) is asked
+again with a fresh token, backing off from POLL_SECONDS to
+MAX_RESTART_POLL_SECONDS, for at most RESTART_WINDOW seconds from the first
+such failure in a row and never past --wait-timeout; then it fails with
+UNREACHABLE. That holds for the release call, the status pre-check and every
+status read of the proof. A status read is always safe to repeat, so one
+whose connection dropped after it was sent is asked again the same way. A
+release whose connection dropped after it was sent may have been acted on, so
+it is never re-sent blindly: the status is read first, and when it names the
+version being released the proof goes on from it as if the release had
+answered; when not, the release is re-sent once (the gateway admits an
+identical repeat, see proved()), and a second drop fails with RESEND_LOST. A
+certificate that fails verification, any other transport failure, a coded
+refusal and the deadline end the release as before. When the release waited
+out a restart, the run summary says how long (RESTARTED).
+
 The gateway contract (Plan 2, "Chart releases (wac-cd)") is isolated in
 RELEASE_BODY, STATUS_BODY and ready(). After the proof, github-release creates
 the GitHub Release for the tag with the job's GITHUB_TOKEN when none exists
@@ -157,6 +176,21 @@ RELEASES_UNREADABLE = (
     "the GitHub Releases of {app} could not be read, so this settings release cannot tell a rollback from an "
     "unfinished release; run it again."
 )
+RESTART_WINDOW = 90
+MAX_RESTART_POLL_SECONDS = 30
+UNREACHABLE = (
+    "The gateway could not be reached for {seconds} s, longer than a restart is waited out or than the time "
+    "left; check the runner's TLS trust and the gateway's readiness, then run the deploy again."
+)
+RESEND_LOST = (
+    "The gateway dropped the release of {version} after it was sent, twice, and its status does not show "
+    "{version} targeted, so the release stopped; run the deploy again."
+)
+DROPPED_UNREAD = (
+    "The gateway dropped the release of {version} after it was sent, and its status could not be read "
+    "before the deadline, so whether it acted is unknown; run the deploy again."
+)
+RESTARTED = "The gateway was restarting; the release waited {seconds} s for it."
 STATUS_REFUSED = (
     "The gateway refused the status read (HTTP 403 with no reason), so the running version is unknown "
     "and no settings were released."
@@ -216,10 +250,24 @@ class Unreachable(ReleaseError):
 class Unanswered(Unreachable):
     """Nothing answered the connection before any response (no_connection()).
 
-    The release path treats it as any Unreachable (same message, fails at
-    once). Only wacd-contract.py's plan call tells it apart, to ride out the
-    gateway's Recreate rollout, which leaves a short gap with no endpoint.
+    wacd-contract.py's plan call retries every one, since its contract
+    operation changes nothing. The release path tells its two kinds apart.
     """
+
+
+class Unsent(Unanswered):
+    """The request never left the runner (never_sent()): nothing reached the gateway."""
+
+
+class Dropped(Unanswered):
+    """The request was written and the connection closed before the status line."""
+
+
+class Interrupted(Unreachable):
+    """The request was written and its answer timed out or was cut off after the status line."""
+
+
+AFTER_SEND = (Dropped, Interrupted)
 
 
 NO_ROUTE = (errno.EHOSTUNREACH, errno.ENETUNREACH)
@@ -245,6 +293,19 @@ def no_connection(error):
     if isinstance(error, (ConnectionRefusedError, ConnectionResetError, ssl.SSLEOFError)):
         return True
     return isinstance(error, OSError) and error.errno in NO_ROUTE
+
+
+def never_sent(error):
+    """Whether a transport error came before the request was written: nothing reached the gateway.
+
+    urllib wraps in URLError only what fails while it connects (the TLS
+    handshake included) and writes the request; what fails reading the answer
+    comes through bare. So a wrapped no_connection() error never left the
+    runner, and a bare one (a reset or EOF before the status line) came after
+    the gateway may have read the request.
+    """
+    wrapped = isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError)
+    return wrapped and no_connection(error)
 
 
 class Unminted(ReleaseError):
@@ -341,13 +402,19 @@ def post(body, trust, timeout, mint_timeout=None):
     except urllib.error.HTTPError as error:
         response = error
     except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError) as error:
-        raise (Unanswered if no_connection(error) else Unreachable)(unreachable) from None
+        if never_sent(error):
+            raise Unsent(unreachable) from None
+        if no_connection(error):
+            raise Dropped(unreachable) from None
+        if isinstance(error, TimeoutError):
+            raise Interrupted(unreachable) from None
+        raise Unreachable(unreachable) from None
     try:
         with response:
             status = response.code if isinstance(response, urllib.error.HTTPError) else response.status
             raw = response.read(MAX_BODY + 1)
     except (OSError, http.client.HTTPException, ValueError):
-        raise Unreachable(unreachable) from None
+        raise Interrupted(unreachable) from None
     value = None
     if len(raw) <= MAX_BODY:
         try:
@@ -481,19 +548,77 @@ def refuse_downgrade(running, version, mode):
     )
 
 
-def proved(version, images, wait_timeout, request=None, mode=None):
+class Restart:
+    """The gateway restarts one release rode out: each a run of unanswered requests ended by an answer."""
+
+    def __init__(self):
+        self.since = None
+        self.interval = POLL_SECONDS
+        self.waited = 0.0
+
+    def failed(self, deadline):
+        """Back off before the next attempt, or fail once RESTART_WINDOW or the deadline is spent."""
+        now = time.monotonic()
+        if self.since is None:
+            self.since = now
+        spent = now - self.since
+        if spent >= RESTART_WINDOW or now >= deadline:
+            raise Unreachable(UNREACHABLE.format(seconds=int(spent)))
+        time.sleep(min(self.interval, RESTART_WINDOW - spent, deadline - now))
+        self.interval = min(self.interval * 2, MAX_RESTART_POLL_SECONDS)
+
+    def answered(self):
+        if self.since is not None:
+            self.waited += time.monotonic() - self.since
+        self.since = None
+        self.interval = POLL_SECONDS
+
+
+def proved(version, images, wait_timeout, request=None, mode=None, restart=None):
     if request is None:
         request = transport
         trust = trust_context()
     else:
         trust = None
     deadline = time.monotonic() + wait_timeout
+    restart = Restart() if restart is None else restart
 
     def send(body):
-        return request(body, trust, max(1, deadline - time.monotonic()))
+        """One answer to body, asking again while the gateway restarts.
+
+        A request that never left is asked again whatever it is; a status
+        read changes nothing, so it is asked again also when its connection
+        dropped after it was sent. A release that dropped after it was sent
+        goes back to the caller (AFTER_SEND).
+        """
+        again = (Unsent,) if body["operation"] == "release" else (Unsent, *AFTER_SEND)
+        while True:
+            try:
+                answer = request(body, trust, max(1, deadline - time.monotonic()))
+            except again:
+                restart.failed(deadline)
+                continue
+            restart.answered()
+            return answer
 
     def wait():
         time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
+
+    def targeted():
+        """(chart digest, status) when the status names version as targeted, else (None, status)."""
+        while time.monotonic() < deadline:
+            code, value = send(STATUS_BODY())
+            if code == 200:
+                if value.get("version") != version:
+                    return None, value
+                found = value.get("chart_digest")
+                if not isinstance(found, str) or not DIGEST_PATTERN.fullmatch(found):
+                    raise ReleaseError("the status names this version with no valid chart digest")
+                return found, value
+            if code != 503:
+                raise rejected("status read", code, value)
+            wait()
+        raise ReleaseError(DROPPED_UNREAD.format(version=version))
 
     checked = mode is None
     while not checked and time.monotonic() < deadline:
@@ -508,8 +633,38 @@ def proved(version, images, wait_timeout, request=None, mode=None):
 
     digest = None
     record = None
+    resent = False
     while checked and digest is None and time.monotonic() < deadline:
-        code, value = send(RELEASE_BODY(version))
+        try:
+            code, value = send(RELEASE_BODY(version))
+        except AFTER_SEND:
+            # The release was written and its answer lost, so the gateway may
+            # have acted. Its status says whether it did. If it did not, an
+            # identical release with a fresh token is an idempotent repeat in
+            # wac.lab's gateway (src/lab/cideploy at a2d221e):
+            # - policy.py:189-217 and :318 consume each token's jti once, so
+            #   only the token is single-use, and post() mints a new one;
+            # - server.py:288-293 runs the fleet checks only for a version the
+            #   ledger lacks, and backend.py:246-256 records a version once and
+            #   returns early for the same chart digest (another digest is
+            #   refused: "chart version was released under a different digest");
+            # - backend.py:466-498 patches the Application only when it is not
+            #   already Synced at that digest with automated sync, and the patch
+            #   sets the same digest under a resourceVersion test, so a lost
+            #   first patch is applied and a landed one is not repeated.
+            # One re-send covers a request lost in flight; a second loss stops.
+            found, value = targeted()
+            if found is not None:
+                digest = found
+                record = {"version": version, "chart_digest": found, "from_status": True}
+                if ready(value, version, digest, images):
+                    return value, record
+                wait()
+                break
+            if resent:
+                raise ReleaseError(RESEND_LOST.format(version=version)) from None
+            resent = True
+            continue
         if code == 200:
             digest = released_digest(value, version)
             record = value["released"]
@@ -1002,7 +1157,12 @@ def run(args):
     if not SHA_PATTERN.fullmatch(args.expected_sha):
         raise ReleaseError("--expected-sha must be 40 lowercase hex characters")
     images = parse_images(args.images, args.version)
-    result, record = proved(args.version, images, timeout, mode=args.mode)
+    restart = Restart()
+    try:
+        result, record = proved(args.version, images, timeout, mode=args.mode, restart=restart)
+    finally:
+        if restart.waited > 0:
+            summarize(RESTARTED.format(seconds=max(1, round(restart.waited))))
     plan = {
         "mode": args.mode,
         "version": args.version,
@@ -1014,15 +1174,19 @@ def run(args):
     return "Verified release receipt: " + args.receipt
 
 
-def summarize_refusal(sentence):
+def summarize(line):
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         return
     try:
         with open(path, "a", encoding="utf-8") as handle:
-            handle.write(f"\nThe gateway refused the release: {sentence}\n")
+            handle.write(f"\n{line}\n")
     except OSError:
         pass
+
+
+def summarize_refusal(sentence):
+    summarize(f"The gateway refused the release: {sentence}")
 
 
 def main(argv):
