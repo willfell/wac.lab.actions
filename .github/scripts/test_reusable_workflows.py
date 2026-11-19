@@ -1,6 +1,9 @@
+import ast
 import importlib.util
 import json
+import platform
 import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -678,6 +681,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         fake = (
             "#!/bin/bash\n"
             'case "$2" in\n'
+            "  *importlib*) exit 0 ;;\n"
             '  *sys.exit*) exit "$STUB_OLD" ;;\n'
             '  *print*) echo "Python $STUB_VERSION" ;;\n'
             "esac\n"
@@ -700,6 +704,55 @@ class ReusableWorkflowTests(unittest.TestCase):
                     )
                 if label == "absent":
                     self.assertIn(f"{job_name} needs python3 3.12 or later on the runner; found no python3 on ci-light-abc12 (Linux, ARM64).", result.stdout)
+        self.assertTrue(sys.version_info >= (3, 12), "the real-interpreter cases below need 3.12 or later")
+        runner_env = {"JOB_RUNNER_NAME": "ci-light-abc12", "JOB_RUNNER_OS": "Linux", "JOB_RUNNER_ARCH": "ARM64"}
+        for broken in (None, "ssl", "http.client", "uuid", "json"):
+            with self.subTest(broken_module=broken), tempfile.TemporaryDirectory() as tmp:
+                bin_dir = Path(tmp) / "bin"
+                lib_dir = Path(tmp) / "lib"
+                bin_dir.mkdir()
+                lib_dir.mkdir()
+                (bin_dir / "python3").write_text(f'#!/bin/bash\nexec "{sys.executable}" "$@"\n')
+                (bin_dir / "python3").chmod(0o755)
+                if broken is not None:
+                    target = lib_dir.joinpath(*broken.split("."))
+                    if "." in broken:
+                        target.parent.mkdir(parents=True)
+                        (target.parent / "__init__.py").write_text("")
+                    target.with_suffix(".py").write_text("raise ImportError('stripped out of this python3')\n")
+                env = {"PATH": str(bin_dir), "PYTHONPATH": str(lib_dir), **runner_env}
+                result = subprocess.run(["/bin/bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+                if broken is None:
+                    self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+                    continue
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(
+                    result.stdout,
+                    f"::error::wac-cd: {job_name} needs python3 3.12 or later on the runner; found "
+                    f"Python {platform.python_version()} at {bin_dir}/python3, which cannot import {broken} "
+                    "on ci-light-abc12 (Linux, ARM64).\n",
+                )
+
+    def test_wac_cd_python_check_lists_every_standard_module_the_scripts_import(self):
+        steps = self.wac_cd()["jobs"]["plan"]["steps"]
+        listed = re.search(r"^modules=\((.*?)\)$", steps[0]["run"], re.M).group(1).split()
+        scripts = Path(__file__).resolve().parents[2] / "scripts"
+        imported = set()
+        for name in ("wacd-contract", "wacd-release", "ci-release", "wacd-chart", "wacd-shadow", "wacd-profile",
+                     "wacd-tag", "wacd-version"):
+            for node in ast.walk(ast.parse((scripts / f"{name}.py").read_text())):
+                if isinstance(node, ast.Import):
+                    imported.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    imported.add(node.module)
+        imported.discard("__future__")
+        self.assertEqual(sorted(listed), sorted(imported), "the check proves exactly the modules the scripts import")
+        for module_name in listed:
+            self.assertIn(module_name.split(".")[0], sys.stdlib_module_names)
+        for job_name in ("deploy", "shadow"):
+            check = self.wac_cd()["jobs"][job_name]["steps"][0 if job_name == "deploy" else 1]["run"]
+            with self.subTest(job=job_name):
+                self.assertEqual(re.search(r"^modules=\((.*?)\)$", check, re.M).group(1).split(), listed)
 
     def test_wac_cd_plan_fails_with_the_refusal_sentence(self):
         import os

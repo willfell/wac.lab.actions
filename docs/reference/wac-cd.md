@@ -152,15 +152,23 @@ jobs" runs `plan` again, which reads the copy afresh and replaces the artifact.
 **What runs beside the token.** `plan`, `shadow` and `deploy` hold
 `id-token: write`, and a GitHub OIDC token does not say which step minted it, so
 none of them runs anything fetched at run time. Each uses the runner image's own
-`python3`, which its first step requires to be 3.12 or later, failing with the
+`python3`, which its first step requires to be 3.12 or later and to import the standard modules the scripts need, failing with the
 runner's name, OS and architecture and the `python3` path and version it found
-(`shadow` records its clock first, then checks), and each uses only actions
+(`shadow` records its clock stamp first, then checks), and each uses only actions
 pinned by full commit SHA, with the tag in each step's name. `deploy` and
 `shadow` used to run `actions/setup-python` on tag-pinned actions, which
 downloaded a Python build at run time on the fleet's runners. A caller's
-`runner` (and `build_runner`) must therefore provide `python3` 3.12 or later:
-the fleet's runner image has 3.12.3, and a runner on an image with an older
-Python fails these jobs at that first step, before any token is requested.
+`runner`, or `CI_RUNNER_SMALL` when `runner` is empty, must therefore provide
+`python3` 3.12 or later with the standard library intact: the fleet's runner
+image has 3.12.3, and a runner on an image with an older or stripped-down Python
+fails these jobs at that step, before any token is requested. `build_runner`
+routes only `build`, which holds no `id-token` and still uses `setup-python`,
+so the requirement does not fall on it. The step also imports every standard
+module the scripts these jobs run import (`ssl`, `json`, `http.client`,
+`urllib.request` and the rest, held to the scripts' imports by the workflow
+test), and names the first one it cannot import together with the runner, the
+`python3` path and the version, instead of failing later inside the gateway
+call.
 `.github/scripts/test_reusable_workflows.py` holds every job of `wac-cd` and
 `wac-ci` that holds `id-token: write` to an allowlist of commit-pinned actions,
 exempts none, and refuses a step that runs `install-tools.sh`, `pip`, `npm`,

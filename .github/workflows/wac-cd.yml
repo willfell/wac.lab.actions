@@ -91,14 +91,24 @@ jobs:
           JOB_RUNNER_OS: ${{ runner.os }}
           JOB_RUNNER_ARCH: ${{ runner.arch }}
         run: |
+          modules=(argparse base64 binascii hashlib http.client importlib.util json os pathlib re shutil signal ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then
-            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
-              exit 0
-            fi
             version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
             found="$version at $python"
+            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              if missing="$("$python" -c 'import importlib, sys
+          for name in sys.argv[1:]:
+              try:
+                  importlib.import_module(name)
+              except Exception:
+                  print(name)
+                  sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
+                exit 0
+              fi
+              found="$found, which cannot import ${missing:-its standard modules}"
+            fi
           fi
           echo "::error::wac-cd: plan needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
           exit 1
@@ -315,14 +325,24 @@ jobs:
           JOB_RUNNER_OS: ${{ runner.os }}
           JOB_RUNNER_ARCH: ${{ runner.arch }}
         run: |
+          modules=(argparse base64 binascii hashlib http.client importlib.util json os pathlib re shutil signal ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then
-            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
-              exit 0
-            fi
             version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
             found="$version at $python"
+            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              if missing="$("$python" -c 'import importlib, sys
+          for name in sys.argv[1:]:
+              try:
+                  importlib.import_module(name)
+              except Exception:
+                  print(name)
+                  sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
+                exit 0
+              fi
+              found="$found, which cannot import ${missing:-its standard modules}"
+            fi
           fi
           echo "::error::wac-cd: shadow needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
           exit 1
@@ -594,14 +614,24 @@ jobs:
           JOB_RUNNER_OS: ${{ runner.os }}
           JOB_RUNNER_ARCH: ${{ runner.arch }}
         run: |
+          modules=(argparse base64 binascii hashlib http.client importlib.util json os pathlib re shutil signal ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then
-            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
-              exit 0
-            fi
             version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
             found="$version at $python"
+            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              if missing="$("$python" -c 'import importlib, sys
+          for name in sys.argv[1:]:
+              try:
+                  importlib.import_module(name)
+              except Exception:
+                  print(name)
+                  sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
+                exit 0
+              fi
+              found="$found, which cannot import ${missing:-its standard modules}"
+            fi
           fi
           echo "::error::wac-cd: deploy needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
           exit 1
