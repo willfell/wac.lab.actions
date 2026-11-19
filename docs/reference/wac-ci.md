@@ -58,7 +58,10 @@ and `agents-md` peak under 400Mi and run for seconds to a minute. A caller
 that passes `build_runner: ${{ vars.CI_RUNNER_STANDARD }}` and no `runner`
 sends `checks` there and leaves the other four jobs on its `CI_RUNNER_SMALL`.
 Passing only `runner` still puts every job on that runner, as before
-`build_runner` existed. Six jobs per pull request on a three-pod dind pool is
+`build_runner` existed. `render` pulls `wac-app` from the in-cluster registry, so this
+split fits only a caller whose `CI_RUNNER_SMALL` is a Lab pool. A repository
+whose small size is a hosted label (mcp.argo, in wac.lab.iac's `github` runner
+mode) keeps passing `runner`. Six jobs per pull request on a three-pod dind pool is
 how wac.hemi waited up to 17 minutes for a slot on 2026-11-18 while each job
 ran for under four.
 

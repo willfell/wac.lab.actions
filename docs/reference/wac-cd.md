@@ -84,7 +84,9 @@ walking away from it.
 Only `build` runs `docker build`, so only `build` needs a dind runner; the
 others push a chart with helm, call the gateway or the GitHub API, and run on
 `CI_RUNNER_SMALL` when the caller passes `build_runner` and no `runner`. A
-caller that passes only `runner` keeps every job on it. `plan` through
+caller that passes only `runner` keeps every job on it. `publish`, `deploy` and `shadow` reach the in-cluster registry,
+the gateway and hemi, so a caller whose `CI_RUNNER_SMALL` is a hosted label
+keeps passing `runner`. `plan` through
 `github-release` run one after another, so on a three-pod dind pool each of
 them used to queue again for a slot behind every other repo's jobs.
 
