@@ -1,5 +1,6 @@
 import ast
 import importlib.util
+import itertools
 import json
 import platform
 import re
@@ -1001,7 +1002,11 @@ class ReusableWorkflowTests(unittest.TestCase):
         Each planted module writes a marker when it is imported. The scripts are
         stand-ins that import the same standard modules, every python3 the steps
         start is the real interpreter (logged by a PATH wrapper), and git, the
-        version check and the inline Python run for real.
+        version check and the inline Python run for real. Each protection must
+        hold on its own: every step runs once with the job's env and once with
+        PYTHONSAFEPATH taken out of it, so a `python3 -c` without -I is caught,
+        and each token job's env alone must keep a bare `python3 -c` from
+        importing the plant, so a job without PYTHONSAFEPATH is caught.
         """
         import os
         import shutil
@@ -1093,11 +1098,13 @@ class ReusableWorkflowTests(unittest.TestCase):
                 key = (job_name, step["name"])
                 self.assertIn(key, scenarios, f"{workflow} {job_name} step {step['name']!r} has no planted-repository run")
                 covered.add(key)
-                for step_env, expected in scenarios[key]:
-                    with self.subTest(job=job_name, step=step["name"], env=step_env):
+                for (step_env, expected), protection in itertools.product(scenarios[key], ("job env", "-I alone")):
+                    with self.subTest(job=job_name, step=step["name"], env=step_env, protection=protection):
                         self.assertEqual(set(step_env), set(step.get("env") or {}))
                         python_log.write_text("")
-                        result = run(step["run"], {**base, **{k: str(v) for k, v in job_env.items()}, **step_env})
+                        env = {k: str(v) for k, v in job_env.items()
+                               if protection == "job env" or k != "PYTHONSAFEPATH"}
+                        result = run(step["run"], {**base, **env, **step_env})
                         self.assertEqual(marks(), [], f"{step['name']} imported a module the checkout planted")
                         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                         if "python3" in step["run"]:
@@ -1105,9 +1112,11 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(covered, set(scenarios), "a planted-repository run for a step that no longer exists")
 
         probe = "python3 -c 'import json, ssl'"
-        plan_env = {k: str(v) for k, v in (self.wac_cd()["jobs"]["plan"].get("env") or {}).items()}
-        self.assertEqual(run(probe, {**base, **plan_env}).returncode, 0)
-        self.assertEqual(marks(), [], "the job's own env keeps a step that forgets -I from importing the checkout")
+        for workflow, job_name, job in token_jobs:
+            with self.subTest(job=job_name, protection="job env alone"):
+                job_env = {k: str(v) for k, v in (job.get("env") or {}).items()}
+                self.assertEqual(run(probe, {**base, **job_env}).returncode, 0)
+                self.assertEqual(marks(), [], "the job's own env keeps a step that forgets -I from importing the checkout")
         self.assertEqual(run(probe, base).returncode, 0)
         self.assertEqual(marks(), ["json.py.ran", "ssl.py.ran"], "without it the plant is imported: the probe can see it")
 
@@ -1158,17 +1167,28 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertIn(f"{job_name} needs python3 3.12 or later on the runner; found no python3 on ci-light-abc12 (Linux, ARM64).", result.stdout)
         self.assertTrue(sys.version_info >= (3, 12), "the real-interpreter cases below need 3.12 or later")
         runner_env = {"JOB_RUNNER_NAME": "ci-light-abc12", "JOB_RUNNER_OS": "Linux", "JOB_RUNNER_ARCH": "ARM64"}
-        for broken in (None, "ssl", "http.client", "uuid", "json"):
+        finder = ("import sys; sys.meta_path.insert(0, type('Broken', (), {{'find_spec': staticmethod("
+                  "lambda name, *rest: ({action}) if name == 'uuid' else None)}})())\n")
+        cases = [(None, None, "")]
+        cases += [(name, f"import sys; sys.modules[{name!r}] = None\n", f"cannot import {name} (ModuleNotFoundError)")
+                  for name in ("ssl", "http.client", "uuid", "json")]
+        cases += [
+            ("uuid interrupted", finder.format(action="(_ for _ in ()).throw(KeyboardInterrupt())"),
+             "cannot import uuid (KeyboardInterrupt)"),
+            ("uuid killed", finder.format(action="__import__('os').kill(__import__('os').getpid(), 9)"),
+             "stopped with exit status 137 while importing its standard modules"),
+        ]
+        for broken, pth, said in cases:
             with self.subTest(broken_module=broken), tempfile.TemporaryDirectory() as tmp:
                 venv = Path(tmp) / "venv"
                 subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
                 bin_dir = venv / "bin"
-                if broken is not None:
+                if pth is not None:
                     site = subprocess.run(
                         [str(bin_dir / "python3"), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
                         check=True, capture_output=True, text=True,
                     ).stdout.strip()
-                    (Path(site) / "stripped.pth").write_text(f"import sys; sys.modules[{broken!r}] = None\n")
+                    (Path(site) / "stripped.pth").write_text(pth)
                 env = {"PATH": str(bin_dir), **runner_env}
                 result = subprocess.run(["/bin/bash", "-c", step["run"]], env=env, capture_output=True, text=True)
                 if broken is None:
@@ -1178,7 +1198,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(
                     result.stdout,
                     f"::error::{workflow}: {job_name} needs python3 3.12 or later on the runner; found "
-                    f"Python {platform.python_version()} at {bin_dir}/python3, which cannot import {broken} "
+                    f"Python {platform.python_version()} at {bin_dir}/python3, which {said} "
                     "on ci-light-abc12 (Linux, ARM64).\n",
                 )
 

@@ -109,12 +109,18 @@ jobs:
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
-              except Exception:
-                  print(name)
+              except BaseException as error:
+                  print(name + " (" + type(error).__name__ + ")")
                   sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
                 exit 0
+              else
+                status=$?
               fi
-              found="$found, which cannot import ${missing:-its standard modules}"
+              if [[ -n "$missing" ]]; then
+                found="$found, which cannot import $missing"
+              else
+                found="$found, which stopped with exit status $status while importing its standard modules"
+              fi
             fi
           fi
           echo "::error::wac-cd: plan needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
@@ -609,12 +615,18 @@ jobs:
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
-              except Exception:
-                  print(name)
+              except BaseException as error:
+                  print(name + " (" + type(error).__name__ + ")")
                   sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
                 exit 0
+              else
+                status=$?
               fi
-              found="$found, which cannot import ${missing:-its standard modules}"
+              if [[ -n "$missing" ]]; then
+                found="$found, which cannot import $missing"
+              else
+                found="$found, which stopped with exit status $status while importing its standard modules"
+              fi
             fi
           fi
           echo "::error::wac-cd: shadow needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
@@ -965,12 +977,18 @@ jobs:
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
-              except Exception:
-                  print(name)
+              except BaseException as error:
+                  print(name + " (" + type(error).__name__ + ")")
                   sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
                 exit 0
+              else
+                status=$?
               fi
-              found="$found, which cannot import ${missing:-its standard modules}"
+              if [[ -n "$missing" ]]; then
+                found="$found, which cannot import $missing"
+              else
+                found="$found, which stopped with exit status $status while importing its standard modules"
+              fi
             fi
           fi
           echo "::error::wac-cd: deploy needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."

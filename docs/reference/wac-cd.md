@@ -216,9 +216,10 @@ routes only `build`, which holds no `id-token` and still uses `setup-python`,
 so the requirement does not fall on it. The step also imports every standard
 module the scripts these jobs run import (`ssl`, `json`, `http.client`,
 `urllib.request` and the rest, held to the scripts' imports by the workflow
-test), and names the first one it cannot import together with the runner, the
-`python3` path and the version, instead of failing later inside the gateway
-call.
+test), and names the first one it cannot import, with the exception's type,
+together with the runner, the `python3` path and the version, instead of
+failing later inside the gateway call; an interpreter that dies importing
+them (a signal, a crash) is named by its exit status.
 `.github/scripts/test_reusable_workflows.py` holds every job of every reusable
 workflow here, and every job anywhere that holds `id-token: write`, to an
 allowlist of actions pinned by full commit SHA, one commit per action, each
@@ -246,7 +247,10 @@ shared checkout and empty Helm directories. No step sources a file, and none
 runs `npm`, `node` or `make`. `.github/scripts/test_reusable_workflows.py` runs
 every step of these jobs, and of `wac-ci`'s `contract`, in a checkout that
 plants `json.py`, `ssl.py` and `sitecustomize.py`, each of which leaves a
-marker when imported, and fails on any marker.
+marker when imported, and fails on any marker. It runs each step twice, once
+with the job's env and once without `PYTHONSAFEPATH`, and checks that each
+job's env alone keeps a bare `python3 -c` from the plant, so removing either
+protection from any of these jobs fails it.
 
 A 503 (`release dependency unavailable`: GitHub slow, rate-limited or down
 behind the gateway) is retried with a fresh token within `wait_timeout`
