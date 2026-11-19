@@ -55,7 +55,9 @@ It runs six jobs. `contract` runs first and decides where `checks` and
 `ci.commands` in order, each in its own log group. For `stack: node` it runs
 `npm ci` first, but only when the repo has a root `package.json`; a repo
 without one, such as finance, lists `npm ci --prefix <dir>` in `ci.commands`
-itself. The npm cache is keyed on every `package-lock.json` in the repo.
+itself. The npm cache is keyed on every `package-lock.json` in the repo. Before
+the root `npm ci` and `ci.commands`, it probes the private `@willfell`
+packages every lockfile pins (below).
 Nothing implicit runs for `go`; setup-go takes `ci.go_version`, or reads the version from `ci.go_version_file` when the profile names one (from a `go.mod`, its `toolchain` line before its `go` line). setup-go sets `GOTOOLCHAIN=local` for every later step, so the commands run on the Go it installed and never download another toolchain. A `ci.go_version` (hemi's `build.goVersion`) below the `go` line of the repo's `go.mod` therefore fails `checks`; before `v1.36.0` Go downloaded the newer toolchain and the run passed. The durable setting is `go_version_file: go.mod` (hemi's `build.goVersionFile`) with `go_version` dropped, since the profile refuses the two together, so the gate always runs the Go the module asks for. When the profile lists `ci.apt_packages`,
 `checks` first runs `sudo apt-get update` and
 `sudo apt-get install -y --no-install-recommends` with those packages, before
@@ -100,6 +102,48 @@ object by object, failing on any difference its normalization does not cover
 covered ones). The normalization is ported from lab's `tests/wac_app/render.py`
 and is the one copy outside lab. The caller removes the input at cutover step
 3, when `deploy/k8s` is deleted.
+
+## The private package probe
+
+From `v1.36.0`, for `stack: node`, `checks` probes the fleet's private
+`@willfell` packages after setup-node and before the root `npm ci` and
+`ci.commands`, so a locked version missing from the registry fails with one
+plain sentence instead of an install error midway through `npm ci`.
+`scripts/wacd-npm-probe.py` reads every `package-lock.json` the node-layout
+step found (finance's `app/package-lock.json` as much as hemi's root one) and
+takes each `node_modules/@willfell/<name>` entry, nested ones included. For
+each locked version it runs, in that lockfile's directory, with the
+`NODE_AUTH_TOKEN` `npm ci` gets (`npm_token`, or the job's GitHub token):
+
+```sh
+npm view "<name>@<version>" version --prefer-online --userconfig .npmrc
+```
+
+That is the probe hemi carries in its own `checks` gate, with the version
+taken from the lockfile and checked before npm runs, since
+`npm view <name>@` resolves the latest version and exits 0. Every lockfile is
+read first, and the step fails before any request when an entry has no exact
+version, a lockfile has no `packages` map (lockfileVersion 1), or a lockfile
+locks `@willfell` packages with no `.npmrc` beside it. The probes then run in
+order and stop at the first the registry does not confirm: npm exits
+non-zero, or prints anything but the locked version. A workspace link
+(`"link": true`, as the wac repo's own `@willfell/wac-ui` is) is installed
+from the repository and is named and skipped. A repo with no lockfile, or no
+`@willfell` entry, gets one line saying there is nothing to probe. The token
+reaches npm through the environment and is never printed; lockfile paths
+reach the script as arguments, never through `${{ }}` in the shell; and the
+script runs as `python3 -I` from the shared checkout and imports nothing from
+the repository.
+
+A repository that pins `v1.36.0` or later can drop its own probe commands,
+the `npm view "@willfell/...` lines (pinned or read from the lockfile), since
+`checks` now runs the same probe for every lockfile before them. On its files
+they are entries of `ci.commands` in `.github/wacd.json`; cut over, they are
+commands of hemi's `checks` gate, changed in hemi like any other setting. The
+list must keep at least one command, and a repository whose own tests require
+the probe commands (wac.hemi's `deploy-contract.test.ts` does) changes those
+tests in the same pull request. Nothing breaks if the commands stay: each
+then runs twice.
 
 ## The contract job
 

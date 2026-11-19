@@ -38,6 +38,7 @@ uv run --with pyyaml python scripts/tests/ci-release.test.py  # lab-release's cl
 python3 scripts/tests/runner-policy.test.py  # actionlint's fleet runner policy
 python3 scripts/tests/lab-route.test.py  # lab-route, against a stub Prometheus
 python3 scripts/tests/wacd-profile.test.py  # the wacd.json validator
+python3 scripts/tests/wacd-npm-probe.test.py  # wac-ci's private npm package probe, against a stub npm
 python3 scripts/tests/wacd-version.test.py  # wac-cd version planning, against temp git repos
 WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-chart.test.py  # deploy chart packaging; needs helm
 python3 scripts/tests/wacd-release.test.py  # wac-cd's gateway client, against a stub gateway

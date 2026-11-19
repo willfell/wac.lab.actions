@@ -223,6 +223,20 @@ jobs:
         with:
           go-version: ${{ fromJSON(steps.profile.outputs.ci).go_version }}
           go-version-file: ${{ fromJSON(steps.profile.outputs.ci).go_version_file }}
+      - name: Probe the private npm packages
+        if: fromJSON(steps.profile.outputs.ci).stack == 'node'
+        shell: bash
+        env:
+          LOCKFILES: ${{ steps.layout.outputs.lockfiles }}
+          NODE_AUTH_TOKEN: ${{ secrets.npm_token || github.token }}
+        run: |
+          lockfiles=()
+          while IFS= read -r lockfile; do
+            if [[ -n "$lockfile" ]]; then
+              lockfiles+=("$lockfile")
+            fi
+          done <<< "$LOCKFILES"
+          python3 -I "$WACD_SCRIPTS"/wacd-npm-probe.py . "${lockfiles[@]}"
       - name: Install root node dependencies
         if: fromJSON(steps.profile.outputs.ci).stack == 'node' && steps.layout.outputs.root_package == 'true'
         shell: bash

@@ -371,6 +371,72 @@ class ReusableWorkflowTests(unittest.TestCase):
                 ],
             )
 
+    def test_wac_ci_probes_the_private_packages_before_any_npm_install(self):
+        import yaml
+
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
+        steps = doc["jobs"]["checks"]["steps"]
+        names = [s.get("name") or s.get("uses") for s in steps]
+        probe = names.index("Probe the private npm packages")
+        step = steps[probe]
+        root_install = steps[names.index("Install root node dependencies")]
+        self.assertEqual(step["if"], "fromJSON(steps.profile.outputs.ci).stack == 'node'")
+        self.assertEqual(
+            step["env"],
+            {
+                "LOCKFILES": "${{ steps.layout.outputs.lockfiles }}",
+                "NODE_AUTH_TOKEN": root_install["env"]["NODE_AUTH_TOKEN"],
+            },
+        )
+        self.assertNotIn("${{", step["run"])
+        setup_node = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/setup-node@"))
+        self.assertLess(names.index("Read the node package layout"), probe)
+        self.assertLess(setup_node, probe)
+        for later in ("Install root node dependencies", "Run the profile's CI commands"):
+            with self.subTest(step=later):
+                self.assertLess(probe, names.index(later))
+
+    def test_wac_ci_probe_step_passes_each_lockfile_and_ignores_the_callers_python_path(self):
+        import json
+        import os
+        import subprocess
+        import yaml
+
+        root = Path(__file__).resolve().parents[2]
+        doc = yaml.safe_load((root / ".github" / "workflows" / "wac-ci.yml").read_text())
+        step = next(s for s in doc["jobs"]["checks"]["steps"] if s.get("name") == "Probe the private npm packages")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            log = tmp / "npm.log"
+            npm = bin_dir / "npm"
+            npm.write_text('#!/bin/sh\nprintf "%s|%s\\n" "$(basename "$PWD")" "$2" >> "$NPM_LOG"\necho "${2##*@}"\n')
+            npm.chmod(0o755)
+            planted = tmp / "planted"
+            planted.mkdir()
+            (planted / "json.py").write_text("raise SystemExit('the caller python path was imported')\n")
+            repo = tmp / "repo"
+            for directory, version in (("app", "0.24.0"), ("my docs", "0.21.0")):
+                (repo / directory).mkdir(parents=True)
+                (repo / directory / ".npmrc").write_text("@willfell:registry=https://npm.pkg.github.com\n")
+                (repo / directory / "package-lock.json").write_text(json.dumps(
+                    {"lockfileVersion": 3, "packages": {"node_modules/@willfell/wac-ui": {"version": version}}}
+                ))
+            env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "NPM_LOG": str(log),
+                   "WACD_SCRIPTS": str(root / "scripts"), "PYTHONPATH": str(planted), "NODE_AUTH_TOKEN": "t"}
+            for label, lockfiles, expected in (
+                ("two lockfiles", "app/package-lock.json\nmy docs/package-lock.json",
+                 ["app|@willfell/wac-ui@0.24.0", "my docs|@willfell/wac-ui@0.21.0"]),
+                ("none", "", []),
+            ):
+                with self.subTest(case=label):
+                    log.unlink(missing_ok=True)
+                    result = subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=repo,
+                                            env={**env, "LOCKFILES": lockfiles}, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(log.read_text().splitlines() if log.exists() else [], expected)
+
     def test_wac_cd_rollback_version_must_be_strict_semver(self):
         import os
         import subprocess

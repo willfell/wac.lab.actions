@@ -54,6 +54,7 @@ jobs:
         run: |
           helm version
           python scripts/tests/wacd-profile.test.py
+          python scripts/tests/wacd-npm-probe.test.py
           python scripts/tests/wacd-version.test.py
           python scripts/tests/wacd-chart.test.py
           python scripts/tests/wacd-release.test.py
