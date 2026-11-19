@@ -3,7 +3,9 @@
 The merge half of wacd: on a push to `main` it versions the app, builds and
 pushes its images, publishes the deploy chart and git tag, releases through
 Lab's gateway, proves the served build, and records a GitHub Release. The
-profile it reads is in [The wacd profile](wacd-profile.md).
+profile it reads is in [The wacd profile](wacd-profile.md); once an app is cut
+over, it reads the same settings from the copy hemi stores instead (see
+**Settings** below).
 
 ```yaml
 name: cd
@@ -43,8 +45,8 @@ this one. It also means this repository cannot be transferred out of
 otherwise every app's next release is denied.
 
 The calling job grants `contents: write` (the tag and the GitHub Release),
-`id-token: write` (the gateway's OIDC token) and `packages: read` (private npm
-packages during the build), and declares no `environment`: the gateway rejects
+`id-token: write` (the gateway's OIDC token, which `plan`, `shadow` and
+`deploy` ask for) and `packages: read` (private npm packages during the build), and declares no `environment`: the gateway rejects
 a token that carries that claim. The trigger is a push to `main` plus a
 `workflow_dispatch` whose own `version` input is passed as `rollback_version`;
 on a push that input is empty.
@@ -89,6 +91,73 @@ the gateway and hemi, so a caller whose `CI_RUNNER_SMALL` is a hosted label
 keeps passing `runner`. `plan` through
 `github-release` run one after another, so on a three-pod dind pool each of
 them used to queue again for a slot behind every other repo's jobs.
+
+**Settings.** Before it reads a profile, `plan` asks Lab's gateway once for
+the app's settings copy: `scripts/wacd-contract.py fetch --out .wacd-contract`
+posts `{"operation": "contract"}` to the same gateway address as `release`,
+with a fresh OIDC token (audience `wacwini:ci-deploy`) for every attempt. The
+gateway answers with hemi's copy, `active.json` in wac.fleet, and the wac.fleet
+commit it read it at, or with `{"copy": null, "fleet_commit": null}` for a
+repository never cut over. Then:
+
+| The gateway answers | Settings come from | The chart also carries |
+| --- | --- | --- |
+| a copy whose `flags.source` is `hemi` | the copy: its profile is derived by `wacd-profile.py --contract`, its `runtime` is the values | `wacwini.com/revision`, `wacwini.com/fleet-commit` |
+| a copy whose `flags.source` is `files` | `.github/wacd.json` and its values file, as before | `wacwini.com/revision`, `wacwini.com/fleet-commit` |
+| no copy, and the repository has `.github/wacd.json` | `.github/wacd.json` and its values file, exactly as before | nothing new |
+| anything else | nothing: `plan` fails before anything is built | |
+
+Anything else is a copy that cannot be read, a copy whose
+`identity.repositoryId` is not the job token's `repository_id`, a copy whose
+source is `files` (or no copy) in a repository with no `.github/wacd.json`, a
+denial, any other status, or a gateway still answering 503 after the bound.
+A cut-over repository whose copy is missing is refused by the gateway itself
+(`fleet_copy_missing`), never answered with null, so it cannot fall back to
+stale files.
+
+When the copy is acted on, `.wacd-contract/` holds `contract.json` (the copy as
+received), `profile.json` (the profile it stands for, in `.github/wacd.json`'s
+shape, its `values_file` pointing at `.wacd-contract/values.json`) and
+`values.json` (the copy's `runtime`). Whenever a copy exists, `plan` uploads
+the directory as the artifact `wac-cd-contract`. `plan` reads its profile
+outputs from the copy; `build`, `deploy` and `github-release` take every
+setting from those outputs and read no settings file; `publish` downloads the
+artifact and packages the chart from `profile.json` with
+`--values-json .wacd-contract/values.json`. So a release ships the revision
+`plan` read, even when a newer one is saved while it builds; nothing after
+`plan` asks the gateway or hemi for settings. A `.wacd-contract/` committed to
+the repository is deleted before `plan` writes and before `publish` downloads,
+so it is never acted on.
+
+A 503 (`release dependency unavailable`: GitHub slow, rate-limited or down
+behind the gateway) is retried every 5 seconds within 120 seconds, each
+request bounded at 30 seconds, like a `release`. A 403 is not retried. A denial is told apart from a 503 by
+its status, never by its body, and the body is never printed: a 403 without a
+`reason` means the gateway did not verify the caller, and a 403 with one of the
+gateway's codes gets this sentence in the run summary:
+
+| Code | Sentence |
+| --- | --- |
+| `fleet_copy_missing` | This app has released from hemi's settings before, and the gateway found no copy of them, so nothing was built. |
+| `fleet_copy_unreadable` | The gateway could not read hemi's copy of this app's settings, so nothing was built. |
+| `fleet_copy_mismatch` | hemi's copy of this app's settings names another app, so nothing was built. |
+| `fleet_commit_not_on_default_branch` | The settings this release was planned with are no longer on the fleet copy's main line. |
+| `fleet_commit_older_than_last_release` | The settings this release was planned with are older than the settings already released. |
+| `revision_annotation_missing` | This app releases from hemi's settings, and this chart does not say which revision of them it was built from. |
+| `revision_mismatch` | This chart names a different revision of the settings from the copy it points to. |
+
+`fleet_commit_not_on_default_branch`, `fleet_commit_older_than_last_release`,
+`revision_annotation_missing` and `revision_mismatch` are the gateway's release
+checks, so they answer a `release` rather than this request; `deploy` still
+reports a refused release by its HTTP status alone.
+
+A code not in that list gets `The gateway refused to hand over this app's settings for a reason this wac-cd does not know (code <code>).`,
+so a code added to the gateway later cannot break a release summary. A
+denial without a code reads `The gateway did not accept this run as a release of a registered app, so it handed over no settings.` The run summary's
+`wac-cd settings` section names the source, the revision and the fleet commit,
+with one sentence saying which rule applied or why the run stopped. The
+revision is a JSON number in the copy and a decimal string in the annotation;
+`wacd-chart.py` converts between the two in one place.
 
 **Versions.** `plan` finds the latest tag `<tag_prefix>X.Y.Z` reachable from
 HEAD and reads the commits since it: any breaking change (`type!:` or a
@@ -196,8 +265,10 @@ environment of every step it runs. The install stays in that job, with the
 tarball pinned, because a separate job without the permission that passed the
 binary on as an artifact would cost a fleet runner per release.
 
-**Shadow.** In every mode but `none`, the `shadow` job asks hemi whether its
-stored copy of the app's configuration matches the files. It mints a GitHub
+**Shadow.** In every mode but `none`, when the settings came from the files,
+the `shadow` job asks hemi whether its stored copy of the app's configuration
+matches the files. When they came from hemi's copy there are no files to
+compare it with, and the job is skipped. It mints a GitHub
 OIDC job token with audience `wacwini:hemi` for each request, reads
 `GET http://hemi-app.hemi.svc.cluster.local:3000/api/v1/contract` for the copy
 number (`identity.revision`), then posts `{"revision", "profile", "values"}` and,
@@ -286,8 +357,12 @@ The deploy chart is pushed to
 nested under it, and `appVersion` equal to the version. Its `Chart.yaml`
 carries two annotations the gateway reads back from the Helm config blob:
 `org.opencontainers.image.revision` (the source SHA) and `wacwini.com/images`
-(the space-separated image references, sorted by name). A published chart
-version is never overwritten.
+(the space-separated image references, sorted by name). A chart published
+while the gateway holds a copy of the app's settings also carries
+`wacwini.com/revision` (the copy's revision as a decimal string, such as `"7"`)
+and `wacwini.com/fleet-commit` (the 40-hex wac.fleet commit it was read at),
+and the gateway holds the release to that copy. A published chart version is
+never overwritten.
 
 Images are built once per version and pushed through the push address, then
 recorded and pulled as `localhost:30500/<name>:<version>@<digest>`. Each

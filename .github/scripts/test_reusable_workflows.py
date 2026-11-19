@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import re
 import tempfile
 import unittest
@@ -302,7 +303,7 @@ class ReusableWorkflowTests(unittest.TestCase):
 
         doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-cd.yml").read_text())
         plan = doc["jobs"]["plan"]
-        self.assertEqual(plan["permissions"], {"contents": "write"})
+        self.assertEqual(plan["permissions"], {"contents": "write", "id-token": "write"})
         self.assertNotIn("persist-credentials", plan["steps"][0].get("with") or {})
         step = next(s for s in plan["steps"] if s.get("name") == "Plan the version")
         stubs = {
@@ -365,7 +366,11 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertIs(job["continue-on-error"], True)
         self.assertEqual(job["timeout-minutes"], 2, "the next queued release waits for the run to end")
         self.assertEqual(job["needs"], "plan")
-        self.assertEqual(job["if"], "needs.plan.outputs.mode != 'none'")
+        self.assertEqual(
+            job["if"],
+            "needs.plan.outputs.mode != 'none' && needs.plan.outputs.source == 'files'",
+            "a copy hemi releases from is the truth; there are no files to compare it with",
+        )
         for name, other in jobs.items():
             needs = other.get("needs") or []
             with self.subTest(job=name):
@@ -424,6 +429,151 @@ class ReusableWorkflowTests(unittest.TestCase):
             ],
             "the probe chart ships no values.yaml: chart defaults would remove a user's explicit null",
         )
+
+    def wac_cd(self):
+        import yaml
+
+        return yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-cd.yml").read_text())
+
+    def test_wac_cd_plan_asks_the_gateway_once_before_reading_the_profile(self):
+        import os
+        import subprocess
+
+        plan = self.wac_cd()["jobs"]["plan"]
+        steps = plan["steps"]
+        names = [s.get("name") or s.get("uses") for s in steps]
+        asks = [s for s in steps if "wacd-contract.py" in s.get("run", "")]
+        self.assertEqual(len(asks), 1, "plan asks the gateway exactly once")
+        ask = asks[0]
+        self.assertEqual(ask["id"], "contract")
+        self.assertIn("fetch --out .wacd-contract", ask["run"])
+        self.assertLess(names.index(ask["name"]), names.index("Read the wacd profile"))
+        upload = next(s for s in steps if str(s.get("uses", "")).startswith("actions/upload-artifact@"))
+        self.assertEqual(upload["if"], "steps.contract.outputs.revision != ''")
+        self.assertEqual(upload["with"]["name"], "wac-cd-contract")
+        self.assertEqual(upload["with"]["path"], ".wacd-contract/")
+        self.assertIs(upload["with"]["include-hidden-files"], True, "upload-artifact skips dot directories")
+        self.assertEqual(upload["with"]["if-no-files-found"], "error")
+        self.assertLess(names.index(ask["name"]), names.index(upload["uses"]))
+        for key in ("source", "revision", "fleet_commit"):
+            self.assertEqual(plan["outputs"][key], f"${{{{ steps.contract.outputs.{key} }}}}")
+        profile = next(s for s in steps if s.get("name") == "Read the wacd profile")
+        self.assertEqual(profile["env"], {"SOURCE": "${{ steps.contract.outputs.source }}"})
+        for source, expected in (
+            ("hemi", "--contract .wacd-contract/contract.json"),
+            ("files", ".github/wacd.json"),
+        ):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "wacd-profile.py").write_text(
+                    "import sys\nprint('argv=' + ' '.join(sys.argv[1:]))\n"
+                )
+                out = root / "out"
+                env = {**os.environ, "WACD_SCRIPTS": str(root), "GITHUB_OUTPUT": str(out), "SOURCE": source}
+                result = subprocess.run(["bash", "-e", "-c", profile["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(out.read_text(), f"argv={expected}\n")
+
+    def test_wac_cd_plan_fails_with_the_refusal_sentence(self):
+        import os
+        import subprocess
+
+        ask = next(s for s in self.wac_cd()["jobs"]["plan"]["steps"] if "wacd-contract.py" in s.get("run", ""))
+        for code, stdout, stderr in ((0, "source=files\nrevision=\n", ""), (1, "", "wacd contract: refused here\n")):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "wacd-contract.py").write_text(
+                    "import sys\n"
+                    f"sys.stdout.write({stdout!r})\n"
+                    f"sys.stderr.write({stderr!r})\n"
+                    f"sys.exit({code})\n"
+                )
+                out = root / "out"
+                out.write_text("")
+                env = {**os.environ, "WACD_SCRIPTS": str(root), "GITHUB_OUTPUT": str(out), "RUNNER_TEMP": tmp}
+                result = subprocess.run(["bash", "-c", ask["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertEqual(out.read_text(), stdout)
+                if code:
+                    self.assertIn("::error::wac-cd: wacd contract: refused here", result.stdout)
+
+    def test_wac_cd_publish_renders_from_the_copy_plan_read(self):
+        """A save made live during a build must not change what the release ships."""
+        import os
+        import subprocess
+
+        doc = self.wac_cd()
+        jobs = doc["jobs"]
+        publish = jobs["publish"]
+        self.assertNotIn("id-token", publish["permissions"], "publish can ask neither the gateway nor hemi")
+        for name, job in jobs.items():
+            text = json.dumps(job)
+            with self.subTest(job=name):
+                self.assertEqual("wacd-contract.py" in text, name == "plan")
+        steps = publish["steps"]
+        names = [s.get("name") or s.get("uses") for s in steps]
+        clear = names.index("Clear any copy in the checkout")
+        self.assertEqual(steps[clear]["run"], "rm -rf .wacd-contract")
+        download = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/download-artifact@"))
+        self.assertEqual(steps[download]["if"], "needs.plan.outputs.source == 'hemi'")
+        self.assertEqual(steps[download]["with"], {"name": "wac-cd-contract", "path": ".wacd-contract"})
+        upload = next(s for s in jobs["plan"]["steps"] if str(s.get("uses", "")).startswith("actions/upload-artifact@"))
+        self.assertEqual(steps[download]["with"]["name"], upload["with"]["name"])
+        step_index = names.index("Publish the deploy chart and the tag")
+        self.assertLess(clear, download)
+        self.assertLess(download, step_index)
+        step = steps[step_index]
+        self.assertEqual(step["env"]["SOURCE"], "${{ needs.plan.outputs.source }}")
+        self.assertEqual(step["env"]["REVISION"], "${{ needs.plan.outputs.revision }}")
+        self.assertEqual(step["env"]["FLEET_COMMIT"], "${{ needs.plan.outputs.fleet_commit }}")
+        sha, commit = "a" * 40, "c" * 40
+        annotations = f"--annotation wacwini.com/revision=7 --annotation wacwini.com/fleet-commit={commit}"
+        for source, revision, profile, extra in (
+            ("hemi", "7", ".wacd-contract/profile.json", f" --values-json .wacd-contract/values.json {annotations}"),
+            ("files", "7", ".github/wacd.json", f" {annotations}"),
+            ("files", "", ".github/wacd.json", ""),
+        ):
+            with self.subTest(source=source, revision=revision), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                log = root / "log"
+                (root / "wacd-chart.py").write_text(
+                    "import os, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "if args[0] == 'chart-state':\n"
+                    "    seen = os.path.join(os.environ['RUNNER_TEMP'], 'seen')\n"
+                    "    print('state=present' if os.path.exists(seen) else 'state=absent')\n"
+                    "    open(seen, 'w').close()\n"
+                    "else:\n"
+                    "    open(os.environ['STUB_LOG'], 'a').write(' '.join(args) + '\\n')\n"
+                    "    os.makedirs(os.path.join(os.environ['RUNNER_TEMP'], 'packaged'), exist_ok=True)\n"
+                    "    open(os.path.join(os.environ['RUNNER_TEMP'], 'packaged', 'app-0.2.0.tgz'), 'w').close()\n"
+                    "    print('chart_dir=' + os.environ['RUNNER_TEMP'])\n"
+                )
+                (root / "wacd-tag.py").write_text("print('tag pushed')\n")
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                (bin_dir / "helm").write_text("#!/bin/sh\nexit 0\n")
+                (bin_dir / "helm").chmod(0o755)
+                env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "WACD_SCRIPTS": str(root),
+                       "RUNNER_TEMP": str(root), "STUB_LOG": str(log), "GITHUB_SHA": sha,
+                       "APP": "app", "VERSION": "0.2.0", "TAG": "v0.2.0", "IMAGES": "{}", "WAC_APP_TGZ": "w.tgz",
+                       "SOURCE": source, "REVISION": revision, "FLEET_COMMIT": commit if revision else ""}
+                result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    log.read_text(),
+                    f"package --profile {profile} --version 0.2.0 --source-sha {sha} --images {{}} "
+                    f"--wac-app-tgz w.tgz --out {root}/deploy-chart{extra}\n",
+                )
+
+    def test_wac_cd_build_and_deploy_take_their_settings_only_from_plan(self):
+        jobs = self.wac_cd()["jobs"]
+        for name in ("build", "deploy", "github-release"):
+            text = json.dumps(jobs[name])
+            with self.subTest(job=name):
+                self.assertNotIn(".github/wacd.json", text)
+                self.assertNotIn("values_file", text)
+                self.assertNotIn(".wacd-contract", text)
 
     def test_wac_ci_setup_go_takes_the_version_or_the_version_file_from_the_profile(self):
         import yaml

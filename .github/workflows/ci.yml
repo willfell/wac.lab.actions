@@ -57,6 +57,7 @@ jobs:
           python scripts/tests/wacd-version.test.py
           python scripts/tests/wacd-chart.test.py
           python scripts/tests/wacd-release.test.py
+          python scripts/tests/wacd-contract.test.py
           python scripts/tests/wacd-parity.test.py
           python scripts/tests/wacd-tag.test.py
           python scripts/tests/wacd-shadow.test.py

@@ -66,6 +66,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
     outputs:
       mode: ${{ steps.version.outputs.mode }}
       version: ${{ steps.version.outputs.version }}
@@ -78,6 +79,9 @@ jobs:
       health_url: ${{ steps.profile.outputs.health_url }}
       health_expect_db_ok: ${{ steps.profile.outputs.health_expect_db_ok }}
       images: ${{ steps.profile.outputs.images }}
+      source: ${{ steps.contract.outputs.source }}
+      revision: ${{ steps.contract.outputs.revision }}
+      fleet_commit: ${{ steps.contract.outputs.fleet_commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,10 +106,36 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Read the settings from the gateway
+        id: contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! python3 "$WACD_SCRIPTS"/wacd-contract.py fetch --out .wacd-contract \
+            > "$RUNNER_TEMP/contract.out" 2> "$RUNNER_TEMP/contract.err"; then
+            echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/contract.err")"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/contract.out" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: steps.contract.outputs.revision != ''
+        with:
+          name: wac-cd-contract
+          path: .wacd-contract/
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
       - name: Read the wacd profile
         id: profile
         shell: bash
-        run: python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+        env:
+          SOURCE: ${{ steps.contract.outputs.source }}
+        run: |
+          if [[ "$SOURCE" == hemi ]]; then
+            python3 "$WACD_SCRIPTS"/wacd-profile.py --contract .wacd-contract/contract.json >> "$GITHUB_OUTPUT"
+          else
+            python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+          fi
       - name: Check the trigger
         shell: bash
         env:
@@ -225,7 +255,7 @@ jobs:
 
   shadow:
     needs: plan
-    if: needs.plan.outputs.mode != 'none'
+    if: needs.plan.outputs.mode != 'none' && needs.plan.outputs.source == 'files'
     continue-on-error: true
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 2
@@ -421,6 +451,14 @@ jobs:
           tgz="$RUNNER_TEMP/wac-app-$CHART_VERSION.tgz"
           test -f "$tgz"
           echo "tgz=$tgz" >> "$GITHUB_OUTPUT"
+      - name: Clear any copy in the checkout
+        shell: bash
+        run: rm -rf .wacd-contract
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.source == 'hemi'
+        with:
+          name: wac-cd-contract
+          path: .wacd-contract
       - name: Publish the deploy chart and the tag
         shell: bash
         env:
@@ -429,9 +467,21 @@ jobs:
           TAG: ${{ needs.plan.outputs.tag }}
           IMAGES: ${{ needs.build.outputs.images }}
           WAC_APP_TGZ: ${{ steps.pull.outputs.tgz }}
+          SOURCE: ${{ needs.plan.outputs.source }}
+          REVISION: ${{ needs.plan.outputs.revision }}
+          FLEET_COMMIT: ${{ needs.plan.outputs.fleet_commit }}
         run: |
           set -euo pipefail
           registry=registry.network.svc.cluster.local:5000
+          profile=.github/wacd.json
+          copy=()
+          if [[ "$SOURCE" == hemi ]]; then
+            profile=.wacd-contract/profile.json
+            copy+=(--values-json .wacd-contract/values.json)
+          fi
+          if [[ -n "$REVISION" ]]; then
+            copy+=(--annotation "wacwini.com/revision=$REVISION" --annotation "wacwini.com/fleet-commit=$FLEET_COMMIT")
+          fi
           chart_state() {
             local err="$RUNNER_TEMP/chart-state.err"
             if ! state="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-state --registry "$registry" \
@@ -442,9 +492,9 @@ jobs:
           }
           chart_state
           if [[ "$state" == state=absent ]]; then
-            line="$(python3 "$WACD_SCRIPTS"/wacd-chart.py package --profile .github/wacd.json \
+            line="$(python3 "$WACD_SCRIPTS"/wacd-chart.py package --profile "$profile" \
               --version "$VERSION" --source-sha "$GITHUB_SHA" --images "$IMAGES" \
-              --wac-app-tgz "$WAC_APP_TGZ" --out "$RUNNER_TEMP/deploy-chart")"
+              --wac-app-tgz "$WAC_APP_TGZ" --out "$RUNNER_TEMP/deploy-chart" ${copy[@]+"${copy[@]}"})"
             chart_dir="${line#chart_dir=}"
             helm package "$chart_dir" -d "$RUNNER_TEMP/packaged"
             tgz="$RUNNER_TEMP/packaged/$APP-$VERSION.tgz"
