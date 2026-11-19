@@ -28,8 +28,9 @@ summary names the source, revision and fleet commit with the sentence.
 
 A 503 is the gateway's "release dependency unavailable" (GitHub slow,
 rate-limited or down behind it) and is retried within `--wait-timeout`
-seconds, the workflow's `wait_timeout`, the same bound `deploy` gives a
-`release`: before the contract operation existed, a release rode out such a
+seconds, the workflow's `wait_timeout` (parsed by wacd-release's own
+wait_bound, so both jobs accept the same values), capped at PLAN_WAIT_CAP, the
+same bound `deploy` gives a `release`: before the contract operation existed, a release rode out such a
 window in `deploy`, and moving the first gateway call into `plan` must not
 make it fail sooner. Each attempt waits the whole time left for its answer,
 as `deploy`'s requests do: the gateway first checks the caller's revision
@@ -77,6 +78,10 @@ CONTRACT_BODY = {"operation": "contract"}
 FIRST_POLL_SECONDS = 5
 MAX_POLL_SECONDS = 30
 MAX_WAIT = release.MAX_WAIT
+# plan's job timeout (40 minutes) is sized for this wait plus its other steps,
+# and a workflow test ties the two. A larger wait_timeout still bounds deploy,
+# but plan stops here so it fails with its summary line, not the job timeout.
+PLAN_WAIT_CAP = 2100
 FILES_PROFILE = Path(".github") / "wacd.json"
 SOURCES = ("files", "hemi")
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -111,7 +116,7 @@ SENTENCES = {
         "The gateway could not read the fleet copy within {wait} seconds; re-run "
         "when GitHub is answering."
     ),
-    "wait": f"--wait-timeout must be a whole number of seconds from 1 to {MAX_WAIT}.",
+    "wait": f"--wait-timeout must be a whole number of seconds from 1 to {MAX_WAIT}, as wait_timeout is for deploy.",
     "status": "The gateway answered HTTP {status} when asked for this app's settings.",
     "unreachable": (
         "The gateway could not be reached for this app's settings, or did not answer within "
@@ -170,14 +175,13 @@ def ask(trust, wait):
     raise Refusal(SENTENCES["unavailable"].format(wait=wait))
 
 
-def wait_bound(text):
-    """The --wait-timeout argument as seconds, within wacd-release's own bound."""
-    if not isinstance(text, str) or not text.isascii() or not text.isdigit():
-        raise Refusal(SENTENCES["wait"])
-    seconds = int(text)
-    if not 1 <= seconds <= MAX_WAIT:
-        raise Refusal(SENTENCES["wait"])
-    return seconds
+def wait_seconds(text):
+    """--wait-timeout as deploy reads wait_timeout, capped at PLAN_WAIT_CAP."""
+    try:
+        seconds = release.wait_bound(text)
+    except release.ReleaseError:
+        raise Refusal(SENTENCES["wait"]) from None
+    return min(seconds, PLAN_WAIT_CAP)
 
 
 def token_repository_id(token):
@@ -248,7 +252,7 @@ def write(out, documents):
 
 def fetch(out, wait_text):
     """Ask once (retrying 503) and leave the copy under out; returns the step outputs."""
-    wait = wait_bound(wait_text)
+    wait = wait_seconds(wait_text)
     clear(out)
     value, token = ask(trust_context(), wait)
     copy, commit = read_copy(value, token)

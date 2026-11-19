@@ -316,13 +316,30 @@ class AnswerTests(FetchCase):
         self.assertRefused(code, "12 seconds")
         self.assertLessEqual(self.clock.now - 1000.0, 12)
 
-    def test_the_wait_timeout_must_be_a_bounded_whole_number(self):
-        for bad in ("0", "-5", "3601", "2.5", "soon", ""):
-            with self.subTest(wait=bad):
+    def test_plan_accepts_exactly_the_wait_timeouts_deploy_accepts(self):
+        """One wait_timeout input feeds both jobs, so they must agree on what it means."""
+        release = contract.release
+        for text in ("600", " 600", "+600", "600\n", "1", "3600", "0", "-5", "3601", "2.5", "soon", "", "6_00"):
+            with self.subTest(wait=repr(text)):
+                try:
+                    deploy = release.wait_bound(text)
+                except release.ReleaseError:
+                    deploy = None
                 self.summary.unlink(missing_ok=True)
-                code = self.fetch(answer(None), wait=bad)
-                self.assertRefused(code, "--wait-timeout")
-                self.assertEqual(self.gateway.seen, [], "nothing is asked with a bad bound")
+                code = self.fetch(answer(None), wait=text)
+                if deploy is None:
+                    self.assertRefused(code, "--wait-timeout")
+                    self.assertEqual(self.gateway.seen, [], "nothing is asked with a bad bound")
+                else:
+                    self.assertEqual(code, 0, self.stderr)
+                    self.assertEqual(len(self.gateway.seen), 1)
+
+    def test_plan_waits_at_most_the_cap_inside_its_job_timeout(self):
+        """deploy honours a larger wait_timeout; plan stops at the cap so its summary is written."""
+        code = self.fetch((503, {}), wait=3600)
+        self.assertRefused(code, f"{contract.PLAN_WAIT_CAP} seconds")
+        self.assertLessEqual(self.clock.now - 1000.0, contract.PLAN_WAIT_CAP + contract.MAX_POLL_SECONDS)
+        self.assertGreaterEqual(self.clock.now - 1000.0, contract.PLAN_WAIT_CAP)
 
     def test_each_coded_denial_has_its_own_sentence(self):
         self.assertEqual(sorted(contract.REFUSALS), sorted(CODES))
