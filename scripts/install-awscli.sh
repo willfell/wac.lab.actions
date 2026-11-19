@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Installs the one AWS CLI v2 that nextjs-site-deploy uses on a runner that has
-# no aws, from AWS's zip, checked against a sha256 committed here and AWS's
-# signature by the key committed beside this script, before anything in it runs.
-# Usage: install-awscli.sh   (needs RUNNER_TEMP and GITHUB_PATH; curl, sha256sum, gpgv, base64 and unzip)
+# Provides the aws that nextjs-site-deploy's token jobs run once they hold the
+# deploy role. A runner's own aws is used only when the aws on PATH is
+# /usr/bin/aws or /usr/local/bin/aws and that directory, the file it resolves
+# to and that file's directory are all owned by root and neither group- nor
+# world-writable, so the job's user could not have put it there (an aws a
+# site's build left on a reused runner must never run with the role).
+# Otherwise it installs the one pinned AWS CLI v2 from AWS's zip, checked
+# against a sha256 committed here and AWS's signature by the key committed
+# beside this script, before anything in it runs.
+# Usage: install-awscli.sh   (needs RUNNER_TEMP and GITHUB_PATH; curl, sha256sum, gpgv, base64 and unzip to install)
 # Installs under $RUNNER_TEMP/aws-cli with the aws command in $RUNNER_TEMP/bin,
-# which goes on GITHUB_PATH for the later steps; no sudo.
+# which goes on GITHUB_PATH, ahead of the rest of PATH, for the later steps; no sudo.
 set -euo pipefail
 
 AWSCLI_VERSION="2.39.4"
@@ -14,6 +20,31 @@ AWSCLI_KEY_FINGERPRINT="FB5DB77FD5C118B80511ADA8A6310ACC4672475C"
 
 key="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/awscli-public-key.asc"
 : "${RUNNER_TEMP:?}" "${GITHUB_PATH:?}"
+
+# Owned by uid 0 and writable by neither its group nor others.
+root_only() {
+  [ -n "$(find "$1" -maxdepth 0 -user 0 ! -perm -020 ! -perm -002 2>/dev/null)" ]
+}
+
+trusted_aws() {
+  local found real
+  found="$(command -v aws 2>/dev/null)" || return 1
+  case "$found" in
+    /usr/bin/aws | /usr/local/bin/aws) ;;
+    *) return 1 ;;
+  esac
+  real="$(readlink -f "$found")" || return 1
+  [ -f "$real" ] && [ -x "$real" ] || return 1
+  root_only "$(dirname "$found")" && root_only "$real" && root_only "$(dirname "$real")"
+}
+
+if trusted_aws; then
+  aws --version
+  exit 0
+fi
+if command -v aws >/dev/null 2>&1; then
+  echo "install-awscli: the aws on PATH is not a root-owned /usr/bin/aws or /usr/local/bin/aws, so it is not used"
+fi
 
 case "$(uname -m)" in
   x86_64)
@@ -31,7 +62,7 @@ case "$(uname -m)" in
 esac
 for tool in curl sha256sum gpgv base64 unzip; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "install-awscli: the runner has no aws and no $tool to install the pinned AWS CLI ${AWSCLI_VERSION} with" >&2
+    echo "install-awscli: the runner has no root-owned aws and no $tool to install the pinned AWS CLI ${AWSCLI_VERSION} with" >&2
     exit 1
   fi
 done

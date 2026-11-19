@@ -20,6 +20,14 @@ if [ -L "$1" ] || [ ! -d "$1" ]; then
 fi
 root="$(cd "$1" && pwd -P)"
 
+# Workflow-command data, escaped as the runner unescapes it, so an entry's
+# name or link target cannot end the annotation and start a command of its own.
+escape() {
+  local text="${1//%/%25}"
+  text="${text//$'\r'/%0D}"
+  printf '%s' "${text//$'\n'/%0A}"
+}
+
 inside() {
   case "$1" in
     "$root" | "$root"/*) return 0 ;;
@@ -29,9 +37,9 @@ inside() {
 
 refused=0
 while IFS= read -r -d '' entry; do
-  relative="${entry#"$root"/}"
+  relative="$(escape "${entry#"$root"/}")"
   if [ -L "$entry" ]; then
-    target="$(readlink "$entry")"
+    target="$(escape "$(readlink "$entry")")"
     resolved="$(realpath -- "$entry" 2>/dev/null || true)"
     if [ -n "$resolved" ] && ! inside "$resolved"; then
       echo "::error::nextjs-site-deploy: $relative is a symbolic link to $target, which resolves outside the export."

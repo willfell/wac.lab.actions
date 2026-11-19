@@ -87,6 +87,14 @@ FAKE
 chmod +x "$workdir/tools/"*
 export TEST_STATE="$workdir"
 
+# The runs see no aws of this machine's unless a case puts one first.
+clean_path=""
+IFS=: read -ra entries <<<"$PATH"
+for entry in "${entries[@]}"; do
+  if [ -n "$entry" ] && [ ! -e "$entry/aws" ]; then clean_path="${clean_path:+$clean_path:}$entry"; fi
+done
+first_path=""
+
 run() {
   local name="$1" zip="$2" sig="$3" machine="$4" mode="${5:-ok}"
   rm -rf "${workdir:?}/${name:?}" "$workdir/installer-ran" "$workdir/tampered-ran"
@@ -94,7 +102,7 @@ run() {
   : >"$workdir/requests"
   status=0
   TEST_MODE="$mode" TEST_ZIP="$zip" TEST_SIG="$sig" TEST_UNAME="$machine" \
-    PATH="$workdir/tools:$PATH" RUNNER_TEMP="$workdir/$name" GITHUB_PATH="$workdir/$name/github-path" \
+    PATH="${first_path:+$first_path:}$workdir/tools:$clean_path" RUNNER_TEMP="$workdir/$name" GITHUB_PATH="$workdir/$name/github-path" \
     bash "$workdir/copy/install-awscli.sh" >"$workdir/$name/result" 2>&1 || status=$?
 }
 nothing_ran() {
@@ -142,6 +150,44 @@ grep -q "zip is not signed by the AWS CLI key $impostor; nothing was unzipped or
 nothing_ran fingerprint
 echo "PASS: a good signature by a key other than the pinned fingerprint is refused"
 copy "$stand_in"
+
+mkdir -p "$workdir/planted-bin"
+printf '#!/bin/sh\ntouch "$TEST_STATE/planted-ran"\necho "aws-cli/9.9.9 planted"\n' >"$workdir/planted-bin/aws"
+chmod 755 "$workdir/planted-bin/aws"
+first_path="$workdir/planted-bin"
+run planted good.zip good.sig x86_64
+first_path=""
+test "$status" -eq 0 || { cat "$workdir/planted/result"; exit 1; }
+test ! -e "$workdir/planted-ran"
+test -e "$workdir/installer-ran"
+test "$(wc -l <"$workdir/requests" | tr -d ' ')" = 2
+test "$(cat "$workdir/planted/github-path")" = "$workdir/planted/bin"
+grep -q 'install-awscli: the aws on PATH is not a root-owned /usr/bin/aws or /usr/local/bin/aws, so it is not used' "$workdir/planted/result"
+grep -q 'aws-cli/2.39.4 stand-in' "$workdir/planted/result"
+echo "PASS: an aws the job's user owns is never run; the pinned AWS CLI is installed and put first on PATH"
+
+# A runner image's own aws (GitHub's hosted images keep one in /usr/local/bin) is used only when root owns it,
+# its directory, the file it resolves to and that file's directory, and none is group- or world-writable.
+owned_by_root() { ls -ldn "$1" | awk '{ exit !($3 == 0 && substr($1, 6, 1) != "w" && substr($1, 9, 1) != "w") }'; }
+for system in /usr/local/bin/aws /usr/bin/aws; do
+  [ -x "$system" ] || continue
+  real="$(readlink -f "$system")"
+  first_path="$(dirname "$system")"
+  run "system-$(basename "$first_path")" good.zip good.sig x86_64
+  first_path=""
+  test "$status" -eq 0 || { cat "$workdir/system-$(basename "$(dirname "$system")")/result"; exit 1; }
+  result="$workdir/system-$(basename "$(dirname "$system")")"
+  if owned_by_root "$(dirname "$system")" && owned_by_root "$real" && owned_by_root "$(dirname "$real")"; then
+    test ! -s "$workdir/requests" && test ! -e "$workdir/installer-ran" && test ! -e "$result/github-path"
+    grep -q '^aws-cli/' "$result/result"
+    echo "PASS: the root-owned $system is used and nothing is downloaded"
+  else
+    test -e "$workdir/installer-ran"
+    grep -q 'is not a root-owned /usr/bin/aws or /usr/local/bin/aws, so it is not used' "$result/result"
+    echo "PASS: $system, which the job's user or its group could replace, is not used"
+  fi
+  break
+done
 
 run unavailable good.zip good.sig x86_64 unavailable
 test "$status" -ne 0

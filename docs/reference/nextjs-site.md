@@ -77,8 +77,8 @@ run nothing from the site.
 | Job | Needs | Holds | Runs | Hands on |
 | --- | --- | --- | --- | --- |
 | `image-cache` | | `contents: read`, `id-token: write`, the role | this repository's scripts at the defining commit (`job.workflow_sha`), and `aws s3 sync` of `s3://<bucket>/images` (`*.webp`, `*.avif`, `.image-manifest.json`) | artifact `nextjs-image-cache`, kept one day, only when the sync found a file |
-| `build` | `image-cache` | `contents: read` | the caller's checkout, the node, npm and yarn fallbacks, setup-node, `install_command`, the image cache unpacked into `<app_dir>/public/images`, `yarn images:validate`, `yarn images:optimize`, `yarn build` with `build_env`, `postbuild_command`, the `out` check | artifact `nextjs-site-out` (the contents of `<app_dir>/out`), kept one day |
-| `deploy` | `build` | `contents: read`, `id-token: write`, the role | this repository's scripts at the defining commit, then the two `aws s3 sync` calls and the CloudFront invalidation | the site, in S3 |
+| `build` | `image-cache` | `contents: read` | the caller's checkout (`persist-credentials: false`, so no token is left on disk where the site's code runs), the node, npm and yarn fallbacks, setup-node, `install_command`, the image cache unpacked into `<app_dir>/public/images`, `yarn images:validate`, `yarn images:optimize`, `yarn build` with `build_env`, `postbuild_command`, the `out` check | artifact `nextjs-site-out` (the contents of `<app_dir>/out`), kept one day |
+| `deploy` | `build` | `contents: read`, `id-token: write`, the role | this repository's scripts at the defining commit, then the image sync (skipped when the export has no `images/`), the app-file sync and the CloudFront invalidation | the site, in S3 |
 
 The hand-offs:
 
@@ -95,7 +95,13 @@ The hand-offs:
   that is neither a regular file nor a directory, and on any entry whose real
   path lies outside it; `aws s3 sync` follows links, so a link could
   otherwise publish a file from anywhere on the runner. Both syncs also pass
-  `--no-follow-symlinks`.
+  `--no-follow-symlinks`. The names and link targets in those annotations
+  are escaped as workflow-command data (`%`, CR and LF), so a name the build
+  chose cannot end its annotation and start a command of its own.
+- An artifact keeps no empty directory, so a site whose `out/images` is
+  empty, or absent, reaches `deploy` with no `images/`; the image sync is then
+  skipped with a line saying so, where a sync of the missing directory would
+  fail the deploy.
 - Both artifacts include hidden files, so `images/.image-manifest.json`
   travels with the images it describes, as the old single job's sync did.
 
@@ -105,9 +111,14 @@ commit-pinned checkout, artifact and `configure-aws-credentials` actions.
 `.github/scripts/test_reusable_workflows.py` fails when any of that, or the
 job graph and permissions above, changes.
 
-Each token job uses the runner's `aws` when it has one. Otherwise
-`scripts/install-awscli.sh` installs AWS CLI 2.39.4 under `$RUNNER_TEMP`
-(no sudo): it downloads AWS's per-architecture zip and its `.sig`, and runs
+Each token job runs `scripts/install-awscli.sh` before it assumes the role.
+It uses the runner's own `aws` only when the `aws` on `PATH` is
+`/usr/bin/aws` or `/usr/local/bin/aws` and that directory, the file it
+resolves to and that file's directory are all owned by root (uid 0) and
+neither group- nor world-writable, so the job's user could not have put it
+there. Any other `aws` is never run: the script says it is not used and
+installs AWS CLI 2.39.4 under `$RUNNER_TEMP` (no sudo), first on `PATH` for
+the later steps: it downloads AWS's per-architecture zip and its `.sig`, and runs
 nothing from it until the zip matches the sha256 committed in the script and
 `gpgv` finds a valid signature by the AWS CLI key, fingerprint
 `FB5D B77F D5C1 18B8 0511 ADA8 A631 0ACC 4672 475C`, committed as
@@ -116,6 +127,13 @@ nothing from it until the zip matches the sha256 committed in the script and
 missing. Moving to another CLI version means re-resolving the version, both
 digests and the key from AWS and updating `scripts/tests/install-awscli.test.sh`,
 which fails on any other values.
+
+The split assumes each job starts on a fresh runner, as the fleet's
+ephemeral pools and GitHub's hosted runners give. On a runner reused between
+jobs, `build`, which runs the site's code, could leave files for a later
+token job to run; the `aws` rule above closes that path for the one tool the
+token jobs would otherwise take from the runner as they found it, and nothing
+else does, so never pass a persistent runner as `runner`.
 
 The three jobs each take a runner from `runner` (or the caller's
 `CI_RUNNER_SMALL`), so a deploy now holds three runner slots in turn rather

@@ -164,6 +164,14 @@ def site_token_job_problems(doc, job_name, job):
     return problems
 
 
+INLINE_PYTHON = re.compile(r'(?:\bpython3|"\$python")((?:\s+-[A-Za-z]+)*)\s+-c\b')
+
+
+def unisolated_inline_python(run):
+    """Each inline `python3 -c` (or `"$python" -c`) in a run body whose flags do not include -I."""
+    return [match.group(0) for match in INLINE_PYTHON.finditer(run) if "-I" not in match.group(1).split()]
+
+
 def runner_problems(jobs, name="wac-ci.yml"):
     path = Path(name)
     return module._check_runner_is_a_caller_choice(path, workflow(jobs))
@@ -1068,6 +1076,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                 if "SITE_OUT" in line:
                     with self.subTest(line=line):
                         self.assertRegex(line.strip(), r'^(bash "\$LAB_ACTIONS_SCRIPTS/check-site-export\.sh" "\$SITE_OUT"'
+                                                        r'|if \[ ! -d "\$SITE_OUT/images" \]; then$'
                                                         r'|aws s3 sync "\$SITE_OUT/images" |args=\("\$SITE_OUT" )')
         for index in aws[:2]:
             self.assertIn("--no-follow-symlinks", steps[index]["run"])
@@ -1116,11 +1125,19 @@ class ReusableWorkflowTests(unittest.TestCase):
             ("a dangling link", lambda r: (r / "gone").symlink_to("missing.html"),
              "gone is a symbolic link to missing.html.", False),
             ("a named pipe", lambda r: os.mkfifo(r / "pipe"), "pipe is neither a regular file nor a directory.", False),
+            ("a name that would start a workflow command",
+             lambda r: (r / "a\n::stop-commands::resume\r%").symlink_to("index.html\n::warning::planted"),
+             "a%0A::stop-commands::resume%0D%25 is a symbolic link to index.html%0A::warning::planted.", False),
+            ("a pipe whose name would start a workflow command",
+             lambda r: os.mkfifo(r / "p\n::error::planted"), "p%0A::error::planted is neither a regular file nor a "
+                                                           "directory.", False),
         )
         for label, plant, said, escapes in cases:
             with self.subTest(case=label):
                 result = run(tree(label.replace(" ", "-"), plant))
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                for line in result.stdout.splitlines():
+                    self.assertTrue(line.startswith("::error::nextjs-site-deploy: "), line)
                 self.assertIn(f"::error::nextjs-site-deploy: {said}", result.stdout)
                 self.assertEqual("outside the export" in result.stdout, escapes)
                 self.assertIn(f"::error::nextjs-site-deploy: the site export holds 1 entry that is not a plain file "
@@ -1163,6 +1180,73 @@ class ReusableWorkflowTests(unittest.TestCase):
                 result = subprocess.run(["bash", "-e", "-c", count["run"]], env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual((runner / "out").read_text(), f"cached={cached}\n")
+
+    def test_nextjs_site_deploy_syncs_images_only_when_the_export_has_them(self):
+        """An artifact drops empty directories, so a site with no images reaches deploy with no images/ at all."""
+        import os
+        import shutil
+        import subprocess
+
+        step = next(step for step in self.nextjs_deploy()["jobs"]["deploy"]["steps"]
+                    if step.get("name") == "Sync images to S3 with immutable cache headers")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "aws").write_text('#!/bin/bash\necho "$*" >> "$AWS_LOG"\n[ -d "$3" ]\n')
+        (bin_dir / "aws").chmod(0o755)
+        for label, images, synced in (("no images directory", False, False), ("images", True, True)):
+            with self.subTest(export=label):
+                site_out = tmp / label.replace(" ", "-")
+                site_out.mkdir()
+                if images:
+                    (site_out / "images").mkdir()
+                    (site_out / "images" / "a.webp").write_text("w")
+                log = tmp / (label.replace(" ", "-") + ".log")
+                env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "SITE_OUT": str(site_out), "S3_BUCKET": "site-bucket",
+                       "AWS_LOG": str(log)}
+                result = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(log.exists(), synced)
+                if synced:
+                    self.assertTrue(log.read_text().startswith(f"s3 sync {site_out}/images s3://site-bucket/images "))
+
+    def test_nextjs_token_jobs_leave_the_choice_of_aws_to_the_installer(self):
+        """A site's build on a reused runner could leave an aws on PATH; the token jobs never run it themselves."""
+        import os
+        import shutil
+        import subprocess
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        planted, scripts = tmp / "planted", tmp / "scripts"
+        planted.mkdir()
+        scripts.mkdir()
+        (planted / "aws").write_text('#!/bin/sh\ntouch "$MARK.planted"\n')
+        (planted / "aws").chmod(0o755)
+        (scripts / "install-awscli.sh").write_text('touch "$MARK.installer"\n')
+        jobs = self.nextjs_deploy()["jobs"]
+        for name in ("image-cache", "deploy"):
+            with self.subTest(job=name):
+                steps = jobs[name]["steps"]
+                provide = next(i for i, step in enumerate(steps) if step.get("name") == "Provide the aws CLI")
+                credentials = next(i for i, step in enumerate(steps)
+                                   if "configure-aws-credentials" in str(step.get("uses")))
+                self.assertLess(provide, credentials)
+                mark = tmp / name
+                env = {"PATH": f"{planted}:{os.environ['PATH']}", "LAB_ACTIONS_SCRIPTS": str(scripts), "MARK": str(mark)}
+                result = subprocess.run(["bash", "-e", "-c", steps[provide]["run"]], env=env, capture_output=True,
+                                        text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(Path(f"{mark}.planted").exists(), "the aws on PATH ran before the installer judged it")
+                self.assertTrue(Path(f"{mark}.installer").exists())
+
+    def test_nextjs_site_deploy_build_keeps_no_token_on_disk(self):
+        """build runs the site's code and never pushes, so its checkout persists no credentials."""
+        steps = self.nextjs_deploy()["jobs"]["build"]["steps"]
+        checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
+        self.assertEqual(len(checkouts), 1)
+        self.assertIs(checkouts[0].get("with", {}).get("persist-credentials"), False)
 
     def token_step_env(self, head):
         """The env each run step of a token job gets in the planted-repository run, keyed by job and step."""
@@ -1217,6 +1301,33 @@ class ReusableWorkflowTests(unittest.TestCase):
             ("contract", "Move the shared checkout out of the workspace"): [({}, 0)],
             ("contract", "Ask hemi for the settings"): [({"JOB_RUNNER_NAME": "ci-small-abc12"}, 0)],
         }
+
+    def test_every_inline_python_in_a_job_holding_id_token_runs_isolated(self):
+        """`-I` on every `-c`, as S1 states it, even where the planted-repository run cannot tell.
+
+        The version probes import only sys, and site runs before the empty path entry is added, so
+        removing -I from one of them changes nothing that run sees; -I also drops user site-packages
+        and every PYTHON* variable, which a later change to the probe could start to depend on.
+        """
+        import yaml
+
+        for text, flagged in (("python3 -c 'x'", True), ('"$python" -c \'x\'', True), ("python3 -u -c 'x'", True),
+                              ("python3 -I -c 'x'", False), ('"$python" -I -c \'x\'', False),
+                              ("python3 -I -u -c 'x'", False), ("python3 -I script.py -c x", False)):
+            with self.subTest(sample=text):
+                self.assertEqual(bool(unisolated_inline_python(text)), flagged)
+        found = 0
+        for path in sorted((Path(__file__).resolve().parents[1] / "workflows").glob("*.yml")):
+            doc = yaml.safe_load(path.read_text())
+            for name, job in (doc.get("jobs") or {}).items():
+                if not holds_id_token(doc, job):
+                    continue
+                for step in job.get("steps", []):
+                    run = str(step.get("run", ""))
+                    found += len(INLINE_PYTHON.findall(run))
+                    with self.subTest(workflow=path.name, job=name, step=step.get("name")):
+                        self.assertEqual(unisolated_inline_python(run), [])
+        self.assertGreaterEqual(found, 9, "the probes and the plan's check are all inline -c")
 
     def test_jobs_holding_id_token_import_nothing_from_the_calling_repository(self):
         """Every run step of a token job, run in a checkout that plants json.py, ssl.py and sitecustomize.py.
@@ -1857,13 +1968,15 @@ class ReusableWorkflowTests(unittest.TestCase):
     def settings_plan(self, *, running="1.4.2", copy_revision="7", revision="7", source="hemi", charts=None,
                       workflow_change=False, rollback=False, extra_tags=(), claim="pushed", profile_images=None,
                       running_copy="6", status_exit=0, earlier="reuse=", status_err=None,
-                      published=("1.3.9", "1.4.2"), unfinished_err=None, code_claims=(), released=()):
+                      published=("1.3.9", "1.4.2"), unfinished_err=None, code_claims=(), released=(),
+                      docs_change=False):
         """Run plan's settings steps against a temp repo, real wacd-version.py and stub gateway and registry reads.
 
         unfinished-release is the real script over a stand-in registry holding the charts in published, where
         "unreadable" makes every chart read fail, and stand-in GitHub Releases for the versions in released, where
         "unreadable" makes every Release read fail. code_claims tags each on a new commit after main's head, as
-        a code release's run claims its version.
+        a code release's run claims its version. docs_change makes main's head after v1.4.2 a commit that
+        changes only docs/, as a caller whose cd.yml ignores docs paths leaves it: no run, no tag.
         """
         import os
         import shutil
@@ -1904,6 +2017,11 @@ class ReusableWorkflowTests(unittest.TestCase):
         if workflow_change:
             (repo / ".github" / "workflows" / "cd.yml").write_text("on: [push, workflow_dispatch]\n")
             git(repo, "commit", "-q", "-am", "ci: take the revision input")
+        elif docs_change:
+            (repo / "docs").mkdir()
+            (repo / "docs" / "guide.md").write_text("# Guide\n")
+            git(repo, "add", "docs")
+            git(repo, "commit", "-q", "-m", "docs: later")
         else:
             git(repo, "commit", "--allow-empty", "-q", "-m", "docs: later")
         for tag in code_claims:
@@ -2226,6 +2344,37 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.unfinished_call(plan)
                 self.assertEqual(plan["settings_outputs"]["unfinished_left"], "")
                 self.assertNotIn("left unfinished", plan["summary"].read_text())
+
+    def test_wac_cd_settings_release_on_a_docs_only_head_ships_as_the_next_patch_on_the_released_code(self):
+        """C (v1.4.2) is tagged and released; D, main's head, changes only docs, so no run started and D has no tag.
+
+        A settings dispatch runs on head D: it reads only tags above the running version, never main's head, so
+        it is the next patch above v1.4.2 tagged on C, and none of the three refusal steps fires.
+        """
+        import subprocess
+
+        plan = self.settings_plan(docs_change=True, released=("1.4.2",))
+        self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+        code, head = plan["code"], plan["head"]
+        self.assertNotEqual(head, code)
+        repo = plan["log"].parent / "repo"
+        changed = subprocess.run(["git", "diff", "--name-only", code, head], cwd=repo, check=True,
+                                 capture_output=True, text=True).stdout.split()
+        self.assertEqual(changed, ["docs/guide.md"])
+        self.assertEqual(subprocess.run(["git", "tag", "--points-at", head], cwd=repo, check=True,
+                                        capture_output=True, text=True).stdout, "", "D carries no tag")
+        self.assertNotIn("refusal", plan)
+        for refused in ("rollout_refused", "unfinished_refused", "workflow_refused"):
+            self.assertNotIn(refused, plan["settings_outputs"])
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+        self.assertEqual({k: plan["version_outputs"][k] for k in ("mode", "version", "tag", "expected_sha")},
+                         {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "expected_sha": code})
+        self.assertEqual(self.unfinished_call(plan).split(" --deadline")[0],
+                         "wacd-release.py unfinished-release --app app --prefix v --running 1.4.2 --versions  --codes ")
+        calls = plan["log"].read_text()
+        self.assertIn(f"wacd-tag.py claim-tag --tag v1.4.3 --commit {code}", calls)
+        self.assertEqual(plan["settings_outputs"]["unfinished_left"], "")
+        self.assertIn(f"settings revision 7 on 1.4.2's code ({code[:12]}), released as 1.4.3", plan["summary"].read_text())
 
     def test_wac_cd_an_unreadable_registry_is_a_fault_never_an_unfinished_release(self):
         plan = self.settings_plan(extra_tags=(("v1.4.3", "head"),), published=("unreadable",))
