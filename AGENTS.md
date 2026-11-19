@@ -33,6 +33,7 @@ shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
 python3 scripts/tests/schema-api-proxy.test.py  # lab-kubeconform's schema fallback
 bash scripts/tests/validate-kustomize.test.sh  # lab-kubeconform end to end; needs kustomize and kubeconform
 bash scripts/tests/helm-install.test.sh  # install-tools.sh's helm path, against a fake curl
+bash scripts/tests/install-helm.test.sh  # install-helm.sh, wac-cd's pinned Helm install, against a fake curl
 uv run --with pyyaml python scripts/tests/ci-release.test.py  # lab-release's client and the names wac-cd and wac.lab load from it
 python3 scripts/tests/runner-policy.test.py  # actionlint's fleet runner policy
 python3 scripts/tests/lab-route.test.py  # lab-route, against a stub Prometheus

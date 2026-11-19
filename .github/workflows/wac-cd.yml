@@ -259,9 +259,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 1
         shell: bash
-        env:
-          HELM_VERSION: v3.16.3
-        run: bash "$WACD_SCRIPTS"/install-tools.sh helm
+        run: bash "$WACD_SCRIPTS"/install-helm.sh
       - name: Compare hemi's copy with the files
         shell: bash
         run: python3 "$WACD_SCRIPTS"/wacd-shadow.py .github/wacd.json
@@ -407,9 +405,7 @@ jobs:
           python-version: "3.12"
       - name: Install helm
         shell: bash
-        env:
-          HELM_VERSION: v3.16.3
-        run: bash "$WACD_SCRIPTS"/install-tools.sh helm
+        run: bash "$WACD_SCRIPTS"/install-helm.sh
       - name: Pull the wac-app chart
         id: pull
         shell: bash

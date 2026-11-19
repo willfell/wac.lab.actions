@@ -25,6 +25,8 @@ GitHub-hosted amd64 runners and the Lab's arm64 runners.
 
 The work is `scripts/install-tools.sh`, which `lab-kubeconform`, `wac-ci` and
 `wac-cd` also run, so a change to it changes all four components.
+`wac-cd` runs it only for `crane`: it installs Helm with its own pinned
+`scripts/install-helm.sh`, so the Helm path below does not reach it.
 
 Helm installs through the upstream `get-helm-3` script from `helm/helm` `main`.
 When `raw.githubusercontent.com` fails, the installer fetches the same file

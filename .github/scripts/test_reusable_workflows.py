@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,13 @@ spec.loader.exec_module(module)
 
 GUARD_RUN = '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
 SHA = "${{ job.workflow_sha }}"
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def guard_step():
@@ -370,19 +378,44 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(runs, ['python3 "$WACD_SCRIPTS"/wacd-shadow.py .github/wacd.json'])
         self.assertTrue((root / "scripts" / "wacd-shadow.py").is_file())
         steps = job["steps"]
-        installs = [i for i, s in enumerate(steps) if "install-tools.sh" in s.get("run", "")]
-        compare = [i for i, s in enumerate(steps) if "wacd-shadow.py" in s.get("run", "")]
+        install_run = 'bash "$WACD_SCRIPTS"/install-helm.sh'
+        installs = [i for i, st in enumerate(steps) if st.get("run") == install_run]
+        compare = [i for i, st in enumerate(steps) if "wacd-shadow.py" in st.get("run", "")]
         self.assertEqual(len(installs), 1)
         install = steps[installs[0]]
         self.assertLess(installs[0], compare[0], "helm is on PATH before the comparison reads it")
-        self.assertEqual(install["run"], 'bash "$WACD_SCRIPTS"/install-tools.sh helm')
-        publish_installs = [
-            st for st in jobs["publish"]["steps"] if "install-tools.sh helm" in st.get("run", "")
-        ]
-        self.assertEqual(install["env"], {"HELM_VERSION": "v3.16.3"}, "an unpinned install fetches Helm 4")
-        self.assertEqual(install["env"], publish_installs[0]["env"], "one pinned Helm for the whole workflow")
-        self.assertEqual(install.get("timeout-minutes"), 1, "a stalled download must leave time for the comparison")
+        self.assertNotIn("env", install, "the version and digests live only in install-helm.sh")
+        self.assertEqual(
+            [st for st in jobs["publish"]["steps"] if st.get("run") == install_run],
+            [{"name": "Install helm", "shell": "bash", "run": install_run}],
+            "publish installs Helm the same pinned way",
+        )
+        for name, other in jobs.items():
+            for st in other["steps"]:
+                if "install-tools.sh" in st.get("run", ""):
+                    with self.subTest(job=name, step=st.get("name")):
+                        self.assertNotIn("helm", st["run"], "wac-cd installs Helm only with install-helm.sh")
+        shadow_py = load_module("wacd_shadow_for_workflow_test", root / "scripts" / "wacd-shadow.py")
+        installer = (root / "scripts" / "install-helm.sh").read_text()
+        self.assertEqual(re.findall(r'^HELM_VERSION="(.+)"$', installer, re.M), ["v3.16.3"])
+        self.assertEqual(shadow_py.HELM_VERSION, "v3.16.3", "the script accepts exactly the version installed")
+        self.assertEqual(install.get("timeout-minutes"), 1, "the smallest bound GitHub accepts")
         self.assertIs(install.get("continue-on-error"), True, "a failed download must not skip the comparison")
+        setup_and_checkouts = 30
+        four_requests = 4 * shadow_py.TIMEOUT
+        worst_case = (
+            setup_and_checkouts
+            + install["timeout-minutes"] * 60
+            + shadow_py.HELM_VERSION_TIMEOUT
+            + shadow_py.HELM_TIMEOUT
+            + four_requests
+        )
+        self.assertLessEqual(
+            worst_case,
+            job["timeout-minutes"] * 60 - 5,
+            "setup, the install bound, both Helm calls and four requests must finish with a margin "
+            "inside the job's bound, so the summary is written (budget in docs/reference/wac-cd.md)",
+        )
         self.assertEqual(
             sorted((root / "scripts" / "fixtures" / "values-probe").rglob("*")),
             [

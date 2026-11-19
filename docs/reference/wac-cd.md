@@ -175,37 +175,88 @@ the artifact `wac-cd-release-<version>`. Last, `health_url` must serve the
 expected source SHA (and `db: ok`, unless `health_expect_db_ok` is `false`)
 within a fixed 300 seconds.
 
+**Installing Helm.** `publish` and `shadow` both run `scripts/install-helm.sh`,
+the one way wac-cd installs Helm (`install-tools.sh` still installs `crane` for
+`build`). It downloads exactly
+`https://get.helm.sh/helm-v3.16.3-linux-<arch>.tar.gz` for amd64 or arm64 with
+`curl --max-time 25`, checks it with `sha256sum -c` against the two digests
+committed in the script beside the version, extracts only `linux-<arch>/helm`
+into `$RUNNER_TEMP/bin` and appends that directory to `GITHUB_PATH`. A digest
+mismatch, a failed download or an unknown architecture exits non-zero and
+installs nothing. It never runs a fetched script: the upstream `get-helm-3`
+installer that `install-tools.sh` uses runs code from `helm/helm` `main` before
+any checksum is checked, and `shadow` holds `id-token: write`, so the GitHub
+token request URL and bearer are in the environment of every step it runs. The
+install stays in that job, with the tarball pinned, because a separate job
+without the permission that passed the binary on as an artifact would cost a
+fleet runner per release.
+
 **Shadow.** In every mode but `none`, the `shadow` job asks hemi whether its
 stored copy of the app's configuration matches the files. It mints a GitHub
 OIDC job token with audience `wacwini:hemi` for each request, reads
 `GET http://hemi-app.hemi.svc.cluster.local:3000/api/v1/contract` for the copy
 number (`identity.revision`), then posts `{"revision", "profile", "values"}` and,
-when Helm could read the file, `"helmValues"` to `/api/v1/shadow`: the copy number, `.github/wacd.json` parsed as JSON, the text of the values
-file the profile names, and `helmValues`, Helm's own reading of that file. YAML 1.1,
-which Helm uses, reads `yes` and `on` as true, `010` as 8 and a key written `y` as
-the string `true`, and applies `<<` merges; hemi reads the same text as YAML 1.2, so
-hemi compares JSON with JSON. The job installs Helm `v3.16.3` (the version `publish`
-installs) in a step that may fail and is bounded at one minute, and the script, once `helm version --template '{{.Version}}'` prints exactly `v3.16.3` (any other Helm, such as one the runner image ships, is treated as absent), runs `helm template probe
-scripts/fixtures/values-probe -f <values file> --show-only templates/values.json`
-with no cluster (`KUBECONFIG=/dev/null`), none of the job's token variables and a
-30-second timeout. The probe chart's only template is `{{ toJson .Values }}` and it
-ships no `values.yaml`, because with chart defaults Helm removes a key the user set to
-null and without them it keeps every null where it was written. If Helm is absent,
-fails, times out or prints anything but a JSON object, the body carries no
-`helmValues` and the summary ends with `Helm could not read the values; hemi
-compared its own reading.` Each request has a 10-second timeout, no proxy and no
-redirects. The job summary gets one line, `hemi's copy matched the files
-(copy <n>).` or `hemi's copy differs from the files in <k> places (copy <n>).`
-(`in 1 place` for a single difference) followed by one line per difference, or `hemi did not answer; nothing was
-compared.` for any other status, a timeout, a dropped connection or a missing
-token. It is observation only: the files stay the truth and nothing acts on the
-answer. The job is `continue-on-error`, no other job lists it in `needs`, and
-`scripts/wacd-shadow.py` exits 0 on every path, so a hemi outage never fails or
-delays a release. The job is bounded at two minutes, because the run holds its
-concurrency group until every job ends and the next queued release waits for
-it. It asks for `contents: read` and `id-token: write`, which the calling job
-already grants. Neither token is ever printed: every token it minted is
-replaced with `[token]` in any line it writes, even one hemi echoed back.
+when Helm could read the file, `"helmValues"` to `/api/v1/shadow`: the copy
+number, `.github/wacd.json` parsed as JSON, the text of the values file the
+profile names, and `helmValues`, Helm's own reading of that file. YAML 1.1,
+which Helm uses, reads `yes` and `on` as true, `010` as 8 and a key written `y`
+as the string `true`, and applies `<<` merges; hemi reads the same text as
+YAML 1.2, so with `helmValues` hemi compares JSON with JSON.
+
+The script reads only regular files inside the repository checkout (the working
+directory). A `.github/wacd.json` or values file that is a symbolic link, sits
+behind one, lies outside the checkout (`..`, an absolute path) or is not a
+regular file is refused, and so is a file over 1 MiB. A refusal skips the whole
+comparison, mints no token, posts nothing and writes its own summary line, for
+example `the values file is a symbolic link or sits behind one; nothing was
+compared.`, `the values file lies outside the repository checkout; nothing was
+compared.` or `the values file is larger than 1 MiB; nothing was compared.`
+
+The script uses Helm only when `helm version --template '{{.Version}}'` prints
+exactly `v3.16.3` (any other Helm, such as one the runner image ships, is
+treated as absent). It then runs `helm template probe
+scripts/fixtures/values-probe -f <absolute values path> --show-only
+templates/values.json`, with no standard input, no cluster (`KUBECONFIG=/dev/null`),
+none of the job's token variables, and empty throwaway `HELM_PLUGINS`,
+`HELM_CACHE_HOME`, `HELM_CONFIG_HOME` and `HELM_DATA_HOME` directories. Helm's
+output is read to at most 1 MiB. The probe chart's only template is
+`{{ toJson .Values }}` and it ships no `values.yaml`, because with chart
+defaults Helm removes a key the user set to null and without them it keeps every
+null where it was written. If Helm is absent, is another version, fails, times
+out or prints more than 1 MiB or anything but a JSON object, the body carries
+no `helmValues` and the summary ends with `Helm could not read the values; hemi
+compared its own reading.`
+
+Each request has a 2-second timeout, no proxy and no redirects. The job summary
+gets one line, `hemi's copy matched the files (copy <n>).` or `hemi's copy
+differs from the files in <k> places (copy <n>).` (`in 1 place` for a single
+difference) followed by one line per difference, or `hemi did not answer;
+nothing was compared.` for any other status, a timeout, a dropped connection or
+a missing token. It is observation only: the files stay the truth and nothing
+acts on the answer. The job is `continue-on-error`, no other job lists it in
+`needs`, and `scripts/wacd-shadow.py` exits 0 on every path, so a hemi outage
+never fails or delays a release. It asks for `contents: read` and
+`id-token: write`, which the calling job already grants. Neither token is ever
+printed: every token it minted is replaced with `[token]` in any line it
+writes, even one hemi echoed back.
+
+The job is bounded at two minutes, because the run holds its concurrency group
+until every job ends and the next queued release waits for it. The summary has
+to be written inside that bound, so the worst case is added up, in seconds:
+
+| Part | Bound |
+| --- | --- |
+| checkouts and `setup-python` (assumed at most) | 30 |
+| `Install helm` step, `timeout-minutes: 1` and `continue-on-error` | 60 |
+| `helm version` | 5 |
+| `helm template` | 10 |
+| four requests at 2 each (two token mints, the contract read, the comparison) | 8 |
+| total | 113 |
+
+That leaves 7 seconds. The install script bounds its one download at 25
+seconds, so the 60 is a backstop for the step, not the usual worst case.
+`.github/scripts/test_reusable_workflows.py` adds these from the workflow and the
+script and fails if the sum passes 115.
 
 ## Where releases live
 

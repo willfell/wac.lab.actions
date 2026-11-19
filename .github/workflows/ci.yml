@@ -64,6 +64,7 @@ jobs:
       - name: Run the script tests
         run: |
           bash scripts/tests/helm-install.test.sh
+          bash scripts/tests/install-helm.test.sh
 
       - uses: astral-sh/setup-uv@v5
 
