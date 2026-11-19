@@ -206,15 +206,24 @@ are that file, the values path main's profile names and the copy's
 `delivery.valuesFile`. Nothing looks at the base branch, so a pull request
 into another pull request's branch is judged by main like any other.
 
+`contract` writes `### wac-ci settings` to the run summary: a table with the
+columns `source` and `revision` and one row (`hemi` and the revision, `files`
+and the revision or `-`, or `-` and `-` when the job fails), then the sentences
+the `result` column below quotes. Every result from
+hemi's copy opens with `Settings come from hemi's copy, revision <n>.`, then
+adds a sentence for each file still on main. The sentences are in the run
+summary only, not the job log.
+
 | hemi's answer | files on main | files in the pull request | result |
 | --- | --- | --- | --- |
 | 200, source `hemi` | absent | present | fails: `<path> was added back; <app>'s settings live in hemi.`, or, when the merge commit's first parent is not main's head, `This run's merge commit is older than <app>'s clean-up; update the branch and re-run.` |
-| 200, source `hemi` | present | present, the same blob | hemi's settings; the summary says `<path> is still on main until hemi's clean-up pull request merges; hemi's settings were used.` |
+| 200, source `hemi` | present | present, the same blob | hemi's settings; after `Settings come from hemi's copy, revision <n>.` the summary says, for each such file, `<path> is still on main until hemi's clean-up pull request merges; hemi's settings were used.` |
+| 200, source `hemi` | present | absent: this pull request deletes the files | hemi's settings; the summary says only `Settings come from hemi's copy, revision <n>.`. This is hemi's clean-up pull request itself, and it passes |
 | 200, source `hemi` | present | present, another blob | fails: `<path> was changed; <app>'s settings live in hemi, so change them there.` |
-| 200, source `hemi` | absent | absent | hemi's settings |
-| 200, source `files` | absent | present | the pull request's own files: it is the restore pull request of a return to files, or a new app's first pull request (below) |
+| 200, source `hemi` | absent | absent | hemi's settings; the summary says only `Settings come from hemi's copy, revision <n>.` |
+| 200, source `files` | absent | present | the pull request's own files: it is the restore pull request of a return to files (`hemi's copy (revision <n>) says <app> is returning to its files and this pull request puts them back, so its own files were used.`), or a new app's first pull request (below) |
 | 200, source `files` | absent | absent | fails: wait for hemi's restore pull request and re-run after it merges; for an answer with no revision, `hemi holds no settings for <app> yet, and neither main nor this pull request has .github/wacd.json, so there is nothing to check.` |
-| 200, source `files` | present | any | the pull request's own files, as before |
+| 200, source `files` | present | any | the pull request's own files, as before; the summary says `hemi's copy (revision <n>) says <app>'s settings live in its files, so the pull request's own files were used.`, or, for an answer with no revision, `hemi holds no settings for <app> yet, so the pull request's own files were used.` |
 | anything but a readable 200 | present | present | the pull request's own files, as before; the summary names only hemi's status, such as `hemi answered 401; using the repository's files.` |
 | anything but a readable 200 | present | removes either file | fails, naming the cause, then `and this pull request removes <repository>'s files`: `hemi did not answer, ...; re-run when hemi answers.` for silence or a 5xx (hemi's clean-up pull request during a hemi outage), `hemi refused the job token (HTTP <status>), ...; if this app is new, register it with lab first.` for a 401 or 403, `hemi answered HTTP <status>, ...` for another status, the Lab-runner sentence for an address that does not resolve, and likewise for an unreadable answer, a token GitHub would not mint or no `id-token` grant. |
 | 401 or 403 | absent | any | fails: `hemi refused this pull request's token (HTTP <status>); <repository>'s settings live in hemi, so the checks cannot run; if this app is new, register it with lab first.` |

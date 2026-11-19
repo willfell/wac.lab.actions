@@ -3,10 +3,14 @@
 `wac-ci` and `wac-cd` are two reusable workflows that replace an app's own
 deploy pipeline. [`wac-ci`](wac-ci.md) runs on pull requests;
 [`wac-cd`](wac-cd.md) runs on a merge to `main` and releases through Lab's
-gateway. Both are driven by one file in the app repo,
-`.github/wacd.json`, so the app holds its profile, a values file for the
-shared `wac-app` chart, a Dockerfile per image, and two short caller
-workflows. It holds no `deploy/k8s`, no `Chart.yaml` and no templates.
+gateway. Both are driven by one profile. Until an app is cut over to hemi the
+profile is a file in the app repo, `.github/wacd.json`, so the app holds its
+profile, a values file for the shared `wac-app` chart, a Dockerfile per image,
+and two short caller workflows. It holds no `deploy/k8s`, no `Chart.yaml` and
+no templates. Once the app is cut over, hemi's clean-up pull request deletes
+`.github/wacd.json` and the values file from `main`: the app holds the
+Dockerfiles and the two caller workflows, and both workflows derive the same
+profile from hemi's copy (**The copy hemi stores**, below).
 
 Both workflows reach their scripts by checking this repo out at
 `job.workflow_sha`, the commit the caller pinned, exactly as the `techdocs`
@@ -21,7 +25,8 @@ in-cluster registry, so they run on Lab runners only.
 ## The profile
 
 `scripts/wacd-profile.py` validates `.github/wacd.json` before anything else
-runs, in both workflows. Every field is required unless marked optional, and an
+runs, in both workflows, for an app on its files; for a cut-over app it
+validates the profile derived from hemi's copy in the same way. Every field is required unless marked optional, and an
 unknown field fails at every level, so a typo is an error naming its dotted
 path (`images[1].sha_build_arg`) rather than a setting that silently does
 nothing.

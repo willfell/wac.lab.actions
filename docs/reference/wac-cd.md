@@ -346,12 +346,32 @@ without a code reads
 `The gateway did not accept this run as a release of a registered app.` From
 `plan`, after its three attempts, it reads
 `The gateway refused this run's token on each of 3 attempts (HTTP 403 with no reason), so nothing was built; a gateway that does not yet serve the contract operation (wacwini/wac.lab#570 not deployed) looks like this too; if this app is new, register it with lab first.`
-The run summary's
-`wac-cd settings` section names the source, the revision and the fleet commit,
-with one sentence saying which rule applied or why the run stopped. The
-revision is a JSON number in the copy and a decimal string in the annotation,
-of at most ten digits as the gateway reads it; `wacd-chart.py` converts between
-the two in one place.
+The revision is a JSON number in the copy and a decimal string in the
+annotation, of at most ten digits as the gateway reads it; `wacd-chart.py`
+converts between the two in one place.
+
+**What `plan` writes to the run summary.** Two sections, in this order. The
+settings step writes `### wac-cd settings`: a table with the columns
+`source`, `revision` and `fleet commit`, one row, then one sentence. The
+fleet commit column holds the full 40-hex commit; a `-` stands for a value the
+run does not have.
+
+| The gateway answered | Row (source, revision, fleet commit) | Sentence |
+| --- | --- | --- |
+| a copy whose source is `hemi` | `hemi`, `<n>`, the 40-hex commit | `Settings come from hemi's copy, revision <n>, read at wac.fleet commit <12 hex>.` |
+| a copy whose source is `files` | `files`, `<n>`, the 40-hex commit | `hemi's copy (revision <n>) says this app's settings live in its files, so they come from the files and the chart names revision <n>.` |
+| no copy | `files`, `-`, `-` | `The gateway holds no copy of this app's settings, so they come from the repository's files, as before.` |
+| a refusal, or anything else that stops the run | `-`, `-`, `-` | the sentence that says why, from the list above or from the cases under **Settings** |
+
+The `<12 hex>` is the first twelve characters of the commit in the table. The
+sentence is written to the run summary only; the job log carries the
+`Set output` lines but not the sentence, so read it on the run's page.
+`Plan the version` then writes `### wac-cd plan`: a table with the columns
+`mode`, `version`, `tag` and `expected sha` and one row, such as `release`, the
+new version, its tag and the commit, followed by the sentences of the run (a
+resume, a superseded run, `mode: settings`) when it has any. Every run that
+reaches `Plan the version` has both sections; the first differs by what the
+gateway answered, as in the table above.
 
 **Versions.** `plan` finds the latest tag `<tag_prefix>X.Y.Z` reachable from
 HEAD and reads the commits since it: any breaking change (`type!:` or a
@@ -377,6 +397,21 @@ exists on another commit fails the plan.
 | `none` | `workflow_dispatch` with `settings_revision` when hemi's copy already holds a newer revision | nothing |
 | `none` | `version_source: caller` with no version, or a tagged HEAD whose chart is published, with `deploy: false` | nothing |
 | `none` | a `release` or `publish` run whose tag push was refused after `main` moved on: superseded | nothing |
+
+Every run lists all of `plan`, `build`, `retag`, `shadow`, `publish`,
+`deploy` and `github-release`, and a job a mode does not use is listed with the
+conclusion `skipped`, not left out. A `release` of a code merge reads
+differently by where its settings came from:
+
+| Settings came from | `plan` | `build` | `shadow` | `retag` | `publish`, `deploy`, `github-release` |
+| --- | --- | --- | --- | --- | --- |
+| the files (a copy whose source is `files`, or no copy) | `success` | `success` | `success` | `skipped` | `success` |
+| hemi's copy | `success` | `success` | `skipped` | `skipped` | `success` |
+
+`shadow` runs only when the settings came from the files, since a copy has no
+files to compare it with, and `retag` runs only in `settings` mode, so a code
+release from hemi's copy skips both, and the run is green with those two
+`skipped`. `deploy` ends with `Verified served build: <the merge commit>`.
 
 `deploy: false` is publish-only, used for cutover step 1: the old route still
 deploys while `wac-cd` publishes the first deploy chart. From `v1.35.0` Lab's
@@ -525,7 +560,7 @@ binary on as an artifact would cost a fleet runner per release.
 **Shadow.** In every mode but `none`, when the settings came from the files,
 the `shadow` job asks hemi whether its stored copy of the app's configuration
 matches the files. When they came from hemi's copy there are no files to
-compare it with, and the job is skipped. It mints a GitHub
+compare it with, and the job is listed with the conclusion `skipped` (**Modes**, above). It mints a GitHub
 OIDC job token with audience `wacwini:hemi` for each request, reads
 `GET http://hemi-app.hemi.svc.cluster.local:3000/api/v1/contract` for the copy
 number (`identity.revision`), then posts `{"revision", "profile", "values"}` and,
