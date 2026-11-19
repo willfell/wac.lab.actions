@@ -124,9 +124,13 @@ npm view "<name>@<version>" version --prefer-online --userconfig .npmrc
 That is the probe hemi carries in its own `checks` gate, with the version
 taken from the lockfile and checked before npm runs, since
 `npm view <name>@` resolves the latest version and exits 0. Every lockfile is
-read first, and the step fails before any request when an entry has no exact
-version, a lockfile has no `packages` map (lockfileVersion 1), or a lockfile
-locks `@willfell` packages with no `.npmrc` beside it. The probes then run in
+read first, and the step fails before any request when a lockfile cannot be
+read or is not JSON, has no `packages` map (lockfileVersion 1), has a
+`@willfell` entry whose name npm would not publish, whose entry is not an
+object or that has no exact version, or locks `@willfell` packages with no
+`.npmrc` beside it; a lockfile path that is not a repo-relative
+`package-lock.json` is refused too, though the node-layout step never passes
+one. The probes then run in
 order and stop at the first the registry does not confirm: npm exits
 non-zero, or prints anything but the locked version. A workspace link
 (`"link": true`, as the wac repo's own `@willfell/wac-ui` is) is installed
@@ -213,8 +217,11 @@ columns `source` and `revision` and one row (`hemi` and the revision, `files`
 and the revision or `-`, or `-` and `-` when the job fails), then the sentences
 the `result` column below quotes. Every result from
 hemi's copy opens with `Settings come from hemi's copy, revision <n>.`, then
-adds a sentence for each file still on main. The sentences are in the run
-summary only, not the job log.
+adds a sentence for each file still on main. A passing result's sentences
+are in the run summary only, not the job log. A failing result's sentence is
+also the script's stderr line `wacd contract: <sentence>`, which the step
+turns into the `::error::` annotation `wac-ci: wacd contract: <sentence>`, so
+it shows in the job log and on the run's page.
 
 | hemi's answer | files on main | files in the pull request | result |
 | --- | --- | --- | --- |
@@ -227,8 +234,9 @@ summary only, not the job log.
 | 200, source `files` | absent | absent | fails: wait for hemi's restore pull request and re-run after it merges; for an answer with no revision, `hemi holds no settings for <app> yet, and neither main nor this pull request has .github/wacd.json, so there is nothing to check.` |
 | 200, source `files` | present | any | the pull request's own files, as before; the summary says `hemi's copy (revision <n>) says <app>'s settings live in its files, so the pull request's own files were used.`, or, for an answer with no revision, `hemi holds no settings for <app> yet, so the pull request's own files were used.` |
 | anything but a readable 200 | present | present | the pull request's own files, as before; the summary names only hemi's status, such as `hemi answered 401; using the repository's files.` |
-| anything but a readable 200 | present | removes either file | fails, naming the cause, then `and this pull request removes <repository>'s files`: `hemi did not answer, ...; re-run when hemi answers.` for silence or a 5xx (hemi's clean-up pull request during a hemi outage), `hemi refused the job token (HTTP <status>), ...; if this app is new, register it with lab first.` for a 401 or 403, `hemi answered HTTP <status>, ...` for another status, the Lab-runner sentence for an address that does not resolve, and likewise for an unreadable answer, a token GitHub would not mint or no `id-token` grant. |
-| 401 or 403 | absent | any | fails: `hemi refused this pull request's token (HTTP <status>); <repository>'s settings live in hemi, so the checks cannot run; if this app is new, register it with lab first.` |
+| anything but a readable 200 | present | removes either file | fails, naming the cause, then `and this pull request removes <repository>'s files`: `hemi did not answer, ...; re-run when hemi answers.` for silence or a 5xx (hemi's clean-up pull request during a hemi outage), `hemi refused this pull request's token (HTTP <status>), ...; if <repository> is new, register it with lab first and re-run.` for a 401 or 403 (outside a `pull_request` run, `hemi refused the job token of this <event> run (HTTP <status>): it admits wac-ci only for pull_request runs, and this pull request removes <repository>'s files.`), `hemi answered HTTP <status>, ...; re-run once hemi serves this repository.` for another status, `hemi's answer could not be read, ...; re-run once hemi serves this repository.` for an unreadable answer, the Lab-runner sentence for an address that does not resolve, and likewise for a token GitHub would not mint or no `id-token` grant. |
+| 403 with hemi's body `{"error":"not registered"}` (an app hemi does not know, or one with no active copy) | absent | any | fails: `hemi does not know <repository>: it is not registered with lab, or hemi holds no active copy of its settings. If it is new, register it (lab:lab-onboard-app), wait for hemi to list it, then re-run the checks.` |
+| any other 401 or 403 | absent | any | fails: `hemi refused this pull request's token (HTTP <status>): if <repository> is new, register it with lab first and re-run; if it is cut over, its settings live in hemi and the checks cannot run until hemi admits this run.` (outside a `pull_request` run: `hemi refused the job token of this <event> run (HTTP <status>): it admits wac-ci only for pull_request runs; ` and the same clauses). Only a 403's body is read, at most 4096 bytes, and only to find that code; a longer body, or anything else, reads as this row |
 | no answer (a connection closed or reset after the request, or an answer shorter than the `Content-Length` it declares), a timeout or a 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
 | hemi's address does not resolve, on all three attempts | absent | any | fails: ``the contract job must run on a Lab runner: <runner> cannot reach hemi's in-cluster address. Pass a Lab pool as `runner`.`` |
 | GitHub mints no job token | absent | any | fails: `GitHub would not mint a job token for hemi; re-run the checks.` |

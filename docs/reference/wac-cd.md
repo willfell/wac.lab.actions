@@ -294,7 +294,7 @@ never left the runner from one the gateway may have read
 (`wacd-release.py`'s `never_sent()`). A connection refused, reset or closed
 while connecting or in the TLS handshake, a connect timeout, or no route is
 nothing sent: the release call, the downgrade pre-check and every status read
-of the proof are asked again with a fresh token, backing off from 5 seconds
+of `deploy`'s proof are asked again with a fresh token, backing off from 5 seconds
 doubling to 30, for at most 90 seconds from the first such failure in a row
 and never past `wait_timeout`, and then `Release through the gateway` fails
 with `The gateway could not be reached for <n> s, longer than a restart is
@@ -312,7 +312,14 @@ skips the fleet checks and is not recorded again, and the Application is
 patched only when it is not already synced at that digest. A second loss
 fails with `The gateway dropped the release of <version> after it was sent,
 twice, and its status does not show <version> targeted, so the release
-stopped; run the deploy again.` A certificate that fails verification and
+stopped; run the deploy again.` A lost release whose status then cannot be
+read (every read a 503 or unanswered) until `wait_timeout` ends fails with
+`The gateway dropped the release of <version> after it was sent, and its
+status could not be read before the deadline, so whether it acted is unknown;
+run the deploy again.`, never sending it again blind. The settings plan's
+status read in `plan` (`Plan the settings release`) does not ride out a
+restart: a refused connection there fails the step as a transport fault, as
+in `v1.35.0`. A certificate that fails verification and
 every other transport failure still fail at once with `release transport
 failed; check TLS trust and service readiness`, a coded refusal is still
 final, and `wait_timeout` still bounds it all. When the release waited out a
@@ -393,9 +400,13 @@ run does not have.
 | no copy | `files`, `-`, `-` | `The gateway holds no copy of this app's settings, so they come from the repository's files, as before.` |
 | a refusal, or anything else that stops the run | `-`, `-`, `-` | the sentence that says why, from the list above or from the cases under **Settings** |
 
-The `<12 hex>` is the first twelve characters of the commit in the table. The
-sentence is written to the run summary only; the job log carries the
-`Set output` lines but not the sentence, so read it on the run's page.
+The `<12 hex>` is the first twelve characters of the commit in the table.
+When the run goes on, the sentence is written to the run summary only; the job
+log carries the `Set output` lines but not the sentence, so read it on the
+run's page. A refusal's sentence also goes to the script's stderr as
+`wacd contract: <sentence>`, which `Read the settings from the gateway` turns
+into the `::error::` annotation `wac-cd: wacd contract: <sentence>`, so it
+shows in the job log and on the run's page as well.
 `Plan the version` then writes `### wac-cd plan`: a table with the columns
 `mode`, `version`, `tag` and `expected sha` and one row, such as `release`, the
 new version, its tag and the commit, followed by the sentences of the run (a
@@ -441,7 +452,11 @@ differently by where its settings came from:
 `shadow` runs only when the settings came from the files, since a copy has no
 files to compare it with, and `retag` runs only in `settings` mode, so a code
 release from hemi's copy skips both, and the run is green with those two
-`skipped`. `deploy` ends with `Verified served build: <the merge commit>`.
+`skipped`. `deploy` writes `### wac-cd deploy` to the run summary, a table
+with the columns `mode`, `version`, `tag` and `expected sha` and one row, and,
+once the served build matches, the line
+`Release proved by gateway status and served sha`; its `Prove the served
+build` step logs `Verified served build: <the merge commit>`.
 
 `deploy: false` is publish-only, used for cutover step 1: the old route still
 deploys while `wac-cd` publishes the first deploy chart. From `v1.35.0` Lab's
@@ -883,9 +898,11 @@ refusal gave no reason.`
   files changed since <V>, so its settings cannot be released on <C short>.`
 
 Every other failure in planning (a fault in the status, a copy that cannot be
-released on its own, a chart above V that cannot be read, an earlier release of
-the revision, a refused tag claim)
-fails `Plan the settings release` or `Plan the version` itself.
+released on its own, a chart above V that cannot be read, GitHub Releases that
+cannot be read, which fail with `the GitHub Releases of <app> could not be
+read, so this settings release cannot tell a rollback from an unfinished
+release; run it again.`, an earlier release of the revision, a refused tag
+claim) fails `Plan the settings release` or `Plan the version` itself.
 
 **How hemi reads the outcome.** A settings run released if and only if its
 `cd / retag` and `cd / deploy` jobs concluded `success`. The run summary says
@@ -1031,8 +1048,11 @@ passes it in the `cd` job:
 ```
 
 Each non-blank line is `KEY=VALUE`, with `KEY` matching `^[A-Z][A-Z0-9_]*$`
-and the value everything after the first `=`, unchanged (it may be empty); a
-trailing carriage return is dropped. Each line becomes
+and the value everything after the first `=`, unchanged and not empty; a
+trailing carriage return is dropped. A value is one line: there is no way to
+continue it, and a value's second line is read as a line of its own (a blank
+one is skipped), so pass a multi-line value (a PEM key, say) encoded on one
+line, such as base64, and decode it in the build. Each line becomes
 `--secret id=<key>,src=<file>` on every image build, after the npm token's
 mount, where `<key>` is the `KEY` lower-cased:
 `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` is mounted as
@@ -1049,9 +1069,15 @@ or, without `env=`, as the file `/run/secrets/<key>`.
 
 The build step fails before any image is built on a line with no `=`, an empty
 `KEY`, a `KEY` that does not match the pattern, `NODE_AUTH_TOKEN` (already
-mounted as `node_auth_token` from `npm_token`), or a `KEY` given twice. Each
-refusal names the line number, and the `KEY` once it is a valid name, and
-never prints a value.
+mounted as `node_auth_token` from `npm_token`), a `KEY` given twice, or an
+empty value, which is what a secret the caller never set becomes:
+`build_secrets line <n> gives <KEY> an empty value; set the secret it is read
+from, or remove the line.` Each refusal names the line number, and the `KEY`
+once it is a valid name, and never prints a value. The sentences for a line
+with no `=` and for a `KEY` that does not match end
+`a value must not span lines.`, since that is what the second line of a
+multi-line value becomes; a second line that happens to read as `KEY=VALUE`
+is taken as a secret of its own, and no check can tell it apart.
 
 How the values are kept out of the log: the runner masks a multi-line secret
 as a whole and line by line, so each `KEY=VALUE` line is masked, but a value
