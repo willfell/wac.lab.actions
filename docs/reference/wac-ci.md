@@ -86,6 +86,11 @@ and is the one copy outside lab. The caller removes the input at cutover step
 
 ## The contract job
 
+`contract` is built for `pull_request` runs. Hemi admits `wac-ci`'s token
+only for a `pull_request` run on the merge ref, so on any other event a
+cut-over repository fails `contract` with a sentence naming the event, and a
+repository on its files runs on them as before.
+
 A repository that has been cut over to hemi has no `.github/wacd.json` and no
 values file: its settings live in hemi. `contract` asks hemi for them on every
 pull request, so a cut-over repository's checks run on hemi's copy, and it
@@ -141,11 +146,19 @@ into another pull request's branch is judged by main like any other.
 | anything but a readable 200 | present | any | the pull request's own files, as before; the summary names only hemi's status, such as `hemi answered 401; using the repository's files.` |
 | 401 or 403 | absent | any | fails: `hemi refused this pull request's token (HTTP <status>); <repository>'s settings live in hemi, so the checks cannot run.` |
 | no answer, a timeout or a 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
+| hemi's address does not resolve | absent | any | fails: ``the contract job must run on a Lab runner: <runner> cannot reach hemi's in-cluster address. Pass a Lab pool as `runner`.`` |
+| GitHub mints no job token | absent | any | fails: `GitHub would not mint a job token for hemi; re-run the checks.` |
 | 404, 422 or any other status | absent | any | fails, naming the status |
 
 A 200 that cannot be read, names another repository than the token's, or
-does not derive a profile counts as "anything but a readable 200", and so does
-a job that has no `id-token` grant to mint with. The restore pull request is
+does not derive a profile counts as "anything but a readable 200". So do an
+address that does not resolve, a token GitHub would not mint, and a job with
+no `id-token` grant to mint with; for a repository on its files the summary
+then says which. An address that does not resolve means a runner outside the
+cluster, such as a hosted one, so it is not asked again, and the sentence
+names the runner (`runner.name`, passed to the step as `JOB_RUNNER_NAME`).
+A connection refused inside the cluster is hemi restarting, and counts as no
+answer. The restore pull request is
 not looked up: `contract` holds `contents: read` only, so its sentence says
 to wait for that pull request rather than naming it.
 

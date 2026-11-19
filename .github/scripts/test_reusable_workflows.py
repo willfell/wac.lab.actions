@@ -799,6 +799,9 @@ class ReusableWorkflowTests(unittest.TestCase):
             check = self.wac_cd()["jobs"][job_name]["steps"][0 if job_name == "deploy" else 1]["run"]
             with self.subTest(job=job_name):
                 self.assertEqual(re.search(r"^modules=\((.*?)\)$", check, re.M).group(1).split(), listed)
+        with self.subTest(job="wac-ci contract"):
+            check = self.wac_ci()["jobs"]["contract"]["steps"][0]["run"]
+            self.assertEqual(re.search(r"^modules=\((.*?)\)$", check, re.M).group(1).split(), listed)
 
     def test_wac_cd_plan_fails_with_the_refusal_sentence(self):
         import os
@@ -1557,7 +1560,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(len(asks), 1)
         ask = asks[0]
         self.assertEqual(ask["id"], "contract")
-        self.assertNotIn("env", ask, "nothing the caller passes reaches the script")
+        self.assertEqual(ask["env"], {"JOB_RUNNER_NAME": "${{ runner.name }}"},
+                         "nothing the caller passes reaches the script")
         for code, expected in ((0, 0), (1, 1)):
             with self.subTest(script_exit=code), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)

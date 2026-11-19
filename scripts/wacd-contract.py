@@ -73,8 +73,10 @@ dropping `id-token` from its own ci.yml:
 | 200 `files` | absent | absent | fails: wait for the restore pull request |
 | 200 `files` | present | any | the files, as before |
 | anything else | present | any | the files, as before; the summary names hemi's status |
-| 401 or 403 | absent | any | fails: hemi refused the token |
+| 401 or 403 | absent | any | fails: hemi refused the token (or the event, outside `pull_request`) |
 | no answer, a timeout or 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
+| an address that does not resolve | absent | any | fails: the job must run on a Lab runner |
+| no token minted | absent | any | fails: GitHub would not mint a job token |
 | any other status | absent | any | fails, naming the status |
 
 "Files on main" is `.github/wacd.json` on main, the profile that holds the
@@ -101,6 +103,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -150,8 +153,14 @@ PR_ATTEMPT_SECONDS = 15
 GIT_SECONDS = 30
 MAX_ANSWER = 1048576
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+RUNNER_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+EVENT_NAME = re.compile(r"[a-z_]{1,40}")
 GRANT_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
 CUT_OVER = "{app}'s settings live in hemi, so the checks cannot run."
+UNREACHABLE = (
+    "the contract job must run on a Lab runner: {runner} cannot reach hemi's in-cluster address. "
+    "Pass a Lab pool as `runner`."
+)
 
 PR_SENTENCES = {
     "added_back": "{path} was added back; {app}'s settings live in hemi.",
@@ -174,9 +183,17 @@ PR_SENTENCES = {
     "status_files": "hemi answered {status}; using the repository's files.",
     "silent_files": "hemi did not answer; using the repository's files.",
     "no_grant_files": "no job token for hemi; using the repository's files.",
+    "no_mint_files": "GitHub would not mint a job token for hemi; using the repository's files.",
+    "unreachable_files": UNREACHABLE,
     "unreadable_files": "hemi's answer could not be read; using the repository's files.",
     "refused": "hemi refused this pull request's token (HTTP {status}); " + CUT_OVER,
+    "refused_event": (
+        "hemi refused the job token of this {event} run (HTTP {status}): it admits wac-ci only for "
+        "pull_request runs, and " + CUT_OVER
+    ),
     "silent": "hemi did not answer; re-run when it does.",
+    "no_mint": "GitHub would not mint a job token for hemi; re-run the checks.",
+    "unreachable": UNREACHABLE,
     "status": "hemi answered HTTP {status}; " + CUT_OVER,
     "no_grant": (
         "GitHub would not mint a job token for hemi: the caller's ci.yml must grant "
@@ -456,11 +473,16 @@ def granted():
 
 
 def hemi_attempt():
-    """(status, body, token) for one GET with a token minted for it; status None when unanswered."""
+    """(status, body, token) for one GET with a token minted for it.
+
+    Without an answer the status says why instead: "no_mint" when GitHub
+    minted no token, "unreachable" when hemi's address does not resolve (a
+    runner outside the cluster), and None for silence.
+    """
     try:
         token = shadow.oidc_token()
     except shadow.Unanswered:
-        return None, None, None
+        return "no_mint", None, None
     request = urllib.request.Request(
         shadow.URL + CONTRACT_ROUTE, headers={"Authorization": "Bearer " + token}, method="GET"
     )
@@ -470,6 +492,8 @@ def hemi_attempt():
     except urllib.error.HTTPError as error:
         error.close()
         return error.code, None, token
+    except urllib.error.URLError as error:
+        return ("unreachable" if isinstance(error.reason, socket.gaierror) else None), None, token
     except (OSError, ValueError, http.client.HTTPException):
         return None, None, token
     try:
@@ -490,20 +514,31 @@ def bounded_attempt():
 
 
 def ask_hemi():
-    """("ok", copy), ("status", code) or (silent | no_grant | unreadable, None)."""
+    """("ok", copy), ("status", code) or (silent | no_mint | unreachable | no_grant | unreadable, None).
+
+    Silence, a 5xx and a token GitHub would not mint are asked again; an
+    address that does not resolve is not, since only another runner helps.
+    """
     if not granted():
         return "no_grant", None
+    last = "silent"
     for attempt in range(PR_ATTEMPTS):
         if attempt:
             time.sleep(PR_BACKOFF[min(attempt, len(PR_BACKOFF)) - 1])
         status, raw, token = bounded_attempt()
+        if status == "unreachable":
+            return "unreachable", None
+        if status == "no_mint":
+            last = "no_mint"
+            continue
         if status is None or 500 <= status <= 599:
+            last = "silent"
             continue
         if status != 200:
             return "status", status
         copy = read_pr_copy(raw, token)
         return ("ok", copy) if copy is not None else ("unreadable", None)
-    return "silent", None
+    return last, None
 
 
 def read_pr_copy(raw, token):
@@ -549,6 +584,16 @@ def repository_name():
     return name if REPOSITORY.fullmatch(name) else "this repository"
 
 
+def runner_name():
+    name = os.environ.get("JOB_RUNNER_NAME", "")
+    return name if RUNNER_NAME.fullmatch(name) else "this runner"
+
+
+def event_name():
+    name = os.environ.get("GITHUB_EVENT_NAME", "")
+    return name if EVENT_NAME.fullmatch(name) else "unnamed"
+
+
 def pull_request(out, main, head):
     """Decide a pull request's settings source; returns (source, revision, sentences)."""
     clear(out)
@@ -563,12 +608,14 @@ def pull_request(out, main, head):
     files_on_main = profile_path in on_main
     if outcome != "ok":
         if files_on_main:
-            return "files", "", [PR_SENTENCES[f"{outcome}_files"].format(status=answer)]
-        app = repository_name()
+            return "files", "", [PR_SENTENCES[f"{outcome}_files"].format(status=answer, runner=runner_name())]
+        app, event = repository_name(), event_name()
         if outcome == "status":
-            key = "refused" if answer in (401, 403) else "status"
-            raise Refusal(PR_SENTENCES[key].format(status=answer, app=app))
-        raise Refusal(PR_SENTENCES[outcome].format(app=app))
+            key = "status"
+            if answer in (401, 403):
+                key = "refused" if event == "pull_request" else "refused_event"
+            raise Refusal(PR_SENTENCES[key].format(status=answer, app=app, event=event))
+        raise Refusal(PR_SENTENCES[outcome].format(app=app, runner=runner_name()))
     copy = answer
     app, revision = copy["identity"]["app"], chart.revision_annotation(copy["identity"]["revision"])
     paths.append(copy["delivery"]["valuesFile"])

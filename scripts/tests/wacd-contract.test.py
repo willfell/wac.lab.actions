@@ -640,7 +640,8 @@ class PullRequestCase(unittest.TestCase):
         self.hemi = hemi
         self.sleeps = []
         self.minted = []
-        env = {"GITHUB_STEP_SUMMARY": str(self.summary), "GITHUB_REPOSITORY": REPOSITORY}
+        env = {"GITHUB_STEP_SUMMARY": str(self.summary), "GITHUB_REPOSITORY": REPOSITORY,
+               "GITHUB_EVENT_NAME": getattr(self, "event", "pull_request"), "JOB_RUNNER_NAME": "ci-light-abc12"}
         if self.grant:
             env.update({"ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.actions.githubusercontent.com/t",
                         "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "runner-bearer"})
@@ -649,8 +650,8 @@ class PullRequestCase(unittest.TestCase):
         os.chdir(self.workspace)
         try:
             with contextlib.ExitStack() as stack:
-                stack.enter_context(patch.object(contract.shadow, "URL", hemi.url))
-                stack.enter_context(patch.object(contract.shadow, "oidc_token", self.mint))
+                stack.enter_context(patch.object(contract.shadow, "URL", getattr(self, "hemi_url", hemi.url)))
+                stack.enter_context(patch.object(contract.shadow, "oidc_token", getattr(self, "minter", self.mint)))
                 stack.enter_context(patch.object(contract.time, "sleep", self.sleeps.append))
                 stack.enter_context(patch.object(contract, "PR_ATTEMPT_SECONDS", 0.3))
                 stack.enter_context(patch.dict(os.environ, env))
@@ -835,6 +836,43 @@ class PullRequestTests(PullRequestCase):
         self.assertFails(self.run_pr((503, {}), main={}, head={}), NO_ANSWER)
         self.assertEqual(len(self.hemi.seen), contract.PR_ATTEMPTS)
         self.assertEqual(len(self.minted), contract.PR_ATTEMPTS)
+
+    def test_a_runner_that_cannot_resolve_hemis_address_is_named(self):
+        """A hosted runner has no cluster DNS: the sentence says which runner, and what to pass instead."""
+        self.hemi_url = "http://hemi-app.hemi.invalid:3000"
+        unreachable = ("the contract job must run on a Lab runner: ci-light-abc12 cannot reach hemi's "
+                       "in-cluster address. Pass a Lab pool as `runner`.")
+        self.assertFails(self.run_pr((200, fixture_copy("hemi")), main={}, head={}), unreachable)
+        self.assertEqual(len(self.minted), 1, "an address that does not resolve is not asked again")
+        self.assertEqual(self.sleeps, [])
+        self.summary.unlink(missing_ok=True)
+        self.assertSource(self.run_pr((200, fixture_copy("hemi")), main=FILES, head=FILES), "files")
+        self.assertIn(unreachable, self.summary_text)
+
+    def test_a_token_github_would_not_mint_is_not_hemis_silence(self):
+        refusals = []
+
+        def refuse():
+            refusals.append(1)
+            raise contract.shadow.Unanswered("GitHub did not return a usable OIDC token")
+
+        self.minter = refuse
+        self.assertFails(self.run_pr((200, fixture_copy("hemi")), main={}, head={}),
+                         "GitHub would not mint a job token for hemi; re-run the checks.")
+        self.assertEqual(self.hemi.seen, [], "hemi is never asked without a token")
+        self.assertEqual(len(refusals), contract.PR_ATTEMPTS, "a mint failure is tried again")
+        self.summary.unlink(missing_ok=True)
+        self.assertSource(self.run_pr((200, fixture_copy("hemi")), main=FILES, head=FILES), "files")
+        self.assertIn("GitHub would not mint a job token for hemi; using the repository's files.", self.summary_text)
+
+    def test_a_refusal_outside_a_pull_request_names_the_event_not_a_pull_request(self):
+        """hemi admits wac-ci only for pull_request runs; a push run's 401 is about the event."""
+        self.event = "push"
+        code = self.run_pr((401, {"error": "unauthorized"}), main={}, head={})
+        self.assertFails(code, f"hemi refused the job token of this push run (HTTP 401): it admits wac-ci only "
+                               f"for pull_request runs, and {REPOSITORY}'s settings live in hemi, so the checks "
+                               "cannot run.")
+        self.assertNotIn("pull request's", self.stderr)
 
     def test_an_answer_that_trickles_in_past_the_attempt_bound_is_silence(self):
         """Each read meets the socket timeout; only the attempt's own bound stops it."""
