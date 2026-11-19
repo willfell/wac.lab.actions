@@ -179,17 +179,22 @@ within a fixed 300 seconds.
 the one way wac-cd installs Helm (`install-tools.sh` still installs `crane` for
 `build`). It downloads exactly
 `https://get.helm.sh/helm-v3.16.3-linux-<arch>.tar.gz` for amd64 or arm64 with
-`curl --max-time 25`, checks it with `sha256sum -c` against the two digests
-committed in the script beside the version, extracts only `linux-<arch>/helm`
-into `$RUNNER_TEMP/bin` and appends that directory to `GITHUB_PATH`. A digest
-mismatch, a failed download or an unknown architecture exits non-zero and
-installs nothing. It never runs a fetched script: the upstream `get-helm-3`
-installer that `install-tools.sh` uses runs code from `helm/helm` `main` before
-any checksum is checked, and `shadow` holds `id-token: write`, so the GitHub
-token request URL and bearer are in the environment of every step it runs. The
-install stays in that job, with the tarball pinned, because a separate job
-without the permission that passed the binary on as an artifact would cost a
-fleet runner per release.
+`curl --proto '=https' --tlsv1.2`, checks it with `sha256sum -c` against the two
+digests committed in the script beside the version, extracts only
+`linux-<arch>/helm` into `$RUNNER_TEMP/bin` and appends that directory to
+`GITHUB_PATH`. A failed or partial download is deleted, and every attempt must
+pass the digest check. Two arguments set the bound: `--max-time <seconds>` for
+one attempt (default 120) and `--attempts <n>` (default 3, five seconds apart).
+`publish` passes `--max-time 120 --attempts 3`, so a slow fetch of the roughly
+16 MB tarball cannot fail a release that a retry would save; `shadow` passes
+`--max-time 25 --attempts 1`. A digest mismatch, no good download or an unknown
+architecture exits non-zero and installs nothing. It never runs a fetched
+script: the upstream `get-helm-3` installer that `install-tools.sh` uses runs
+code from `helm/helm` `main` before any checksum is checked, and `shadow` holds
+`id-token: write`, so the GitHub token request URL and bearer are in the
+environment of every step it runs. The install stays in that job, with the
+tarball pinned, because a separate job without the permission that passed the
+binary on as an artifact would cost a fleet runner per release.
 
 **Shadow.** In every mode but `none`, the `shadow` job asks hemi whether its
 stored copy of the app's configuration matches the files. It mints a GitHub
@@ -206,28 +211,35 @@ YAML 1.2, so with `helmValues` hemi compares JSON with JSON.
 The script reads only regular files inside the repository checkout (the working
 directory). A `.github/wacd.json` or values file that is a symbolic link, sits
 behind one, lies outside the checkout (`..`, an absolute path) or is not a
-regular file is refused, and so is a file over 1 MiB. A refusal skips the whole
-comparison, mints no token, posts nothing and writes its own summary line, for
-example `the values file is a symbolic link or sits behind one; nothing was
-compared.`, `the values file lies outside the repository checkout; nothing was
-compared.` or `the values file is larger than 1 MiB; nothing was compared.`
+regular file is refused, and so is a values path containing a comma (Helm
+splits `-f` on commas). So is a file over 256 KiB, and a profile and values
+that together would make a request body over 256 KiB, which is the limit of
+hemi's shadow route. A refusal skips the whole comparison, mints no token,
+posts nothing and writes its own summary line, for example `the values file is
+a symbolic link or sits behind one; nothing was compared.`, `the values file
+lies outside the repository checkout; nothing was compared.`, `the values file
+path contains a comma; nothing was compared.` or `the values file is larger
+than 256 KiB; nothing was compared.`
 
 The script uses Helm only when `helm version --template '{{.Version}}'` prints
 exactly `v3.16.3` (any other Helm, such as one the runner image ships, is
-treated as absent). It then runs `helm template probe
-scripts/fixtures/values-probe -f <absolute values path> --show-only
-templates/values.json`, with no standard input, no cluster (`KUBECONFIG=/dev/null`),
-none of the job's token variables, and empty throwaway `HELM_PLUGINS`,
-`HELM_CACHE_HOME`, `HELM_CONFIG_HOME` and `HELM_DATA_HOME` directories. Helm's
-output is read to at most 1 MiB. The probe chart's only template is
-`{{ toJson .Values }}` and it ships no `values.yaml`, because with chart
-defaults Helm removes a key the user set to null and without them it keeps every
-null where it was written. If Helm is absent, is another version, fails, times
-out or prints more than 1 MiB or anything but a JSON object, the body carries
-no `helmValues` and the summary ends with `Helm could not read the values; hemi
-compared its own reading.`
+treated as absent). Helm is never given a path the repository chose: the bytes
+the script read and checked are written to `values.yaml` in a scratch directory
+and only that file is passed, as `helm template probe
+scripts/fixtures/values-probe -f <scratch>/values.yaml --show-only
+templates/values.json`. Helm runs with no standard input, no cluster
+(`KUBECONFIG=/dev/null`), none of the job's token variables, and empty throwaway
+`HELM_PLUGINS`, `HELM_CACHE_HOME`, `HELM_CONFIG_HOME` and `HELM_DATA_HOME`
+directories, and its output is read to at most 256 KiB. The probe chart's only
+template is `{{ toJson .Values }}` and it ships no `values.yaml`, because with
+chart defaults Helm removes a key the user set to null and without them it keeps
+every null where it was written. If Helm is absent, is another version, fails,
+times out, is skipped for lack of time, or prints more than 256 KiB or anything
+but a JSON object, or if its reading would push the request body over 256 KiB,
+the body carries no `helmValues` and the summary ends with `Helm could not read
+the values; hemi compared its own reading.`
 
-Each request has a 2-second timeout, no proxy and no redirects. The job summary
+Each socket operation of a request has a 5-second timeout, there is no proxy and there are no redirects. The job summary
 gets one line, `hemi's copy matched the files (copy <n>).` or `hemi's copy
 differs from the files in <k> places (copy <n>).` (`in 1 place` for a single
 difference) followed by one line per difference, or `hemi did not answer;
@@ -242,21 +254,28 @@ writes, even one hemi echoed back.
 
 The job is bounded at two minutes, because the run holds its concurrency group
 until every job ends and the next queued release waits for it. The summary has
-to be written inside that bound, so the worst case is added up, in seconds:
+to be written inside that bound, and a socket timeout cannot promise that: it
+applies to each operation, not to a DNS lookup, and not to a reply that trickles
+in. So the exchange has one deadline. The step that writes `GITHUB_ENV` also
+records `WACD_SHADOW_STARTED`, the time in epoch seconds, and the script ends the
+exchange 85 seconds after it (after the script's own start if the stamp is
+absent, not a number, in the future or older than the job). In seconds:
 
-| Part | Bound |
+| Part | Seconds |
 | --- | --- |
-| checkouts and `setup-python` (assumed at most) | 30 |
-| `Install helm` step, `timeout-minutes: 1` and `continue-on-error` | 60 |
-| `helm version` | 5 |
-| `helm template` | 10 |
-| four requests at 2 each (two token mints, the contract read, the comparison) | 8 |
-| total | 113 |
+| steps before the stamp (job start and two checkouts), assumed at most | 20 |
+| deadline after the stamp, shared by `setup-python`, the install step and the script | 85 |
+| reserve for writing the summary | 15 |
+| total | 120 |
 
-That leaves 7 seconds. The install script bounds its one download at 25
-seconds, so the 60 is a backstop for the step, not the usual worst case.
-`.github/scripts/test_reusable_workflows.py` adds these from the workflow and the
-script and fails if the sum passes 115.
+The install step (`--max-time 25 --attempts 1`, `timeout-minutes: 1` as a kill
+switch) only uses up part of the 85. Helm gets what is left minus 10 seconds
+kept for the exchange, each call limited to its own 5 or 10 seconds, and is
+skipped as unread when under 5 seconds are left. The token mints and the
+exchange with hemi run in a worker thread that is joined against what is left;
+when the deadline passes the summary says `hemi did not answer; nothing was
+compared.` and the script exits 0. `.github/scripts/test_reusable_workflows.py`
+checks that the three parts add up to the job's bound.
 
 ## Where releases live
 

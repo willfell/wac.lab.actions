@@ -26,23 +26,28 @@ summary says so.
 
 Only files inside the repository checkout are read: a path that is, or passes
 through, a symbolic link, that is not a regular file, or that leaves the working
-directory is refused, and so is a file over MAX_RESPONSE bytes. A refusal skips
-the whole comparison with its own summary line and posts nothing.
+directory is refused, and so is a values path containing a comma (Helm splits
+-f on commas) and a file that could not be posted whole. A refusal skips the
+whole comparison with its own summary line and posts nothing. Helm is never
+given a repository-chosen path: the bytes read and checked are written to a
+file of a fixed name in a scratch directory, and only that file is passed to -f.
 
 Time budget. The job is bounded at 120 seconds and the summary must be written
-inside it, so the worst case is added up and kept under it:
+inside it. A per-operation socket timeout bounds neither DNS, nor a reply that
+trickles in, so the whole exchange has one deadline, in seconds:
 
-    checkouts and setup-python (assumed)             30
-    install step, its timeout-minutes: 1             60
-    helm version (HELM_VERSION_TIMEOUT)               5
-    helm template (HELM_TIMEOUT)                     10
-    four requests at TIMEOUT 2 (two token mints,
-      the contract read and the comparison)           8
-    total                                           113
+    steps before the stamp (assumed at most)   20   WACD_SHADOW_STARTED is written
+    deadline after the stamp                   85   by the step that writes GITHUB_ENV
+    reserve for the summary                    15
+    total                                     120
 
-That leaves 7 seconds. install-helm.sh bounds its one download at 25 seconds,
-so the 60 for the install step is a backstop, not the usual worst case. The
-sum is checked against the workflow in .github/scripts/test_reusable_workflows.py.
+setup-python, the install step and the script all spend the same 85, so a slow
+install only leaves less for the rest. Helm gets what is left minus POST_RESERVE
+and is skipped as unread when that is under HELM_VERSION_TIMEOUT; the token
+mints and the exchange with hemi run in a worker thread that main joins against
+what is left, and when the deadline passes the summary says hemi did not
+answer. The sum is checked against the workflow in
+.github/scripts/test_reusable_workflows.py.
 
 ci-release.py mints its token the same way. It is not imported because wac.lab
 loads that file by path and its names are pinned; this script keeps its own.
@@ -71,12 +76,19 @@ URL = "http://hemi-app.hemi.svc.cluster.local:3000"
 AUDIENCE = "wacwini:hemi"
 TOKEN_SCHEME = "https"
 TOKEN_HOST_SUFFIX = ".actions.githubusercontent.com"
-TIMEOUT = 2
+TIMEOUT = 5
+JOB_SECONDS = 120
+SUMMARY_RESERVE = 15
+BEFORE_STAMP = 20
+DEADLINE_SECONDS = JOB_SECONDS - SUMMARY_RESERVE - BEFORE_STAMP
+POST_RESERVE = 10
+STAMP_ENV = "WACD_SHADOW_STARTED"
 HELM_TIMEOUT = 10
 HELM_VERSION_TIMEOUT = 5
 HELM_VERSION = "v3.16.3"
 PROBE_CHART = Path(__file__).resolve().parent / "fixtures" / "values-probe"
-MAX_RESPONSE = 1048576  # 1 MiB: also the cap on each file read and on Helm's output
+MAX_RESPONSE = 1048576
+MAX_BODY = 262144  # hemi's limit on the whole request body, src/app/api/v1/shadow/route.ts
 SILENT = "hemi did not answer; nothing was compared."
 HELM_UNREAD = "Helm could not read the values; hemi compared its own reading."
 REDACTED = "[token]"
@@ -179,8 +191,8 @@ def repo_file(path: Path, what: str) -> tuple[Path, str]:
     """The absolute path and text of a regular file inside the working directory.
 
     Refuses a path that leaves the checkout, passes through a symbolic link or
-    is not a regular file, and a file over MAX_RESPONSE bytes, so the checkout
-    cannot make this script read /proc/self/environ or post a huge body.
+    is not a regular file, and a file over MAX_BODY bytes (it could not be
+    posted), so the checkout cannot make this script read /proc/self/environ.
     """
     root = Path.cwd().resolve()
     absolute = Path(os.path.abspath(path))
@@ -201,14 +213,14 @@ def repo_file(path: Path, what: str) -> tuple[Path, str]:
     with os.fdopen(descriptor, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise Skipped(f"{what} is not a regular file; nothing was compared.")
-        data = handle.read(MAX_RESPONSE + 1)
-    if len(data) > MAX_RESPONSE:
-        raise Skipped(f"{what} is larger than {MAX_RESPONSE // 1048576} MiB; nothing was compared.")
+        data = handle.read(MAX_BODY + 1)
+    if len(data) > MAX_BODY:
+        raise Skipped(f"{what} is larger than {MAX_BODY // 1024} KiB; nothing was compared.")
     return absolute, data.decode("utf-8")
 
 
 def run_bounded(argv: list[str], env: dict[str, str], timeout: float) -> bytes | None:
-    """Standard output of a command that exits 0 in time and within MAX_RESPONSE, else None.
+    """Standard output of a command that exits 0 in time and within MAX_BODY, else None.
 
     The command gets no standard input and its error output is discarded. It is
     killed, with anything it started, on timeout or when it prints too much.
@@ -224,7 +236,7 @@ def run_bounded(argv: list[str], env: dict[str, str], timeout: float) -> bytes |
 
     def drain() -> None:
         try:
-            box.append(process.stdout.read(MAX_RESPONSE + 1))
+            box.append(process.stdout.read(MAX_BODY + 1))
         except (OSError, ValueError):
             box.append(None)
 
@@ -234,7 +246,7 @@ def run_bounded(argv: list[str], env: dict[str, str], timeout: float) -> bytes |
     try:
         reader.join(timeout)
         out = box[0] if box else None
-        if reader.is_alive() or out is None or len(out) > MAX_RESPONSE:
+        if reader.is_alive() or out is None or len(out) > MAX_BODY:
             return None
         process.wait(timeout=max(deadline - time.monotonic(), 0.1))
         return out if process.returncode == 0 else None
@@ -254,16 +266,38 @@ def run_bounded(argv: list[str], env: dict[str, str], timeout: float) -> bytes |
             pass
 
 
-def helm_values(values_file: Path) -> dict[str, Any] | None:
-    """Helm's own reading of the values file as JSON, or None when it cannot be had.
+def deadline_from(environ: Any, now: float) -> float:
+    """When the exchange must be over: DEADLINE_SECONDS after the workflow's stamp.
 
-    values_file is the absolute path repo_file returned, so a repository-chosen
-    name can neither be "-" (standard input) nor reach a getter or plugin as a URL.
-    Only the pinned Helm counts: another version (a runner image's own, when the
-    install step failed) reads YAML differently and would be posted as Helm's.
-    Helm gets a bare environment: no cluster (KUBECONFIG=/dev/null), none of the
-    job's token variables, and plugin, cache, config and data directories that
-    are empty and thrown away.
+    A stamp that is absent, not a number, in the future or older than the job
+    can be is ignored and the script's own start is used instead.
+    """
+    try:
+        started = float(environ.get(STAMP_ENV, ""))
+    except ValueError:
+        started = now
+    if not 0 <= now - started <= JOB_SECONDS:
+        started = now
+    return started + DEADLINE_SECONDS
+
+
+def body_size(body: dict[str, Any]) -> int:
+    return len(json.dumps(body).encode())
+
+
+def helm_values(values: str, deadline: float) -> dict[str, Any] | None:
+    """Helm's own reading of the values as JSON, or None when it cannot be had in time.
+
+    The values are written, as checked, to a file of a fixed name in a scratch
+    directory and only that file is passed to -f, so a repository-chosen name
+    can be neither "-" (standard input), nor a URL for a getter or plugin, nor
+    a comma-separated list of files. Only the pinned Helm counts: another
+    version (a runner image's own, when the install step failed) reads YAML
+    differently and would be posted as Helm's. Helm gets a bare environment: no
+    cluster (KUBECONFIG=/dev/null), none of the job's token variables, and
+    plugin, cache, config and data directories that are empty and thrown away.
+    Each call is limited by what is left of the deadline once POST_RESERVE is
+    kept for the exchange; with too little left Helm is skipped as unread.
     """
     helm = shutil.which("helm")
     if helm is None:
@@ -273,6 +307,8 @@ def helm_values(values_file: Path) -> dict[str, Any] | None:
     except OSError:
         return None
     with scratch:
+        if "," in scratch.name:
+            return None
         env = {"KUBECONFIG": os.devnull}
         for name in ("PATH", "HOME", "TMPDIR"):
             if name in os.environ:
@@ -281,13 +317,23 @@ def helm_values(values_file: Path) -> dict[str, Any] | None:
             directory = Path(scratch.name) / name.lower()
             directory.mkdir()
             env["HELM_" + name] = str(directory)
-        version = run_bounded([helm, "version", "--template", "{{.Version}}"], env, HELM_VERSION_TIMEOUT)
+        checked = Path(scratch.name) / "values.yaml"
+        checked.write_bytes(values.encode("utf-8"))
+        budget = deadline - time.time() - POST_RESERVE
+        if budget < HELM_VERSION_TIMEOUT:
+            return None
+        version = run_bounded(
+            [helm, "version", "--template", "{{.Version}}"], env, min(HELM_VERSION_TIMEOUT, budget)
+        )
         if version is None or version.decode("utf-8", "replace").strip() != HELM_VERSION:
             return None
+        budget = deadline - time.time() - POST_RESERVE
+        if budget < 1:
+            return None
         out = run_bounded(
-            [helm, "template", "probe", str(PROBE_CHART), "-f", str(values_file),
+            [helm, "template", "probe", str(PROBE_CHART), "-f", str(checked),
              "--show-only", "templates/values.json"],
-            env, HELM_TIMEOUT,
+            env, min(HELM_TIMEOUT, budget),
         )
     if out is None:
         return None
@@ -299,19 +345,18 @@ def helm_values(values_file: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def compare(profile_path: str) -> list[str]:
-    path = Path(profile_path)
-    _, text = repo_file(path, ".github/wacd.json")
-    profile = json.loads(text)
-    values_file, values = repo_file(path.parent.parent / profile["values_file"], "the values file")
+def exchange(profile: dict[str, Any], values: str, deadline: float) -> list[str]:
     identity = call("GET", "/api/v1/contract").get("identity")
     revision = identity.get("revision") if isinstance(identity, dict) else None
     if not isinstance(revision, int) or isinstance(revision, bool):
         raise Unanswered("hemi's contract carries no copy number")
     body: dict[str, Any] = {"revision": revision, "profile": profile, "values": values}
-    helm = helm_values(values_file)
+    helm = helm_values(values, deadline)
     if helm is not None:
         body["helmValues"] = helm
+        if body_size(body) > MAX_BODY:
+            del body["helmValues"]
+            helm = None
     answer = call("POST", "/api/v1/shadow", body)
     equal, differences = answer.get("equal"), answer.get("differences")
     if (
@@ -335,12 +380,45 @@ def compare(profile_path: str) -> list[str]:
     return lines + unread
 
 
+def compare(profile_path: str, deadline: float) -> list[str]:
+    path = Path(profile_path)
+    _, text = repo_file(path, ".github/wacd.json")
+    profile = json.loads(text)
+    configured = profile["values_file"]
+    if isinstance(configured, str) and "," in configured:
+        raise Skipped("the values file path contains a comma; nothing was compared.")
+    _, values = repo_file(path.parent.parent / configured, "the values file")
+    largest = {"revision": 2**31 - 1, "profile": profile, "values": values}
+    if body_size(largest) > MAX_BODY:
+        raise Skipped(
+            f"the profile and values together are larger than hemi accepts ({MAX_BODY // 1024} KiB); "
+            "nothing was compared."
+        )
+    box: list[tuple[bool, Any]] = []
+
+    def work() -> None:
+        try:
+            box.append((True, exchange(profile, values, deadline)))
+        except BaseException as error:
+            box.append((False, error))
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(max(deadline - time.time(), 0))
+    if worker.is_alive() or not box:
+        raise Unanswered("the time allowed ran out before hemi answered")
+    ok, value = box[0]
+    if not ok:
+        raise value
+    return value
+
+
 def main(argv: list[str]) -> int:
     MINTED.clear()
     try:
         if len(argv) != 2:
             raise Unanswered("usage: wacd-shadow.py <path to .github/wacd.json>")
-        lines = compare(argv[1])
+        lines = compare(argv[1], deadline_from(os.environ, time.time()))
     except Skipped as reason:
         print(redact(f"wacd shadow: {reason}"))
         lines = [str(reason)]

@@ -378,17 +378,18 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(runs, ['python3 "$WACD_SCRIPTS"/wacd-shadow.py .github/wacd.json'])
         self.assertTrue((root / "scripts" / "wacd-shadow.py").is_file())
         steps = job["steps"]
-        install_run = 'bash "$WACD_SCRIPTS"/install-helm.sh'
-        installs = [i for i, st in enumerate(steps) if st.get("run") == install_run]
+        shadow_install = 'bash "$WACD_SCRIPTS"/install-helm.sh --max-time 25 --attempts 1'
+        publish_install = 'bash "$WACD_SCRIPTS"/install-helm.sh --max-time 120 --attempts 3'
+        installs = [i for i, st in enumerate(steps) if st.get("run") == shadow_install]
         compare = [i for i, st in enumerate(steps) if "wacd-shadow.py" in st.get("run", "")]
         self.assertEqual(len(installs), 1)
         install = steps[installs[0]]
         self.assertLess(installs[0], compare[0], "helm is on PATH before the comparison reads it")
         self.assertNotIn("env", install, "the version and digests live only in install-helm.sh")
         self.assertEqual(
-            [st for st in jobs["publish"]["steps"] if st.get("run") == install_run],
-            [{"name": "Install helm", "shell": "bash", "run": install_run}],
-            "publish installs Helm the same pinned way",
+            [st for st in jobs["publish"]["steps"] if "install-helm.sh" in st.get("run", "")],
+            [{"name": "Install helm", "shell": "bash", "run": publish_install}],
+            "publish keeps a generous download bound, retries, and no tighter step timeout than before",
         )
         for name, other in jobs.items():
             for st in other["steps"]:
@@ -401,21 +402,20 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(shadow_py.HELM_VERSION, "v3.16.3", "the script accepts exactly the version installed")
         self.assertEqual(install.get("timeout-minutes"), 1, "the smallest bound GitHub accepts")
         self.assertIs(install.get("continue-on-error"), True, "a failed download must not skip the comparison")
-        setup_and_checkouts = 30
-        four_requests = 4 * shadow_py.TIMEOUT
-        worst_case = (
-            setup_and_checkouts
-            + install["timeout-minutes"] * 60
-            + shadow_py.HELM_VERSION_TIMEOUT
-            + shadow_py.HELM_TIMEOUT
-            + four_requests
+        stamp = [st for st in steps if "GITHUB_ENV" in st.get("run", "")]
+        self.assertEqual(len(stamp), 1)
+        self.assertIn(
+            f'echo "{shadow_py.STAMP_ENV}=$(date +%s)" >> "$GITHUB_ENV"', stamp[0]["run"],
+            "the deadline is counted from this stamp",
         )
-        self.assertLessEqual(
-            worst_case,
-            job["timeout-minutes"] * 60 - 5,
-            "setup, the install bound, both Helm calls and four requests must finish with a margin "
-            "inside the job's bound, so the summary is written (budget in docs/reference/wac-cd.md)",
+        self.assertLess(steps.index(stamp[0]), compare[0])
+        self.assertEqual(
+            shadow_py.BEFORE_STAMP + shadow_py.DEADLINE_SECONDS + shadow_py.SUMMARY_RESERVE,
+            job["timeout-minutes"] * 60,
+            "steps before the stamp, the deadline and the reserve for writing the summary add up to the job's bound "
+            "(budget in docs/reference/wac-cd.md)",
         )
+        self.assertGreaterEqual(shadow_py.SUMMARY_RESERVE, 15)
         self.assertEqual(
             sorted((root / "scripts" / "fixtures" / "values-probe").rglob("*")),
             [

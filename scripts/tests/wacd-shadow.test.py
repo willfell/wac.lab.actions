@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -88,6 +89,8 @@ YAML_11_AS_HELM_READS_IT = {
     "true": "letter",
 }
 CLOSE = object()
+HANG = object()
+DRIP = object()
 
 
 def contract(revision):
@@ -102,6 +105,7 @@ class Stub:
         self.seen = []
         self.connections = 0
         self.minted = 0
+        self.release = threading.Event()
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -120,6 +124,22 @@ class Stub:
                 if reply is CLOSE:
                     self.close_connection = True
                     self.connection.shutdown(2)
+                    return
+                if reply is HANG:
+                    outer.release.wait(30)
+                    return
+                if reply is DRIP:
+                    self.send_response(200)
+                    self.send_header("Content-Length", "1000000")
+                    self.end_headers()
+                    for _ in range(30):
+                        if outer.release.wait(1):
+                            return
+                        try:
+                            self.wfile.write(b" ")
+                            self.wfile.flush()
+                        except OSError:
+                            return
                     return
                 status, value = reply
                 raw = json.dumps(value).encode()
@@ -151,6 +171,7 @@ class Stub:
         return [s for s in self.seen if s[1] != "/token"]
 
     def close(self):
+        self.release.set()
         self.server.shutdown()
         self.server.server_close()
 
@@ -170,7 +191,7 @@ def app_repo(tmp, values=VALUES, values_file="deploy/values.yaml"):
 class Harness:
     def run_against(
         self, stub, values=VALUES, path=None, helm_timeout=None, helm_version_timeout=None,
-        values_file="deploy/values.yaml", setup=None,
+        values_file="deploy/values.yaml", setup=None, extra_env=None, deadline_seconds=None,
     ):
         """Run main() against the stub from the app checkout; return (code, stdout, stderr, summary).
 
@@ -190,12 +211,14 @@ class Harness:
             }
             if path is not None:
                 env["PATH"] = str(path)
+            env.update(extra_env or {})
             out, err = io.StringIO(), io.StringIO()
             with (
                 patch.dict(os.environ, env),
                 patch.object(shadow, "URL", stub.url),
                 patch.object(shadow, "TOKEN_SCHEME", "http"),
                 patch.object(shadow, "TOKEN_HOST_SUFFIX", "127.0.0.1"),
+                patch.object(shadow, "DEADLINE_SECONDS", deadline_seconds or shadow.DEADLINE_SECONDS),
                 patch.object(shadow, "HELM_TIMEOUT", helm_timeout or shadow.HELM_TIMEOUT),
                 patch.object(
                     shadow, "HELM_VERSION_TIMEOUT", helm_version_timeout or shadow.HELM_VERSION_TIMEOUT
@@ -427,7 +450,7 @@ class HelmStandInTests(Harness, unittest.TestCase):
         cases = {
             "version never finishes": (f'if [ "$1" = version ]; then exec {sleep} 30; fi\n', False),
             "output over the cap": (
-                f"echo '{{\"a\": 1}}'\n{head} -c {shadow.MAX_RESPONSE} /dev/zero | {tr} '\\0' ' '\n",
+                f"echo '{{\"a\": 1}}'\n{head} -c {shadow.MAX_BODY} /dev/zero | {tr} '\\0' ' '\n",
                 True,
             ),
         }
@@ -445,30 +468,69 @@ class HelmStandInTests(Harness, unittest.TestCase):
                     stub.close()
                 self.assert_posts_files_alone(stub, result)
 
-    def test_helm_is_given_the_absolute_values_path_whatever_the_repository_names_it(self):
+    def test_helm_is_given_only_a_scratch_copy_of_the_values_whatever_the_repository_names_them(self):
         for values_file in ("-", "https:/example.invalid/values.yaml", "deploy/values.yaml"):
             with self.subTest(values_file):
                 stub = Stub((200, contract(3)))
                 try:
                     with tempfile.TemporaryDirectory() as tmp:
-                        record = Path(tmp) / "args"
+                        record, copy = Path(tmp) / "args", Path(tmp) / "copy"
                         script = (
                             f"printf '%s\\n' \"$@\" > '{record}'\n"
                             f"[ /dev/stdin -ef /dev/null ] && echo devnull >> '{record}'\n"
+                            "p=\n"
+                            f'for a in "$@"; do if [ "$p" = -f ]; then {shutil.which("cp")} "$a" \'{copy}\'; fi; p="$a"; done\n'
                             "echo '{\"a\": 1}'\n"
                         )
                         code, _, _, _ = self.run_against(
                             stub, path=self.bin_dir(tmp, script), values_file=values_file
                         )
                         args = record.read_text().splitlines()
+                        copied = copy.read_text()
                 finally:
                     stub.close()
                 self.assertEqual(code, 0)
                 self.assertEqual(self.posted(stub)["helmValues"], {"a": 1})
                 given = args[args.index("-f") + 1]
-                self.assertTrue(os.path.isabs(given), given)
-                self.assertTrue(given.endswith(os.sep + os.path.join("app", values_file)), given)
+                self.assertEqual(os.path.basename(given), "values.yaml")
+                self.assertNotIn(",", given)
+                self.assertNotIn(os.sep + "app" + os.sep, given, "no path of the repository's choosing")
+                self.assertEqual(copied, VALUES, "Helm reads exactly the text that was checked and posted")
                 self.assertEqual(args[-1], "devnull", "Helm reads no standard input")
+
+    def test_a_helm_reading_that_would_overfill_the_body_is_left_out(self):
+        script = (
+            f"printf '{{\"a\": \"'\n{shutil.which('head')} -c 150000 /dev/zero | "
+            f"{shutil.which('tr')} '\\0' x\nprintf '\"}}'\n"
+        )
+        values = "#" * 150000
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                code, _, _, summary = self.run_against(
+                    stub, values=values, path=self.bin_dir(tmp, script)
+                )
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, f"hemi's copy matched the files (copy 3).\n{HELM_UNREAD}\n"))
+        self.assertEqual(self.posted(stub), {"revision": 3, "profile": PROFILE, "values": values})
+
+    def test_helm_is_skipped_when_too_little_of_the_deadline_is_left(self):
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ran = Path(tmp) / "ran"
+                script = f"echo ran > '{ran}'\necho '{{\"a\": 1}}'\n"
+                result = self.run_against(
+                    stub,
+                    path=self.bin_dir(tmp, script),
+                    deadline_seconds=shadow.POST_RESERVE + shadow.HELM_VERSION_TIMEOUT - 1,
+                )
+                invoked = ran.exists()
+        finally:
+            stub.close()
+        self.assertFalse(invoked)
+        self.assert_posts_files_alone(stub, result)
 
     def test_a_helm_that_fails_or_answers_badly_posts_the_files_alone(self):
         cases = {
@@ -578,22 +640,101 @@ class RefusalTests(Harness, unittest.TestCase):
             with self.subTest(values_file):
                 self.refused(outside, values_file=values_file, values=None)
 
-    def test_an_oversized_values_file_is_refused_and_one_at_the_cap_is_posted(self):
+    def test_a_values_path_with_a_comma_is_refused(self):
         self.refused(
-            "the values file is larger than 1 MiB; nothing was compared.",
-            values="#" * (shadow.MAX_RESPONSE + 1),
+            "the values file path contains a comma; nothing was compared.",
+            values_file="deploy/x,outside/y.yaml",
         )
-        at_cap = "#" * shadow.MAX_RESPONSE
+
+    def test_a_file_over_what_hemi_accepts_is_refused_whole_or_together(self):
+        self.refused(
+            f"the values file is larger than {shadow.MAX_BODY // 1024} KiB; nothing was compared.",
+            values="#" * (shadow.MAX_BODY + 1),
+        )
+        overhead = len(
+            json.dumps({"revision": 2**31 - 1, "profile": PROFILE, "values": ""}).encode()
+        )
+        self.refused(
+            f"the profile and values together are larger than hemi accepts ({shadow.MAX_BODY // 1024} KiB); "
+            "nothing was compared.",
+            values="#" * (shadow.MAX_BODY - overhead + 1),
+        )
+        fits = "#" * (shadow.MAX_BODY - overhead)
         stub = Stub((200, contract(3)))
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 empty = Path(tmp) / "bin"
                 empty.mkdir()
-                code, _, _, summary = self.run_against(stub, values=at_cap, path=empty)
+                code, _, _, summary = self.run_against(stub, values=fits, path=empty)
         finally:
             stub.close()
         self.assertEqual((code, summary), (0, f"hemi's copy matched the files (copy 3).\n{HELM_UNREAD}\n"))
-        self.assertEqual(self.posted(stub)["values"], at_cap)
+        self.assertEqual(self.posted(stub)["values"], fits)
+        self.assertLessEqual(len(json.dumps(self.posted(stub)).encode()), shadow.MAX_BODY)
+
+
+class DeadlineTests(Harness, unittest.TestCase):
+    """The summary is written by the deadline however hemi or GitHub misbehave."""
+
+    def run_late(self, stub, seconds=2, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "bin"
+            empty.mkdir()
+            started = time.monotonic()
+            result = self.run_against(stub, path=empty, deadline_seconds=seconds, **kwargs)
+        return result, time.monotonic() - started
+
+    def test_a_reply_that_trickles_in_ends_at_the_deadline_with_the_summary_written(self):
+        stub = Stub(DRIP)
+        try:
+            (code, _, _, summary), elapsed = self.run_late(stub)
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, SILENT))
+        self.assertGreaterEqual(elapsed, 1.5, "it waited for the deadline, not for a socket timeout")
+        self.assertLess(elapsed, shadow.TIMEOUT, "a one-byte-a-second reply never trips a socket timeout")
+
+    def test_a_server_that_never_answers_ends_at_the_deadline_with_the_summary_written(self):
+        stub = Stub(HANG)
+        try:
+            (code, _, _, summary), elapsed = self.run_late(stub)
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, SILENT))
+        self.assertLess(elapsed, shadow.TIMEOUT)
+
+    def test_the_workflow_stamp_sets_the_deadline(self):
+        stub = Stub(HANG)
+        stamp = str(time.time() - (shadow.DEADLINE_SECONDS - 2))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                empty = Path(tmp) / "bin"
+                empty.mkdir()
+                started = time.monotonic()
+                code, _, _, summary = self.run_against(
+                    stub, path=empty, extra_env={shadow.STAMP_ENV: stamp}
+                )
+                elapsed = time.monotonic() - started
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, SILENT))
+        self.assertLess(elapsed, shadow.TIMEOUT)
+
+    def test_the_deadline_comes_from_the_stamp_or_else_from_the_script_start(self):
+        now = 1_000_000.0
+        d = shadow.DEADLINE_SECONDS
+        cases = {
+            "a recent stamp": ({shadow.STAMP_ENV: str(now - 10)}, now - 10 + d),
+            "a stamp just written": ({shadow.STAMP_ENV: str(now)}, now + d),
+            "absent": ({}, now + d),
+            "not a number": ({shadow.STAMP_ENV: "soon"}, now + d),
+            "not finite": ({shadow.STAMP_ENV: "nan"}, now + d),
+            "in the future": ({shadow.STAMP_ENV: str(now + 50)}, now + d),
+            "older than the job can be": ({shadow.STAMP_ENV: str(now - shadow.JOB_SECONDS - 1)}, now + d),
+        }
+        for label, (environ, expected) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(shadow.deadline_from(environ, now), expected)
 
 
 class CommandLineTests(unittest.TestCase):

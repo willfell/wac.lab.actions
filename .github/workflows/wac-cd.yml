@@ -252,6 +252,7 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+          echo "WACD_SHADOW_STARTED=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -259,7 +260,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 1
         shell: bash
-        run: bash "$WACD_SCRIPTS"/install-helm.sh
+        run: bash "$WACD_SCRIPTS"/install-helm.sh --max-time 25 --attempts 1
       - name: Compare hemi's copy with the files
         shell: bash
         run: python3 "$WACD_SCRIPTS"/wacd-shadow.py .github/wacd.json
@@ -405,7 +406,7 @@ jobs:
           python-version: "3.12"
       - name: Install helm
         shell: bash
-        run: bash "$WACD_SCRIPTS"/install-helm.sh
+        run: bash "$WACD_SCRIPTS"/install-helm.sh --max-time 120 --attempts 3
       - name: Pull the wac-app chart
         id: pull
         shell: bash
