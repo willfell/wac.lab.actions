@@ -520,6 +520,87 @@ class DowngradeTests(unittest.TestCase):
             self.assertFalse(Path(receipt).exists())
 
 
+class SettingsModeTests(unittest.TestCase):
+    """A settings release goes through the same gateway proof as a release, expecting its own source."""
+
+    def test_a_newer_running_version_refuses_it_as_it_refuses_a_release(self):
+        script, error = DowngradeTests.run_release(self, "settings", (200, running("0.2.0")), (200, released()))
+        self.assertIsInstance(error, ReleaseError)
+        self.assertIn("dispatch a rollback", str(error))
+        self.assertEqual(script.bodies, [wacd.STATUS_BODY()])
+        script, result = DowngradeTests.run_release(self, "settings", (200, running("0.0.9")), (200, released()))
+        self.assertEqual(result, released())
+
+    def test_the_receipt_records_settings_mode_and_the_running_code_as_expected(self):
+        plan = {"mode": "settings", "version": VERSION, "tag": "v" + VERSION, "expected_sha": "c" * 40}
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt = str(Path(tmp) / "receipt.json")
+            with patch.object(wacd, "trust_context", lambda: None), patch.object(
+                wacd, "transport", Script((200, released()))
+            ):
+                code, _, err = CliTests.main(self, *CliTests.release_argv(
+                    self, receipt, mode="settings", expected_sha="c" * 40))
+            self.assertEqual((code, err), (0, ""), err)
+            self.assertEqual(json.loads(Path(receipt).read_text())["wac_cd"], plan)
+
+
+class RunningTests(unittest.TestCase):
+    """plan reads the version the gateway says is running, the one a settings release re-releases."""
+
+    def run_cli(self, *responses, timeout="240"):
+        script = Script(*responses)
+        stack, clock = fake_clock()
+        with tempfile.TemporaryDirectory() as tmp, stack:
+            summary = Path(tmp) / "summary"
+            with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", script), \
+                    patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                code, out, err = CliTests.main(self, "running", "--wait-timeout", timeout)
+            written = summary.read_text() if summary.exists() else ""
+        return script, clock, (code, out, err, written)
+
+    def test_the_running_version_is_printed_for_the_step_output(self):
+        script, _, (code, out, err, _) = self.run_cli((200, running("1.4.2")))
+        self.assertEqual((code, out, err), (0, "running=1.4.2\n", ""))
+        self.assertEqual(script.bodies, [wacd.STATUS_BODY()], "one status read; nothing is released")
+
+    def test_unavailable_is_retried_within_the_wait(self):
+        script, clock, (code, out, err, _) = self.run_cli((503, {}), (503, {}), (200, running("1.4.2")))
+        self.assertEqual((code, out), (0, "running=1.4.2\n"), err)
+        self.assertEqual(len(script.bodies), 3)
+        script, clock, (code, out, err, _) = self.run_cli((503, {}), timeout="20")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("deadline", err)
+        self.assertLessEqual(clock.now - 1000.0, 21)
+
+    def test_a_coded_refusal_names_its_sentence_in_the_summary(self):
+        _, _, (code, out, err, summary) = self.run_cli((403, {"reason": "fleet_copy_missing"}))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(wacd.REFUSALS["fleet_copy_missing"], err)
+        self.assertIn(wacd.REFUSALS["fleet_copy_missing"], summary)
+        _, _, (code, _, err, _) = self.run_cli((500, {}))
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 500", err)
+
+    def test_a_running_version_that_is_not_x_y_z_is_no_version_to_release_settings_on(self):
+        for value in ("bootstrap", "v1.4.2", "", None, 7):
+            with self.subTest(running=value):
+                status = evidence()
+                status["version"] = value
+                _, _, (code, out, err, _) = self.run_cli((200, status))
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn("is not a released X.Y.Z", err)
+                self.assertEqual(len(err.strip().splitlines()), 1)
+
+    def test_the_token_is_never_printed(self):
+        def explode(body, trust, timeout):
+            raise RuntimeError(f"Authorization: Bearer {TOKEN}")
+
+        with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", explode):
+            code, out, err = CliTests.main(self, "running", "--wait-timeout", "30")
+        self.assertEqual(code, 1)
+        self.assertNotIn(TOKEN, out + err)
+
+
 class ServedTests(unittest.TestCase):
     def serve(self, *responses, sha=SOURCE, expect_db=True, timeout=1):
         health = Health(*responses)

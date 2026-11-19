@@ -17,6 +17,13 @@ sentence is the error line and a job summary line. The body is never printed.
 wacd-contract.py uses the same post() and map for the gateway's contract
 operation.
 
+`running --wait-timeout N` is plan's one gateway read in `settings` mode: one
+`status` request (503 retried within N seconds, a refusal mapped as for a
+release) and `running=<X.Y.Z>`, the version the app runs now, which is what a
+settings release re-releases, a rolled-back version included. A running
+version that is not a strict X.Y.Z (the bootstrap tag before the first
+release) fails, since there is no released code to put the settings on.
+
 The gateway contract (Plan 2, "Chart releases (wac-cd)") is isolated in
 RELEASE_BODY, STATUS_BODY and ready(). After the proof, github-release creates
 the GitHub Release for the tag with the job's GITHUB_TOKEN when none exists
@@ -56,7 +63,7 @@ MAX_WAIT = 3600
 GITHUB_TIMEOUT = 30
 TAG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-RELEASED_MODES = ("release", "resume", "rollback")
+RELEASED_MODES = ("release", "resume", "rollback", "settings")
 REASON_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 # The gateway's closed list of refusal codes, each with the sentence a run
@@ -372,6 +379,31 @@ def proved(version, images, wait_timeout, request=None, mode=None):
     raise ReleaseError("release evidence deadline exceeded")
 
 
+def running_version(wait_timeout, request=None):
+    """The X.Y.Z the gateway's status says is running, retrying 503 within wait_timeout."""
+    if request is None:
+        request = transport
+        trust = trust_context()
+    else:
+        trust = None
+    deadline = time.monotonic() + wait_timeout
+    while time.monotonic() < deadline:
+        code, value = request(STATUS_BODY(), trust, max(1, deadline - time.monotonic()))
+        if code == 200:
+            found = value.get("version")
+            if semver(found) is None:
+                shown = found[:40] if isinstance(found, str) else type(found).__name__
+                raise ReleaseError(
+                    f"the gateway reports {shown!r} running, which is not a released X.Y.Z, so there "
+                    "is no running code to release settings on"
+                )
+            return found
+        if code != 503:
+            raise rejected("status request", code, value)
+        time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
+    raise ReleaseError("status deadline exceeded; the gateway stayed unavailable")
+
+
 def probe(url, timeout):
     opener = urllib.request.build_opener(
         ci.NoRedirect(), urllib.request.ProxyHandler({})
@@ -529,6 +561,8 @@ def build_parser():
     health.add_argument("--sha", required=True)
     health.add_argument("--expect-db", required=True, choices=["true", "false"])
     health.add_argument("--wait-timeout", required=True)
+    running = commands.add_parser("running")
+    running.add_argument("--wait-timeout", required=True)
     gh = commands.add_parser("github-release")
     gh.add_argument("--tag", required=True)
     gh.add_argument("--sha", required=True)
@@ -539,6 +573,8 @@ def run(args):
     if args.command == "github-release":
         return github_release(args.tag, args.sha, os.environ)
     timeout = wait_bound(args.wait_timeout)
+    if args.command == "running":
+        return "running=" + running_version(timeout)
     if args.command == "health":
         if not SHA_PATTERN.fullmatch(args.sha):
             raise ReleaseError("--sha must be 40 lowercase hex characters")

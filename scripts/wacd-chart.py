@@ -426,6 +426,21 @@ def chart_images(registry, app, version):
     return parse_image_refs(text)
 
 
+def chart_copy_revision(registry, app, version):
+    """deploy/<app>:<version>'s copy revision: "absent" (no chart), "none" (no copy) or the decimal.
+
+    wac-cd's settings plan uses it to tell whether a version already ships the
+    revision it was dispatched for.
+    """
+    config = chart_config(registry, app, version)
+    if config is None:
+        return "absent"
+    text = chart_annotations(config).get(CONTRACT_REVISION_ANNOTATION)
+    if text is None:
+        return "none"
+    return revision_annotation(revision_from_annotation(text))
+
+
 def runnable_manifest(registry, name, manifest):
     """Follow an image index to its first real platform manifest."""
     for entry in manifest.get("manifests") or []:
@@ -525,7 +540,7 @@ def build_parser():
     package.add_argument("--ci", action="store_true")
     package.add_argument("--values-json")
     package.add_argument("--annotation", action="append", default=[])
-    for command in ("chart-revision", "chart-images", "chart-state"):
+    for command in ("chart-revision", "chart-images", "chart-state", "chart-copy-revision"):
         one = sub.add_parser(command)
         one.add_argument("--registry", required=True)
         one.add_argument("--app", required=True)
@@ -574,6 +589,8 @@ def run(args):
         if revision is None:
             raise ChartError(f"{DEPLOY_REPO}/{args.app}:{args.version} is not in the registry")
         return f"revision={revision}"
+    if args.command == "chart-copy-revision":
+        return "copy_revision=" + chart_copy_revision(args.registry, args.app, args.version)
     if args.command == "chart-images":
         images = chart_images(args.registry, args.app, args.version)
         if images is None:

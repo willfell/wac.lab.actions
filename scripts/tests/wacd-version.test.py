@@ -449,6 +449,123 @@ class RepoTest(unittest.TestCase):
                 version.plan(Path(empty), "v", "commits", None)
 
 
+class SettingsTest(unittest.TestCase):
+    """A settings release is the next patch above main's newest tag, tagged on the running code."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        git(self.repo, "-c", "init.defaultBranch=main", "init", "-q")
+        self.old = self.commit("feat: first")
+        git(self.repo, "tag", "v1.3.9")
+        self.code = self.commit("fix: second")
+        git(self.repo, "tag", "v1.4.2")
+
+    def commit(self, message):
+        git(self.repo, "commit", "--allow-empty", "-q", "-m", message)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def settings(self, commit, running, prefix="v"):
+        return version.plan_settings(self.repo, prefix, commit, running, main_ref="main")
+
+    def refusal(self, *args, **kw):
+        with self.assertRaises(version.VersionError) as ctx:
+            self.settings(*args, **kw)
+        return str(ctx.exception)
+
+    def test_the_next_patch_above_the_highest_tag_merged_into_main(self):
+        git(self.repo, "checkout", "-q", "-b", "stray")
+        self.commit("feat: never merged")
+        git(self.repo, "tag", "v9.0.0")
+        git(self.repo, "checkout", "-q", "main")
+        self.commit("feat: merged, not released yet")
+        self.assertEqual(
+            self.settings(self.code, "1.4.2"),
+            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": ""},
+        )
+
+    def test_after_a_rollback_it_still_releases_above_the_newest(self):
+        self.assertEqual(
+            self.settings(self.old, "1.3.9"),
+            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": ""},
+        )
+
+    def test_a_version_already_claimed_on_the_running_code_is_named(self):
+        git(self.repo, "tag", "v1.4.3", self.code)
+        self.assertEqual(
+            self.settings(self.code, "1.4.2"),
+            {"mode": "settings", "version": "1.4.4", "tag": "v1.4.4", "claimed": "1.4.3"},
+        )
+        self.assertEqual(self.settings(self.code, "1.4.3")["claimed"], "", "a running version is not a pending claim")
+        git(self.repo, "tag", "v1.4.0", self.old)
+        self.assertEqual(self.settings(self.old, "1.3.9")["claimed"], "", "only main's newest tag can be a claim")
+
+    def test_other_tag_families_do_not_count(self):
+        git(self.repo, "tag", "ui-v5.0.0")
+        self.assertEqual(self.settings(self.code, "1.4.2")["version"], "1.4.3")
+        git(self.repo, "tag", "app-v0.2.0", self.code)
+        self.assertEqual(self.settings(self.code, "0.2.0", prefix="app-v")["tag"], "app-v0.2.1")
+
+    def test_refusals(self):
+        git(self.repo, "checkout", "-q", "-b", "side", self.old)
+        side = self.commit("fix: off main")
+        git(self.repo, "checkout", "-q", "main")
+        self.assertIn("is not on main", self.refusal(side, "1.4.2"))
+        self.assertIn("is not a commit in this checkout", self.refusal("f" * 40, "1.4.2"))
+        self.assertIn("40 lowercase hex", self.refusal("abc", "1.4.2"))
+        for running in ("v1.4.2", "1.4", "bootstrap", ""):
+            with self.subTest(running=running):
+                self.assertIn("not a released X.Y.Z", self.refusal(self.code, running))
+        self.assertIn("no zz-v", self.refusal(self.code, "1.4.2", prefix="zz-v"))
+        git(self.repo, "tag", "v1.4.3", side)
+        self.assertEqual(
+            self.refusal(self.code, "1.4.2"), f"tag v1.4.3 already exists on {side}, not on {self.code}"
+        )
+        message = self.refusal(self.code, "1.4.2", prefix="v\n")
+        self.assertIn("line break", message)
+
+    def test_a_missing_main_ref_or_a_shallow_checkout_fails(self):
+        with self.assertRaises(version.VersionError) as ctx:
+            version.plan_settings(self.repo, "v", self.code, "1.4.2", main_ref="origin/main")
+        self.assertIn("origin/main is not in the checkout", str(ctx.exception))
+        clone = Path(self._tmp.name) / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{self.repo}", str(clone)], check=True)
+        with self.assertRaises(version.VersionError) as ctx:
+            version.plan_settings(clone, "v", self.code, "1.4.2", main_ref="origin/main")
+        self.assertIn("shallow", str(ctx.exception))
+
+    def test_a_settings_tag_on_the_head_leaves_it_with_two_tags_that_resume_the_newer(self):
+        git(self.repo, "tag", self.settings(self.code, "1.4.2")["tag"], self.code)
+        self.assertEqual(
+            version.plan(self.repo, "v", "commits", None, main_ref="main"),
+            {"mode": "resume", "version": "1.4.3", "tag": "v1.4.3"},
+            "a re-run of the code release on that commit re-releases the current settings",
+        )
+        self.commit("fix: later")
+        self.assertEqual(
+            version.plan(self.repo, "v", "commits", None, main_ref="main"),
+            {"mode": "release", "version": "1.4.4", "tag": "v1.4.4"},
+            "the next merge releases above the settings version",
+        )
+        git(self.repo, "tag", "v1.4.4")
+        git(self.repo, "checkout", "-q", self.code)
+        with self.assertRaises(version.ReplayRefused) as ctx:
+            version.plan(self.repo, "v", "commits", None, main_ref="main")
+        self.assertIn("This run is for v1.4.3, but v1.4.4 is already published.", str(ctx.exception))
+
+    def test_a_settings_tag_after_a_rollback_sits_on_old_code_and_the_next_merge_goes_above_it(self):
+        git(self.repo, "tag", self.settings(self.old, "1.3.9")["tag"], self.old)
+        self.commit("fix: next")
+        self.assertEqual(
+            version.plan(self.repo, "v", "commits", None, main_ref="main"),
+            {"mode": "release", "version": "1.4.4", "tag": "v1.4.4"},
+        )
+        git(self.repo, "checkout", "-q", self.old)
+        with self.assertRaises(version.ReplayRefused):
+            version.plan(self.repo, "v", "commits", None, main_ref="main")
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -537,6 +654,28 @@ class CliTest(unittest.TestCase):
             with self.subTest(args=args):
                 result = self.cli("--prefix", "v", *args)
                 self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_cli_settings_mode_prints_the_version_and_any_claim(self):
+        head = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "tag", "v1.3.9")
+        git(self.repo, "tag", "v1.4.2")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        result = self.cli("--mode", "settings", "--prefix", "v", "--commit", head, "--running", "1.4.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(), ["mode=settings", "version=1.4.3", "tag=v1.4.3", "claimed="]
+        )
+        for args in (
+            ["--commit", head, "--running", "v1.4.2"],
+            ["--commit", head],
+            ["--running", "1.4.2"],
+        ):
+            with self.subTest(args=args):
+                result = self.cli("--mode", "settings", "--prefix", "v", *args)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertTrue(result.stderr.startswith("wacd version:"), result.stderr)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
 
     def test_cli_rejects_bad_deploy_value(self):
         result = self.cli("--prefix", "v", "--deploy", "yes")

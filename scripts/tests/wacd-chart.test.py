@@ -94,8 +94,8 @@ class Registry:
         ).encode()
         self.routes[f"/v2/{repo}/manifests/{ref}"] = (status, OCI_MANIFEST, manifest)
 
-    def put_chart(self, app, version, revision=SHA, images="", config_type=HELM_CONFIG):
-        annotations = {}
+    def put_chart(self, app, version, revision=SHA, images="", config_type=HELM_CONFIG, extra=None):
+        annotations = dict(extra or {})
         if revision is not None:
             annotations["org.opencontainers.image.revision"] = revision
         if images:
@@ -232,6 +232,19 @@ class RegistryReadTests(RegistryCase):
         line = images.stdout.rstrip("\n")
         self.assertTrue(line.startswith("images=") and "\n" not in line)
         self.assertEqual(json.loads(line[len("images="):]), IMAGES)
+
+    def test_chart_copy_revision_tells_absent_from_no_copy_from_a_revision(self):
+        base = ("chart-copy-revision", "--registry", self.address, "--app", "travel")
+        self.registry.put_chart("travel", "0.1.0")
+        self.registry.put_chart("travel", "0.2.0", extra={"wacwini.com/revision": "7"})
+        self.registry.put_chart("travel", "0.3.0", extra={"wacwini.com/revision": "07"})
+        for version, expected in (("0.0.1", "absent"), ("0.1.0", "none"), ("0.2.0", "7")):
+            with self.subTest(version=version):
+                result = run_cli(*base, "--version", version)
+                self.assertEqual((result.returncode, result.stdout), (0, f"copy_revision={expected}\n"), result.stderr)
+        bad = run_cli(*base, "--version", "0.3.0")
+        self.assertEqual((bad.returncode, bad.stdout), (1, ""))
+        self.assertTrue(bad.stderr.startswith("wacd chart: wacwini.com/revision must be a decimal"), bad.stderr)
 
     def test_wrong_config_media_type_is_an_error(self):
         self.registry.put_chart("travel", "0.1.0", config_type="application/json")

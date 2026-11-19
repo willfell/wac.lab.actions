@@ -18,6 +18,16 @@ A deploying run fails when origin/main carries a tag with the prefix that HEAD
 does not contain, or when HEAD's highest tag is lower than the highest tag with
 the prefix on origin/main: what is running changes by a rollback or a new
 release, never by replaying an old build.
+
+`--mode settings --commit C --running V` plans a settings-only release: the
+running version V's images, built from C, released again under a new version
+with the copy's current settings. The new version is the next patch above the
+highest tag with the prefix merged into origin/main, never above V itself, so
+after a rollback it still goes above every published version; its tag goes on
+C, which must be on main. It prints mode=settings, version=, tag= and
+claimed=: claimed names main's newest version when that tag already sits on C
+above V (an earlier settings release of this code that never went live), so
+wac-cd can take it again rather than spend a second version on one revision.
 """
 
 import argparse
@@ -28,6 +38,7 @@ from pathlib import Path
 
 NUM = r"(0|[1-9][0-9]*)"
 SEMVER = re.compile(rf"{NUM}\.{NUM}\.{NUM}")
+SHA40 = re.compile(r"[0-9a-f]{40}")
 BREAKING_HEADER = re.compile(r"\w+(\([^)]*\))?!:")
 FEAT_HEADER = re.compile(r"feat(\([^)]*\))?:")
 BREAKING_FOOTER = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
@@ -210,6 +221,51 @@ def plan(
     return finish({"mode": "release", "version": new, "tag": tag}, deploy)
 
 
+def plan_settings(repo, prefix, commit, running, main_ref=MAIN_REF):
+    """The version and tag of a settings release of running (built from commit)."""
+    if any(ch in prefix for ch in "\r\n\0"):
+        raise VersionError("tag prefix contains a line break")
+    if not SHA40.fullmatch(commit or ""):
+        raise VersionError("--commit must be 40 lowercase hex characters")
+    match = SEMVER.fullmatch(running or "")
+    if not match:
+        raise VersionError(
+            f"the running version {str(running)[:40]!r} is not a released X.Y.Z, so there is no "
+            "running code to release settings on"
+        )
+    current = tuple(int(part) for part in match.groups())
+    repo = Path(repo)
+    if git(repo, "rev-parse", "--is-shallow-repository").strip() == "true":
+        raise VersionError(
+            "the checkout is shallow, so tags and history are incomplete; fetch with full depth"
+        )
+    if commit_of_ref(repo, main_ref) is None:
+        raise VersionError(
+            f"{main_ref} is not in the checkout, so the newest published version cannot be judged; fetch with full depth"
+        )
+    if commit_of_ref(repo, commit) != commit:
+        raise VersionError(f"{commit} is not a commit in this checkout")
+    ancestor = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, main_ref],
+        capture_output=True,
+    )
+    if ancestor.returncode != 0:
+        raise VersionError(f"{running} was built from {commit}, which is not on main")
+    newest = newest_tag(tag_lines(repo, "--merged", main_ref), prefix)
+    if newest is None:
+        raise VersionError(f"main carries no {prefix}X.Y.Z tag, so there is no release to go above")
+    (major, minor, patch), newest_name = newest
+    claimed = ""
+    if commit_of(repo, newest_name) == commit and newest[0] > current:
+        claimed = f"{major}.{minor}.{patch}"
+    new = f"{major}.{minor}.{patch + 1}"
+    tag = f"{prefix}{new}"
+    existing = commit_of(repo, tag)
+    if existing is not None and existing != commit:
+        raise VersionError(f"tag {tag} already exists on {existing}, not on {commit}")
+    return {"mode": "settings", "version": new, "tag": tag, "claimed": claimed}
+
+
 def finish(result, deploy):
     if deploy:
         return result
@@ -225,7 +281,19 @@ def main(argv):
     parser.add_argument("--deploy", choices=("true", "false"), default="true")
     parser.add_argument("--published", choices=PUBLISHED, default="unknown")
     parser.add_argument("--main-ref", default=MAIN_REF)
+    parser.add_argument("--mode", choices=("code", "settings"), default="code")
+    parser.add_argument("--commit", default="")
+    parser.add_argument("--running", default="")
     args = parser.parse_args(argv[1:])
+    if args.mode == "settings":
+        try:
+            result = plan_settings(Path.cwd(), args.prefix, args.commit, args.running, args.main_ref)
+        except VersionError as err:
+            print(f"wacd version: {' '.join(str(err).split())}", file=sys.stderr)
+            return 1
+        for key in ("mode", "version", "tag", "claimed"):
+            print(f"{key}={result[key]}")
+        return 0
     try:
         result = plan(
             Path.cwd(),

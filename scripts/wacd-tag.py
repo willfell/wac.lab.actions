@@ -22,6 +22,11 @@ on the remote:
 claim-tag prints one human line, then claim=pushed, claim=exists or
 claim=superseded.
 
+`claim-tag --tag T --commit C` is the claim of a settings release, whose tag
+goes on C, the running version's source, rather than on the run's own commit.
+It does what push-tag does at C, and a refused push always fails: C is not
+the commit main moved on from, so a newer run does not release it.
+
 A published tag is never moved, deleted or forced. Any problem exits 1 with one
 "wacd tag: ..." stderr line.
 
@@ -152,6 +157,15 @@ def branch_tip(remote, branch):
     return None
 
 
+def claim_tag_on(remote, tag, commit):
+    """claim-tag --commit: the tag on commit, and a refused push is a failure."""
+    try:
+        outcome, message = push_tag_outcome(remote, tag, commit)
+    except PushRefused as refused:
+        raise TagError(f"{refused}; the tag {tag} cannot be claimed on {commit}") from None
+    return [message, f"claim={outcome}"]
+
+
 def claim_tag(remote, tag, sha, branch):
     """Return the lines claim-tag prints: one human line, then claim=<outcome>."""
     if branch.startswith("-") or git("check-ref-format", "--branch", branch, check=False).returncode != 0:
@@ -186,7 +200,9 @@ def build_parser():
     push.add_argument("--remote", default="origin")
     claim = commands.add_parser("claim-tag")
     claim.add_argument("--tag", required=True)
-    claim.add_argument("--sha", required=True)
+    on = claim.add_mutually_exclusive_group(required=True)
+    on.add_argument("--sha")
+    on.add_argument("--commit")
     claim.add_argument("--branch", default="main")
     claim.add_argument("--remote", default="origin")
     return parser
@@ -195,7 +211,9 @@ def build_parser():
 def main(argv):
     try:
         args = build_parser().parse_args(argv[1:])
-        if args.command == "claim-tag":
+        if args.command == "claim-tag" and args.commit is not None:
+            lines = claim_tag_on(args.remote, args.tag, args.commit)
+        elif args.command == "claim-tag":
             lines = claim_tag(args.remote, args.tag, args.sha, args.branch)
         else:
             lines = [push_tag(args.remote, args.tag, args.sha)]
