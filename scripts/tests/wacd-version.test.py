@@ -146,6 +146,91 @@ class RepoTest(unittest.TestCase):
         self.tag("v0.9.0")
         self.assertEqual(self.plan()["version"], "0.10.0")
 
+    def two_releases(self):
+        first = self.commit("feat: first")
+        self.tag("v0.1.0")
+        second = self.commit("feat: second")
+        self.tag("v0.2.0")
+        return first, second
+
+    def refusal(self, **kw):
+        with self.assertRaises(version.VersionError) as ctx:
+            self.plan(**kw)
+        return str(ctx.exception)
+
+    def test_rerun_of_a_version_that_is_no_longer_the_newest_is_refused(self):
+        first, second = self.two_releases()
+        self.assertEqual(
+            self.plan(), {"mode": "resume", "version": "0.2.0", "tag": "v0.2.0"}
+        )
+        git(self.repo, "checkout", "-q", first)
+        sentence = (
+            "This run is for v0.1.0, but v0.2.0 is already published. "
+            "Roll back or release anew; an old build is never replayed."
+        )
+        for published in ("true", "unknown", "false"):
+            with self.subTest(published=published):
+                self.assertEqual(self.refusal(published=published), sentence)
+
+    def test_the_newest_version_is_judged_across_every_branch(self):
+        self.commit("feat: first")
+        self.tag("v0.1.0")
+        base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "checkout", "-q", "-b", "elsewhere")
+        self.commit("feat: elsewhere")
+        self.tag("v0.3.0")
+        git(self.repo, "checkout", "-q", base)
+        self.assertIn("but v0.3.0 is already published", self.refusal())
+
+    def test_other_tag_families_do_not_make_a_version_old(self):
+        first, _ = self.two_releases()
+        self.tag("ui-v9.0.0")
+        self.tag("v0.3.0-rc.1")
+        git(self.repo, "checkout", "-q", "main")
+        self.assertEqual(self.plan()["version"], "0.2.0")
+        self.assertEqual(self.plan(prefix="ui-v")["version"], "9.0.0")
+
+    def test_a_head_with_two_tags_resumes_when_the_higher_is_the_newest(self):
+        first, second = self.two_releases()
+        self.tag("v0.2.1")
+        self.assertEqual(
+            self.plan(), {"mode": "resume", "version": "0.2.1", "tag": "v0.2.1"}
+        )
+        self.assertEqual(self.plan(published="false")["mode"], "release")
+
+    def test_a_head_with_two_tags_is_refused_when_neither_is_the_newest(self):
+        first, second = self.two_releases()
+        self.tag("v0.1.1", first)
+        self.tag("v0.1.5", first)
+        git(self.repo, "checkout", "-q", first)
+        self.assertEqual(
+            self.refusal(),
+            "This run is for v0.1.5, but v0.2.0 is already published. "
+            "Roll back or release anew; an old build is never replayed.",
+        )
+
+    def test_an_untagged_head_releases_whatever_is_published(self):
+        self.two_releases()
+        self.commit("fix: next")
+        self.assertEqual(
+            self.plan(), {"mode": "release", "version": "0.2.1", "tag": "v0.2.1"}
+        )
+        self.assertEqual(
+            self.plan(source="caller", caller="3.0.0")["version"], "3.0.0"
+        )
+
+    def test_publish_only_runs_keep_their_modes_on_an_old_head(self):
+        first, _ = self.two_releases()
+        git(self.repo, "checkout", "-q", first)
+        self.assertEqual(
+            self.plan(deploy=False),
+            {"mode": "none", "version": "0.1.0", "tag": "v0.1.0"},
+        )
+        self.assertEqual(
+            self.plan(deploy=False, published="false"),
+            {"mode": "publish", "version": "0.1.0", "tag": "v0.1.0"},
+        )
+
     def test_resume_ignores_what_the_commits_say(self):
         self.commit("feat!: first")
         self.tag("v4.0.0")

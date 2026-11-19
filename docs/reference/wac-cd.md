@@ -297,6 +297,18 @@ the version being released, it fails naming both and pointing at a rollback
 dispatch. A rollback skips that refusal; an equal, older or non-`X.Y.Z`
 running version (the bootstrap tag before the first release) proceeds.
 
+**No replay of an old version.** A `resume` or `release` run whose HEAD's
+highest tag is lower than the highest `<tag_prefix>X.Y.Z` tag in the whole
+repository (every branch, the same tags and the same version order that pick
+the next version) fails `plan` with `This run is for <tag>, but <newest> is
+already published. Roll back or release anew; an old build is never replayed.`,
+in the run summary and on stderr, before the chart is checked or anything is
+built. A commit carrying several tags counts by its highest, so a re-run of the
+newest version still resumes. What is running changes by a rollback or a new
+release, never by replaying an old build. A rollback is not refused: it names
+its version and does not consult this rule. A `deploy: false` run is not
+refused either, since it never deploys.
+
 **Rollback** is a `workflow_dispatch` of `cd.yml` with `version`. `plan` reads
 the chart's recorded revision and requires it to be an ancestor of `main`;
 build and publish are skipped and the chart that already exists is released

@@ -12,6 +12,10 @@ resume (HEAD is already tagged, so finish that release) and none.
 registry. A tagged HEAD whose chart is absent (`false`) is built and published
 again, which is how a version is recovered after a registry loss and how a HEAD
 tagged by an older pipeline gets its first chart. `true` and `unknown` resume.
+
+A deploying run whose HEAD's highest tag is lower than the highest tag with the
+prefix anywhere in the repository fails: what is running changes by a rollback
+or a new release, never by replaying an old build.
 """
 
 import argparse
@@ -56,11 +60,18 @@ def parse_tag(tag, prefix):
     return tuple(int(part) for part in match.groups())
 
 
-def latest_tag(tags, prefix):
+def newest_tag(tags, prefix):
     found = [(parsed, tag) for tag in tags if (parsed := parse_tag(tag, prefix))]
     if not found:
         return None
-    return ".".join(str(part) for part in max(found)[0])
+    return max(found)
+
+
+def latest_tag(tags, prefix):
+    newest = newest_tag(tags, prefix)
+    if newest is None:
+        return None
+    return ".".join(str(part) for part in newest[0])
 
 
 def is_breaking(message):
@@ -122,6 +133,13 @@ def plan(repo, prefix, source, caller_version, deploy=True, published="unknown")
     ]
     if at_head:
         parsed, tag = max(at_head)
+        if deploy:
+            newest = newest_tag(tag_lines(repo), prefix)
+            if parsed < newest[0]:
+                raise VersionError(
+                    f"This run is for {tag}, but {newest[1]} is already published. "
+                    "Roll back or release anew; an old build is never replayed."
+                )
         result = {
             "mode": "release" if published == "false" else "resume",
             "version": ".".join(str(part) for part in parsed),

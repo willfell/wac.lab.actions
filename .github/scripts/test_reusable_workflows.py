@@ -404,6 +404,78 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertEqual((outputs["version"], outputs["tag"]), ("0.2.0", "v0.2.0"))
                     self.assertNotIn("Superseded", summary.read_text())
 
+    def test_wac_cd_plan_refuses_to_replay_an_old_version_but_not_a_rollback_or_a_new_release(self):
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        import yaml
+
+        root = Path(__file__).resolve().parents[2]
+        doc = yaml.safe_load((root / ".github" / "workflows" / "wac-cd.yml").read_text())
+        step = next(s for s in doc["jobs"]["plan"]["steps"] if s.get("name") == "Plan the version")
+
+        def git(repo, *args):
+            return subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                 "-c", "tag.gpgsign=false", *args],
+                cwd=repo, check=True, capture_output=True, text=True,
+            ).stdout.strip()
+
+        def run(case_head, rollback="", extra_commit=False):
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                repo, scripts = tmp / "repo", tmp / "scripts"
+                repo.mkdir()
+                scripts.mkdir()
+                shutil.copy(root / "scripts" / "wacd-version.py", scripts / "wacd-version.py")
+                git(repo, "-c", "init.defaultBranch=main", "init", "-q")
+                git(repo, "commit", "--allow-empty", "-q", "-m", "feat: first")
+                first = git(repo, "rev-parse", "HEAD")
+                git(repo, "tag", "v0.1.0")
+                git(repo, "commit", "--allow-empty", "-q", "-m", "feat: second")
+                git(repo, "tag", "v0.2.0")
+                if case_head == "first":
+                    git(repo, "checkout", "-q", first)
+                if extra_commit:
+                    git(repo, "commit", "--allow-empty", "-q", "-m", "fix: next")
+                head = git(repo, "rev-parse", "HEAD")
+                (scripts / "wacd-chart.py").write_text(
+                    "import sys\n"
+                    f"print('revision={first}' if sys.argv[1] == 'chart-revision' else 'state=present')\n"
+                )
+                (scripts / "wacd-tag.py").write_text("print('claim=pushed')\n")
+                out, summary = tmp / "out", tmp / "summary"
+                env = {**os.environ, "WACD_SCRIPTS": str(scripts), "RUNNER_TEMP": str(tmp),
+                       "GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_SHA": head,
+                       "ROLLBACK_VERSION": rollback, "VERSION_SOURCE": "commits", "CALLER_VERSION": "",
+                       "DEPLOY": "true", "APP": "app", "TAG_PREFIX": "v"}
+                result = subprocess.run(["bash", "-c", step["run"]], env=env, cwd=repo,
+                                        capture_output=True, text=True)
+                outputs = dict(line.split("=", 1) for line in out.read_text().splitlines()) if out.exists() else {}
+                return result, outputs, summary.read_text() if summary.exists() else ""
+
+        sentence = ("This run is for v0.1.0, but v0.2.0 is already published. "
+                    "Roll back or release anew; an old build is never replayed.")
+        result, outputs, summary = run("first")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(outputs, {})
+        self.assertIn(sentence, result.stderr)
+        self.assertIn(sentence, summary)
+        self.assertIn("::error::wac-cd: ", result.stdout)
+
+        result, outputs, _ = run("main")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((outputs["mode"], outputs["version"]), ("resume", "0.2.0"))
+
+        result, outputs, _ = run("main", extra_commit=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((outputs["mode"], outputs["version"]), ("release", "0.2.1"))
+
+        result, outputs, _ = run("main", rollback="0.1.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((outputs["mode"], outputs["version"], outputs["tag"]), ("rollback", "0.1.0", "v0.1.0"))
+
     def test_wac_cd_shadow_observes_and_never_holds_a_release(self):
         """A hemi outage must not fail or delay a release: the shadow job is off the release path."""
         import yaml

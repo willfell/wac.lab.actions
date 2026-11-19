@@ -225,9 +225,20 @@ jobs:
           else
             plan_version() {
               local planned
-              planned="$(python3 "$WACD_SCRIPTS"/wacd-version.py --prefix "$TAG_PREFIX" \
+              local reason
+              if ! planned="$(python3 "$WACD_SCRIPTS"/wacd-version.py --prefix "$TAG_PREFIX" \
                 --version-source "$VERSION_SOURCE" --version "$CALLER_VERSION" --deploy "$DEPLOY" \
-                --published "$1")"
+                --published "$1" 2> "$RUNNER_TEMP/version.err")"; then
+                reason="$(tr '\n' ' ' < "$RUNNER_TEMP/version.err" | sed 's/^wacd version: //; s/ *$//')"
+                echo "wac-cd: $reason" >&2
+                echo "::error::wac-cd: $reason"
+                {
+                  echo "### wac-cd plan"
+                  echo
+                  echo "$reason"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
               mode="$(sed -n 's/^mode=//p' <<< "$planned")"
               version="$(sed -n 's/^version=//p' <<< "$planned")"
               tag="$(sed -n 's/^tag=//p' <<< "$planned")"
