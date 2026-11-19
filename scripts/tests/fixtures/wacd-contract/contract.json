@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "identity": {
+    "repositoryId": "987654321",
+    "repository": "wacwini/wac.app.travel",
+    "app": "travel",
+    "repoType": "cluster-app",
+    "revision": 7,
+    "sourceSha": "1111111111111111111111111111111111111111"
+  },
+  "delivery": {
+    "kind": "cluster-app",
+    "application": "travel",
+    "namespace": "travel",
+    "project": "travel",
+    "chart": "deploy/travel",
+    "chartVersion": "1.0.0",
+    "tagPrefix": "v",
+    "valuesFile": "deploy/values.yaml",
+    "healthUrl": "http://travel-app.travel.svc.cluster.local:3000/api/health",
+    "healthExpectDbOk": false
+  },
+  "build": {
+    "images": [
+      {"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "shaBuildArg": "TRAVEL_BUILD_SHA"},
+      {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}
+    ],
+    "stack": "node",
+    "nodeVersion": "22",
+    "aptPackages": ["python3", "g++"]
+  },
+  "gates": [{"name": "checks", "commands": ["npm run lint", "npm test"], "required": true}],
+  "runtime": {"name": "travel-app", "image": "travel-app", "replicas": 2, "env": {"LOG_LEVEL": "info"}},
+  "flags": {"source": "hemi"}
+}

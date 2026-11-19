@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "app": "travel",
+  "chart_version": "1.0.0",
+  "values_file": "deploy/values.yaml",
+  "tag_prefix": "v",
+  "health_url": "http://travel-app.travel.svc.cluster.local:3000/api/health",
+  "health_expect_db_ok": false,
+  "images": [
+    {"name": "travel-app", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "TRAVEL_BUILD_SHA"},
+    {"name": "travel-cron", "dockerfile": "cron/Dockerfile", "context": "cron"}
+  ],
+  "ci": {
+    "stack": "node",
+    "node_version": "22",
+    "commands": ["npm run lint", "npm test"],
+    "apt_packages": ["python3", "g++"]
+  }
+}
