@@ -24,13 +24,128 @@ permissions:
   contents: read
 
 jobs:
+  contract:
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      source: ${{ steps.contract.outputs.source }}
+    steps:
+      - name: Require the runner's python3 3.12 or later
+        timeout-minutes: 1
+        shell: bash
+        env:
+          JOB_RUNNER_NAME: ${{ runner.name }}
+          JOB_RUNNER_OS: ${{ runner.os }}
+          JOB_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          modules=(argparse base64 binascii hashlib http.client importlib.util json os pathlib re shutil signal ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
+          python="$(command -v python3 || true)"
+          found="no python3"
+          if [[ -n "$python" ]]; then
+            version="$("$python" -c 'import sys; print("Python " + sys.version.split()[0])' 2> /dev/null || echo "an unreadable python3")"
+            found="$version at $python"
+            if "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2> /dev/null; then
+              if missing="$("$python" -c 'import importlib, sys
+          for name in sys.argv[1:]:
+              try:
+                  importlib.import_module(name)
+              except Exception:
+                  print(name)
+                  sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
+                exit 0
+              fi
+              found="$found, which cannot import ${missing:-its standard modules}"
+            fi
+          fi
+          echo "::error::wac-ci: contract needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
+          exit 1
+      - name: Require the defining workflow commit
+        timeout-minutes: 1
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out the shared scripts (actions/checkout v4)
+        timeout-minutes: 3
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+      - name: Read the default branch's tree (actions/checkout v4)
+        timeout-minutes: 3
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: refs/heads/${{ github.event.repository.default_branch }}
+          path: .wacd-main
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: .github/wacd.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Read the pull request's tree (actions/checkout v4)
+        timeout-minutes: 3
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: .wacd-head
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: .github/wacd.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Ask hemi for the settings
+        id: contract
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! python3 "$WACD_SCRIPTS"/wacd-contract.py pr --out .wacd-contract --main .wacd-main --head .wacd-head \
+            > "$RUNNER_TEMP/contract.out" 2> "$RUNNER_TEMP/contract.err"; then
+            echo "::error::wac-ci: $(tr '\n' ' ' < "$RUNNER_TEMP/contract.err" | sed 's/ *$//')"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/contract.out" >> "$GITHUB_OUTPUT"
+      - name: Upload the settings copy (actions/upload-artifact v4)
+        timeout-minutes: 3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: steps.contract.outputs.source == 'hemi'
+        with:
+          name: wac-ci-contract
+          path: .wacd-contract/
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
   checks:
+    needs: contract
+    if: ${{ !cancelled() }}
     runs-on: ${{ inputs.build_runner || inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 30
     permissions:
       contents: read
       packages: read
     steps:
+      - name: Require the contract job's success
+        timeout-minutes: 1
+        shell: bash
+        env:
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+        run: |
+          if [[ "$CONTRACT_RESULT" != success ]]; then
+            echo "::error::wac-ci: the contract job ended ${CONTRACT_RESULT:-without a result}, so this job's checks cannot run."
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -50,13 +165,30 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+      - name: Clear any copy in the checkout
+        if: needs.contract.outputs.source == 'hemi'
+        shell: bash
+        run: rm -rf .wacd-contract
+      - name: Download the settings copy (actions/download-artifact v4)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.contract.outputs.source == 'hemi'
+        with:
+          name: wac-ci-contract
+          path: .wacd-contract
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Read the wacd profile
         id: profile
         shell: bash
-        run: python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+        env:
+          SOURCE: ${{ needs.contract.outputs.source }}
+        run: |
+          if [[ "$SOURCE" == hemi ]]; then
+            python3 "$WACD_SCRIPTS"/wacd-profile.py --contract .wacd-contract/contract.json >> "$GITHUB_OUTPUT"
+          else
+            python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+          fi
       - name: Install the profile's apt packages
         if: steps.profile.outputs.apt_packages != ''
         shell: bash
@@ -103,11 +235,23 @@ jobs:
           done
 
   render:
+    needs: contract
+    if: ${{ !cancelled() }}
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
+      - name: Require the contract job's success
+        timeout-minutes: 1
+        shell: bash
+        env:
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+        run: |
+          if [[ "$CONTRACT_RESULT" != success ]]; then
+            echo "::error::wac-ci: the contract job ended ${CONTRACT_RESULT:-without a result}, so this job's checks cannot run."
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -127,13 +271,30 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+      - name: Clear any copy in the checkout
+        if: needs.contract.outputs.source == 'hemi'
+        shell: bash
+        run: rm -rf .wacd-contract
+      - name: Download the settings copy (actions/download-artifact v4)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.contract.outputs.source == 'hemi'
+        with:
+          name: wac-ci-contract
+          path: .wacd-contract
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Read the wacd profile
         id: profile
         shell: bash
-        run: python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+        env:
+          SOURCE: ${{ needs.contract.outputs.source }}
+        run: |
+          if [[ "$SOURCE" == hemi ]]; then
+            python3 "$WACD_SCRIPTS"/wacd-profile.py --contract .wacd-contract/contract.json >> "$GITHUB_OUTPUT"
+          else
+            python3 "$WACD_SCRIPTS"/wacd-profile.py .github/wacd.json >> "$GITHUB_OUTPUT"
+          fi
       - name: Install the render tools
         shell: bash
         env:
@@ -163,12 +324,19 @@ jobs:
         shell: bash
         env:
           WAC_APP_TGZ: ${{ steps.pull.outputs.tgz }}
+          SOURCE: ${{ needs.contract.outputs.source }}
         run: |
-          images_line="$(python3 "$WACD_SCRIPTS"/wacd-chart.py ci-images --profile .github/wacd.json)"
-          python3 "$WACD_SCRIPTS"/wacd-chart.py package --profile .github/wacd.json \
+          profile=.github/wacd.json
+          copy=()
+          if [[ "$SOURCE" == hemi ]]; then
+            profile=.wacd-contract/profile.json
+            copy+=(--values-json .wacd-contract/values.json)
+          fi
+          images_line="$(python3 "$WACD_SCRIPTS"/wacd-chart.py ci-images --profile "$profile")"
+          python3 "$WACD_SCRIPTS"/wacd-chart.py package --profile "$profile" \
             --version 0.0.0 --source-sha "$GITHUB_SHA" --ci \
             --images "${images_line#images=}" \
-            --wac-app-tgz "$WAC_APP_TGZ" --out "$RUNNER_TEMP/deploy-chart" >> "$GITHUB_OUTPUT"
+            --wac-app-tgz "$WAC_APP_TGZ" --out "$RUNNER_TEMP/deploy-chart" ${copy[@]+"${copy[@]}"} >> "$GITHUB_OUTPUT"
       - name: Lint the deploy chart
         shell: bash
         env:
@@ -205,17 +373,23 @@ jobs:
         run: uv run --no-project --with pyyaml python "$WACD_SCRIPTS"/wacd-parity.py "$RUNNER_TEMP/kustomize.yaml" "$RUNNER_TEMP/render.yaml"
 
   lint:
+    needs: contract
+    if: ${{ !cancelled() }}
     uses: ./.github/workflows/actionlint.yml
     with:
       runner: ${{ inputs.runner }}
       runner_policy: fleet
 
   techdocs:
+    needs: contract
+    if: ${{ !cancelled() }}
     uses: ./.github/workflows/techdocs.yml
     with:
       runner: ${{ inputs.runner }}
 
   agents-md:
+    needs: contract
+    if: ${{ !cancelled() }}
     uses: ./.github/workflows/agents-md.yml
     with:
       runner: ${{ inputs.runner }}

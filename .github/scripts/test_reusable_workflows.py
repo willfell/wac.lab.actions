@@ -256,7 +256,7 @@ class ReusableWorkflowTests(unittest.TestCase):
 
         doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
         for job_name in ("checks", "render"):
-            app = doc["jobs"][job_name]["steps"][0]
+            app = doc["jobs"][job_name]["steps"][1]
             with self.subTest(job=job_name):
                 self.assertTrue(app["uses"].startswith("actions/checkout@"))
                 self.assertNotIn("repository", app.get("with") or {})
@@ -660,6 +660,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                 with self.subTest(workflow=name, job=job_name):
                     self.assertEqual(id_token_problems(doc, job_name, job), [])
         self.assertIn(("wac-cd.yml", "plan"), checked)
+        self.assertIn(("wac-ci.yml", "contract"), checked)
 
     def test_no_job_holding_id_token_is_exempt_from_the_rule(self):
         self.assertEqual(KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE, (), "a job holding id-token: write may never be an exception")
@@ -714,7 +715,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             "only the clock stamp precedes the check in shadow: its budget starts there",
         )
 
-    def python_check_holds(self, job, job_name, position):
+    def python_check_holds(self, job, job_name, position, workflow="wac-cd"):
         import subprocess
 
         self.assertFalse([s for s in job["steps"] if "setup-python" in str(s.get("uses", ""))],
@@ -744,7 +745,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                 if label == "3.10":
                     self.assertEqual(
                         result.stdout,
-                        f"::error::wac-cd: {job_name} needs python3 3.12 or later on the runner; found Python 3.10.12 "
+                        f"::error::{workflow}: {job_name} needs python3 3.12 or later on the runner; found Python 3.10.12 "
                         f"at {bin_dir}/python3 on ci-light-abc12 (Linux, ARM64).\n",
                     )
                 if label == "absent":
@@ -773,7 +774,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertEqual(
                     result.stdout,
-                    f"::error::wac-cd: {job_name} needs python3 3.12 or later on the runner; found "
+                    f"::error::{workflow}: {job_name} needs python3 3.12 or later on the runner; found "
                     f"Python {platform.python_version()} at {bin_dir}/python3, which cannot import {broken} "
                     "on ci-light-abc12 (Linux, ARM64).\n",
                 )
@@ -1480,6 +1481,184 @@ class ReusableWorkflowTests(unittest.TestCase):
                 "go-version-file": "${{ fromJSON(steps.profile.outputs.ci).go_version_file }}",
             },
         )
+
+    def wac_ci(self):
+        import yaml
+
+        return yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
+
+    def test_wac_ci_only_the_contract_job_holds_a_job_token_and_every_other_job_waits_for_it(self):
+        """A dependent of a failed job reports skipped, which a ruleset counts as passing."""
+        doc = self.wac_ci()
+        jobs = doc["jobs"]
+        self.assertEqual(sorted(name for name, job in jobs.items() if holds_id_token(doc, job)), ["contract"])
+        self.assertEqual(jobs["contract"]["permissions"], {"contents": "read", "id-token": "write"})
+        self.assertNotIn("needs", jobs["contract"])
+        self.assertEqual(jobs["contract"]["outputs"], {"source": "${{ steps.contract.outputs.source }}"})
+        others = [name for name in jobs if name != "contract"]
+        self.assertEqual(sorted(others), ["agents-md", "checks", "lint", "render", "techdocs"])
+        for name in others:
+            job = jobs[name]
+            with self.subTest(job=name):
+                needs = job.get("needs")
+                self.assertIn("contract", [needs] if isinstance(needs, str) else needs or [])
+                self.assertEqual(job.get("if"), "${{ !cancelled() }}")
+                if "uses" in job:
+                    continue
+                first = job["steps"][0]
+                self.assertEqual(first["name"], "Require the contract job's success")
+                self.assertEqual(first["env"], {"CONTRACT_RESULT": "${{ needs.contract.result }}"})
+
+    def test_wac_ci_a_job_after_a_failed_contract_job_fails_rather_than_passing(self):
+        import subprocess
+
+        step = self.wac_ci()["jobs"]["render"]["steps"][0]
+        for result, code in (("success", 0), ("failure", 1), ("skipped", 1), ("cancelled", 1), ("", 1)):
+            with self.subTest(result=result):
+                run = subprocess.run(["bash", "-e", "-c", step["run"]], env={"CONTRACT_RESULT": result},
+                                     capture_output=True, text=True)
+                self.assertEqual(run.returncode, code, run.stdout + run.stderr)
+                if code:
+                    self.assertIn("::error::wac-ci: ", run.stdout)
+        jobs = self.wac_ci()["jobs"]
+        self.assertEqual(jobs["checks"]["steps"][0], step, "every job checks the same way")
+
+    def test_wac_ci_contract_job_requires_the_runners_python3_before_anything_else(self):
+        self.python_check_holds(self.wac_ci()["jobs"]["contract"], "contract", 0, workflow="wac-ci")
+
+    def test_wac_ci_contract_job_bounds_every_step(self):
+        for index, step in enumerate(self.wac_ci()["jobs"]["contract"]["steps"]):
+            with self.subTest(step=step.get("name", index)):
+                self.assertIsInstance(step.get("timeout-minutes"), int)
+
+    def test_wac_ci_contract_reads_main_from_the_default_branch_and_never_the_base(self):
+        """Whether a repository is cut over is main's to say: stacked pull requests are judged the same way."""
+        steps = self.wac_ci()["jobs"]["contract"]["steps"]
+        reads = {s["with"]["path"]: s for s in steps
+                 if str(s.get("uses", "")).startswith("actions/checkout@") and "repository" not in s["with"]}
+        self.assertEqual(sorted(reads), [".wacd-head", ".wacd-main"])
+        sparse = {"fetch-depth": 1, "filter": "blob:none", "sparse-checkout": ".github/wacd.json",
+                  "sparse-checkout-cone-mode": False, "persist-credentials": False}
+        self.assertEqual(reads[".wacd-main"]["with"],
+                         {"ref": "refs/heads/${{ github.event.repository.default_branch }}",
+                          "path": ".wacd-main", **sparse})
+        self.assertEqual(reads[".wacd-head"]["with"], {"path": ".wacd-head", **sparse})
+        text = (Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text()
+        for word in ("base_ref", "pull_request.base", "github.head_ref", "pull_request.head"):
+            with self.subTest(word=word):
+                self.assertNotIn(word, text)
+
+    def test_wac_ci_contract_step_asks_once_and_fails_with_the_scripts_sentence(self):
+        import os
+        import subprocess
+
+        steps = self.wac_ci()["jobs"]["contract"]["steps"]
+        asks = [s for s in steps if "wacd-contract.py" in s.get("run", "")]
+        self.assertEqual(len(asks), 1)
+        ask = asks[0]
+        self.assertEqual(ask["id"], "contract")
+        self.assertNotIn("env", ask, "nothing the caller passes reaches the script")
+        for code, expected in ((0, 0), (1, 1)):
+            with self.subTest(script_exit=code), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "wacd-contract.py").write_text(
+                    "import sys\n"
+                    "print('source=hemi\\nrevision=7\\nargv=' + ' '.join(sys.argv[1:]))\n"
+                    "print('wacd contract: hemi did not answer;\\nre-run when it does.', file=sys.stderr)\n"
+                    f"sys.exit({code})\n"
+                )
+                out = root / "out"
+                env = {**os.environ, "WACD_SCRIPTS": str(root), "GITHUB_OUTPUT": str(out), "RUNNER_TEMP": tmp}
+                result = subprocess.run(["bash", "-e", "-c", ask["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if code:
+                    self.assertIn("::error::wac-ci: wacd contract: hemi did not answer; re-run when it does.",
+                                  result.stdout)
+                    self.assertFalse(out.exists(), "a failure sets no output")
+                else:
+                    self.assertEqual(
+                        out.read_text(),
+                        "source=hemi\nrevision=7\nargv=pr --out .wacd-contract --main .wacd-main --head .wacd-head\n",
+                    )
+
+    def test_wac_ci_hands_hemis_copy_to_the_other_jobs_only_when_the_source_is_hemi(self):
+        jobs = self.wac_ci()["jobs"]
+        names = [s.get("name") for s in jobs["contract"]["steps"]]
+        upload = next(s for s in jobs["contract"]["steps"] if str(s.get("uses", "")).startswith("actions/upload-artifact@"))
+        self.assertLess(names.index("Ask hemi for the settings"), names.index(upload["name"]))
+        self.assertEqual(upload["if"], "steps.contract.outputs.source == 'hemi'")
+        self.assertEqual(upload["with"], {"name": "wac-ci-contract", "path": ".wacd-contract/",
+                                          "include-hidden-files": True, "if-no-files-found": "error",
+                                          "overwrite": True, "retention-days": 1})
+        for name in ("checks", "render"):
+            steps = jobs[name]["steps"]
+            names = [s.get("name") or s.get("uses") for s in steps]
+            with self.subTest(job=name):
+                clear = steps[names.index("Clear any copy in the checkout")]
+                download = next(s for s in steps if str(s.get("uses", "")).startswith("actions/download-artifact@"))
+                self.assertEqual(clear["if"], "needs.contract.outputs.source == 'hemi'")
+                self.assertEqual(clear["run"], "rm -rf .wacd-contract")
+                self.assertEqual(download["if"], "needs.contract.outputs.source == 'hemi'")
+                self.assertEqual(download["with"], {"name": "wac-ci-contract", "path": ".wacd-contract"})
+                app = names.index("actions/checkout@v4")
+                self.assertLess(app, names.index(clear["name"]))
+                self.assertLess(names.index(clear["name"]), names.index(download["name"]))
+                self.assertLess(names.index(download["name"]), names.index("Read the wacd profile"))
+
+    def test_wac_ci_reads_the_profile_from_the_copy_only_when_the_source_is_hemi(self):
+        import os
+        import subprocess
+
+        jobs = self.wac_ci()["jobs"]
+        for name in ("checks", "render"):
+            step = next(s for s in jobs[name]["steps"] if s.get("name") == "Read the wacd profile")
+            self.assertEqual(step["env"], {"SOURCE": "${{ needs.contract.outputs.source }}"})
+            for source, expected in (("hemi", "--contract .wacd-contract/contract.json"),
+                                     ("files", ".github/wacd.json"), ("", ".github/wacd.json")):
+                with self.subTest(job=name, source=source), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "wacd-profile.py").write_text("import sys\nprint('argv=' + ' '.join(sys.argv[1:]))\n")
+                    out = root / "out"
+                    env = {**os.environ, "WACD_SCRIPTS": str(root), "GITHUB_OUTPUT": str(out), "SOURCE": source}
+                    result = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(out.read_text(), f"argv={expected}\n")
+
+    def test_wac_ci_render_packages_the_copys_runtime_only_when_the_source_is_hemi(self):
+        import os
+        import subprocess
+
+        step = next(s for s in self.wac_ci()["jobs"]["render"]["steps"]
+                    if s.get("name") == "Package the deploy chart with CI images")
+        self.assertEqual(step["env"], {"WAC_APP_TGZ": "${{ steps.pull.outputs.tgz }}",
+                                       "SOURCE": "${{ needs.contract.outputs.source }}"})
+        today = [
+            "ci-images --profile .github/wacd.json",
+            "package --profile .github/wacd.json --version 0.0.0 --source-sha " + "a" * 40
+            + " --ci --images {\"x\":1} --wac-app-tgz /t/wac-app.tgz --out {tmp}/deploy-chart",
+        ]
+        copy = [
+            "ci-images --profile .wacd-contract/profile.json",
+            "package --profile .wacd-contract/profile.json --version 0.0.0 --source-sha " + "a" * 40
+            + " --ci --images {\"x\":1} --wac-app-tgz /t/wac-app.tgz --out {tmp}/deploy-chart"
+            " --values-json .wacd-contract/values.json",
+        ]
+        for source, expected in (("files", today), ("", today), ("hemi", copy)):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                log = root / "argv.log"
+                (root / "wacd-chart.py").write_text(
+                    "import sys\n"
+                    f"open({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                    "print('images={\"x\":1}' if sys.argv[1] == 'ci-images' else 'chart_dir=/c')\n"
+                )
+                out = root / "out"
+                env = {**os.environ, "WACD_SCRIPTS": str(root), "GITHUB_OUTPUT": str(out), "SOURCE": source,
+                       "WAC_APP_TGZ": "/t/wac-app.tgz", "GITHUB_SHA": "a" * 40, "RUNNER_TEMP": tmp}
+                result = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(log.read_text().splitlines(), [line.replace("{tmp}", tmp) for line in expected])
+                self.assertEqual(out.read_text(), "chart_dir=/c\n")
 
     def test_repository_workflows_pass(self):
         self.assertEqual(module.main(), 0)
