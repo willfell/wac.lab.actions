@@ -87,7 +87,8 @@ split fits only a caller whose `CI_RUNNER_SMALL` is a Lab pool. A repository
 whose small size is a hosted label (mcp.argo, in wac.lab.iac's `github` runner
 mode) keeps passing `runner`. `contract` also reaches hemi at its
 in-cluster address, so on a hosted runner it gets no answer: a repository on
-its files runs on them as before, and a cut-over repository needs a Lab pool.
+its files runs on them as before (with the one exception below), and a
+cut-over repository needs a Lab pool.
 Six jobs per pull request on a three-pod dind pool is
 how wac.hemi waited up to 17 minutes for a slot on 2026-11-18 while each job
 ran for under four.
@@ -106,6 +107,10 @@ and is the one copy outside lab. The caller removes the input at cutover step
 only for a `pull_request` run on the merge ref, so on any other event a
 cut-over repository fails `contract` with a sentence naming the event, and a
 repository on its files runs on them as before.
+
+A repository on its files is never failed because of hemi, except a pull request that deletes or moves `.github/wacd.json` or the values file while hemi does not answer, which fails until hemi answers, because it cannot be told from hemi's clean-up pull request or from a mistake. That holds
+whatever hemi's answer was (no answer, a 401, 403 or 404, an unreadable 200)
+and on any runner, a hosted one included; the table below has the row.
 
 A repository that has been cut over to hemi has no `.github/wacd.json` and no
 values file: its settings live in hemi. `contract` asks hemi for them on every

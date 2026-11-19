@@ -38,6 +38,21 @@ jobs:
       settings_revision: ${{ inputs.revision }}
 ```
 
+Callers must:
+
+- set a `run-name` that contains
+  `format('settings revision {0}', inputs.revision)`, so a settings run is
+  named exactly `settings revision <n>`: hemi finds the run it dispatched by
+  that display name;
+- call `wac-cd.yml` from a job whose id is `cd` and which has no `name:`, since
+  hemi reads the jobs as `cd / <job>` (`cd / plan`, `cd / retag`,
+  `cd / deploy`);
+- declare both `workflow_dispatch` inputs, `version` and `revision`, with
+  `required: false`: hemi dispatches one of them alone, and GitHub refuses a
+  dispatch that omits a required input.
+
+hemi refuses to cut an app over until its `cd.yml` meets the first two.
+
 **The caller file must be `.github/workflows/cd.yml`.** The gateway admits a
 release only from that caller file on `refs/heads/main`, for a `push` or
 `workflow_dispatch` event, whose job workflow ref is exactly
@@ -634,14 +649,7 @@ copy as for any run, and then, in `Plan the settings release`:
 5. Never spends a second version on one revision, and never undoes a
    rollback:
    - when V's chart already carries `settings_revision`, V' is V (a re-run
-     after the release went live; releasing it again changes nothing), as
-     long as V's chart was published from the fleet commit the copy is read at
-     now (`wacwini.com/fleet-commit`). When the two differ, the copy was
-     changed without a new revision (a hand edit of `active.json` in
-     wac.fleet; hemi never reuses a number), and `plan` fails with `revision
-     <n> runs from fleet commit <a>, but the copy is at <b>; a changed copy
-     needs a new revision number.` rather than re-prove V green without the
-     change;
+     after the release went live; releasing it again changes nothing);
    - otherwise `wacd-release.py earlier-release` judges the versions on
      `main` above V, newest first. A version counts as released only with
      evidence that it was proved running: its GitHub Release, which `github-release` creates
@@ -762,6 +770,10 @@ re-run of C's own code-release run then sees V' on its HEAD: while V' is the
 newest it resumes V', a harmless re-release of the current settings; once
 anything newer exists, **No replay of an old version** refuses it. When C was
 `main`'s head, HEAD carries both V and V', and counts by V'.
+
+**Known limit: a hand edit of wac.fleet.** A hand edit of wac.fleet that
+keeps the revision number is not released: the running version is re-proved
+unchanged. A hand edit must carry a new revision number (hemi's runbook).
 
 **Known limit: a settings release over an unfinished code release.** A
 settings release plans V' above every tag on `main`, so when a code release's

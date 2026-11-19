@@ -733,7 +733,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             ("plan", "Plan the settings release"): [({
                 "SETTINGS_REVISION": "7", "SOURCE": "hemi", "COPY_REVISION": "7", "APP": "app", "TAG_PREFIX": "v",
                 "PROFILE_IMAGES": json.dumps([{"name": "web", "dockerfile": "Dockerfile", "context": "."}]),
-                "FLEET_COMMIT": "f" * 40, "GITHUB_TOKEN": "job-token"}, 0)],
+                "GITHUB_TOKEN": "job-token"}, 0)],
             ("plan", "Refuse a settings release while the app is rolling out"): [refusal],
             ("plan", "Refuse a settings release behind a workflow change"): [refusal],
             ("plan", "Plan the version"): [(code, 0), ({**code, "ROLLBACK_VERSION": "1.4.2"}, 0), (settings, 0)],
@@ -1305,8 +1305,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         if status_err is not None:
             env["STUB_STATUS_ERR"] = status_err
         self.assertEqual(set(settings_step["env"]), {"SETTINGS_REVISION", "SOURCE", "COPY_REVISION", "APP",
-                                                     "TAG_PREFIX", "PROFILE_IMAGES", "FLEET_COMMIT", "GITHUB_TOKEN"})
-        self.assertEqual(settings_step["env"]["FLEET_COMMIT"], "${{ steps.contract.outputs.fleet_commit }}")
+                                                     "TAG_PREFIX", "PROFILE_IMAGES", "GITHUB_TOKEN"})
 
         def outputs():
             return dict(line.split("=", 1) for line in out.read_text().splitlines()) if out.exists() else {}
@@ -1427,17 +1426,14 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertRegex(call, r"^wacd-release\.py earlier-release --app app --prefix v --revision 7 "
                                        r"--running 1\.4\.2 --versions 1\.4\.3 --claimed 1\.4\.3 --deadline \d+$")
 
-    def test_wac_cd_settings_release_of_the_live_revision_from_another_fleet_commit_fails(self):
-        """A hand edit of active.json that keeps the revision number would be re-proved green and not shipped."""
+    def test_wac_cd_settings_rerun_of_the_live_revision_after_another_apps_save_re_proves_it(self):
+        """The copy's fleet commit is wac.fleet's head, which moves with every app's save, so it decides nothing."""
         plan = self.settings_plan(running="1.4.3", running_copy="7", extra_tags=(("v1.4.3", "code"),),
                                   running_fleet="a" * 40)
-        sentence = (f"revision 7 runs from fleet commit {'a' * 40}, but the copy is at {'f' * 40}; a changed copy "
-                    "needs a new revision number.")
-        self.assertEqual(plan["settings"].returncode, 1, plan["settings"].stdout)
-        self.assertIn(f"::error::wac-cd: {sentence}", plan["settings"].stdout)
-        self.assertIn(sentence, plan["summary"].read_text())
-        self.assertEqual(plan["settings_outputs"], {})
-        self.assertNotIn("wacd-tag.py", plan["log"].read_text())
+        self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+        self.assertEqual((plan["version_outputs"]["mode"], plan["version_outputs"]["version"]), ("settings", "1.4.3"),
+                         "V again, never a refusal and never a new version")
 
     def test_wac_cd_settings_rerun_after_a_rollback_refuses_instead_of_undoing_it(self):
         sentence = ("Revision 7 was released as 1.4.3, and 1.3.9 runs now after a rollback. To put those settings "

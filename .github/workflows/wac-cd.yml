@@ -237,7 +237,6 @@ jobs:
           APP: ${{ steps.profile.outputs.app }}
           TAG_PREFIX: ${{ steps.profile.outputs.tag_prefix }}
           PROFILE_IMAGES: ${{ steps.profile.outputs.images }}
-          FLEET_COMMIT: ${{ steps.contract.outputs.fleet_commit }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -289,7 +288,6 @@ jobs:
           commit="$(sed -n 's/^commit=//p' <<< "$status")"
           images="$(sed -n 's/^images=//p' <<< "$status")"
           live="$(sed -n 's/^copy_revision=//p' <<< "$status")"
-          live_fleet="$(sed -n 's/^fleet_commit=//p' <<< "$status")"
           if ! python3 -I -c 'import json, sys
           running = sorted(json.loads(sys.argv[1]))
           wanted = sorted(image["name"] for image in json.loads(sys.argv[2]))
@@ -301,9 +299,6 @@ jobs:
           claimed="$(sed -n 's/^claimed=//p' <<< "$planned")"
           above="$(sed -n 's/^above=//p' <<< "$planned")"
           if [[ "$live" == "$SETTINGS_REVISION" ]]; then
-            if [[ "$live_fleet" != "$FLEET_COMMIT" ]]; then
-              fail "revision $SETTINGS_REVISION runs from fleet commit $live_fleet, but the copy is at $FLEET_COMMIT; a changed copy needs a new revision number."
-            fi
             version="$running"
           else
             code=0
