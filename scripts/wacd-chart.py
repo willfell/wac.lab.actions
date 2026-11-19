@@ -445,8 +445,7 @@ def chart_release(registry, app, version, timeout=TIMEOUT):
     None when deploy/<app>:<version> is not in the registry. wac-cd's settings
     plan holds the gateway's status to it: the status's chart_digest must be
     this digest, and every running image one of these. copy is the copy
-    revision the chart ships, as chart_copy_revision reports it, and
-    fleet_commit the wac.fleet commit that copy was read at, or "none".
+    revision the chart ships, as chart_copy_revision reports it.
     """
     found = chart_with_digest(registry, app, version, timeout)
     if found is None:
@@ -464,7 +463,6 @@ def chart_release(registry, app, version, timeout=TIMEOUT):
         "revision": revision,
         "images": parse_image_refs(text),
         "copy": copy_of(annotations),
-        "fleet_commit": fleet_commit_of(annotations),
     }
 
 
@@ -474,14 +472,6 @@ def copy_of(annotations):
     if text is None:
         return "none"
     return revision_annotation(revision_from_annotation(text))
-
-
-def fleet_commit_of(annotations):
-    """The wac.fleet commit a chart's copy was read at: "none" or 40 hex."""
-    text = annotations.get(FLEET_COMMIT_ANNOTATION)
-    if text is None:
-        return "none"
-    return check(text, SHA40, FLEET_COMMIT_ANNOTATION)
 
 
 def chart_copy_revision(registry, app, version):

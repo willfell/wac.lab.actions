@@ -33,9 +33,8 @@ chart_digest that is not the registry's, or a chart the registry lacks is a
 fault and exits 1 at once. A 503 (the gateway cannot read Kubernetes) is
 retried within N; a 403 without a reason is a refused status read, which an
 app the gateway does not know and a token it could not check both give. It
-prints running=, commit= (the chart's source), images= (its images),
-copy_revision= (the copy revision it ships) and fleet_commit= (the wac.fleet
-commit that copy was read at, or none).
+prints running=, commit= (the chart's source), images= (its images) and
+copy_revision= (the copy revision it ships).
 
 `earlier-release --app A --prefix P --revision N --running V --versions L
 --claimed X` is the settings plan's rule B over L, the versions on main above
@@ -69,11 +68,11 @@ be read fails, never counting as absent. It prints unfinished=none.
 All three settings reads take `--deadline <epoch seconds>`, the plan step's one
 wall-clock deadline. The status wait ends DEADLINE_MARGIN seconds before it,
 starts no request with under MIN_READ_SECONDS of that wait left, and bounds
-each read by the time left, so an app that never settles reaches the rollout
-refusal (exit 3) with its sentence, unless GitHub's token endpoint is slow on
-the last status pass (ci.oidc_token() has its own fixed 20 s): then the
-backstop ends the read and the run fails as a fault with the deadline
-sentence, never with a wrong decision. A hard backstop (SIGALRM) at the
+each read by the time left, its token mint included (status_transport()), so
+an app that never settles reaches the rollout refusal (exit 3) with its
+sentence, which names the seconds measured: a mint that has not succeeded when
+the wait ends, after the app was seen rolling out, ends the wait like any
+other read. A hard backstop (SIGALRM) at the
 deadline itself stops a read that trickles past every socket timeout; each
 command disarms it and restores the previous handler in a finally, so it
 cannot fire once the command has decided.
@@ -231,6 +230,10 @@ def no_connection(error):
     return isinstance(error, OSError) and error.errno in NO_ROUTE
 
 
+class Unminted(ReleaseError):
+    """GitHub minted no token for a request (ci.oidc_token() failed), so nothing was sent."""
+
+
 class RollingOut(ReleaseError):
     """The status never settled within the wait: the app is mid-rollout."""
 
@@ -290,14 +293,20 @@ def trust_context():
         ) from None
 
 
-def post(body, trust, timeout):
+def post(body, trust, timeout, mint_timeout=None):
     """One POST to the gateway with a token minted for it: (status, JSON or None, token).
 
-    ci.oidc_token() raises ReleaseError when no token can be had; a transport
-    failure raises Unreachable. Whatever the status, the parsed body is
-    returned to the caller, which keeps only what it needs from it.
+    The mint waits ci-release's own OIDC_TIMEOUT unless mint_timeout bounds
+    it. A mint that fails raises Unminted, with ci.oidc_token()'s message; a
+    transport failure raises Unreachable. Whatever the status, the parsed body
+    is returned to the caller, which keeps only what it needs from it.
     """
-    token = ci.oidc_token()
+    try:
+        token = ci.oidc_token() if mint_timeout is None else ci.oidc_token(mint_timeout)
+    except Deadline:
+        raise
+    except ReleaseError as error:
+        raise Unminted(str(error)) from None
     request = urllib.request.Request(
         ci.URL,
         data=json.dumps(body).encode(),
@@ -331,9 +340,9 @@ def post(body, trust, timeout):
     return status, value, token
 
 
-def transport(body, trust, timeout):
+def transport(body, trust, timeout, mint_timeout=None):
     """(status, value) as ci-release's request() returns it, but a 403 keeps its reason."""
-    status, value, _ = post(body, trust, timeout)
+    status, value, _ = post(body, trust, timeout, mint_timeout)
     if status == 200:
         if not isinstance(value, dict):
             raise ReleaseError("invalid release response")
@@ -664,17 +673,34 @@ def steady(value, release):
     return seen > 0
 
 
+def status_transport(body, trust, timeout):
+    """transport() with the token mint bounded by the same time left as the read."""
+    return transport(body, trust, timeout, mint_timeout=min(ci.OIDC_TIMEOUT, timeout))
+
+
 def running_release(app, wait_timeout, request=None):
-    """(version, release) from the first steady status within wait_timeout seconds."""
+    """(version, release) from the first steady status within wait_timeout seconds.
+
+    Each read, its token mint included, is bounded by the time left in the
+    wait. A mint that has not succeeded when the wait is over, after the app
+    was seen rolling out, ends the wait as any other read would: the app was
+    rolling out for all of it.
+    """
     if request is None:
-        request = transport
+        request = status_transport
         trust = trust_context()
     else:
         trust = None
-    deadline = time.monotonic() + wait_timeout
+    started = time.monotonic()
+    deadline = started + wait_timeout
     seen = None
     while deadline - time.monotonic() >= MIN_READ_SECONDS:
-        code, value = request(STATUS_BODY(), trust, deadline - time.monotonic())
+        try:
+            code, value = request(STATUS_BODY(), trust, deadline - time.monotonic())
+        except Unminted:
+            if seen is None or deadline - time.monotonic() >= MIN_READ_SECONDS:
+                raise
+            break
         if code == 200:
             version = value.get("version")
             if semver(version) is None:
@@ -701,7 +727,7 @@ def running_release(app, wait_timeout, request=None):
         time.sleep(min(POLL_SECONDS, max(0, deadline - time.monotonic())))
     if seen is not None:
         raise RollingOut(
-            f"{app} was rolling out {seen} for the whole {int(wait_timeout)} seconds: the gateway never "
+            f"{app} was rolling out {seen} for the whole {int(time.monotonic() - started)} seconds: the gateway never "
             "reported it synced, healthy and fully rolled out with only its own images, so no settings "
             "were released; dispatch again once it settles"
         )
@@ -923,7 +949,7 @@ def run(args):
         images = json.dumps(release["images"], separators=(",", ":"), sort_keys=True)
         return (
             f"running={version}\ncommit={release['revision']}\nimages={images}\n"
-            f"copy_revision={release['copy']}\nfleet_commit={release['fleet_commit']}"
+            f"copy_revision={release['copy']}"
         )
     if args.command == "health":
         if not SHA_PATTERN.fullmatch(args.sha):

@@ -624,11 +624,12 @@ copy as for any run, and then, in `Plan the settings release`:
    seconds after it starts, and passes it as `--deadline` to each of its
    three network reads: this one, rule 5's and rule 6's. The status wait ends 15 seconds
    before the deadline, starts no request with under 2 seconds of the wait
-   left, and bounds each read by the time left, so an app that never settles
-   reaches the rollout refusal with its sentence, unless GitHub's token
-   endpoint is slow on the last status pass (each mint has its own fixed 20
-   seconds): then the backstop below ends the read and the run fails as a fault
-   with the deadline sentence, never with a wrong decision. At the deadline
+   left, and bounds each read by the time left, its token mint included (the
+   mint is given the time left in the wait, at most its usual 20 seconds), so
+   an app that never settles reaches the rollout refusal with its sentence,
+   naming the seconds it waited: a mint that has not succeeded when the wait
+   ends, after the app was seen rolling out, ends the wait like any other
+   read. At the deadline
    itself a `SIGALRM` backstop stops a read that trickles past every socket
    timeout and fails the step with a sentence; each read disarms it and
    restores the previous handler as soon as it decides, so it cannot fire

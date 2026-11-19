@@ -1034,8 +1034,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             "wacd-contract.py fetch": "source=hemi\nrevision=7\nfleet_commit=" + "f" * 40 + "\nreason=r",
             "wacd-contract.py pr": "source=hemi\nrevision=7",
             "wacd-profile.py": "app=app\ntag_prefix=v",
-            "wacd-release.py running": (f"running=1.4.2\ncommit={head}\nimages={json.dumps(running)}\n"
-                                        "copy_revision=6\nfleet_commit=" + "f" * 40),
+            "wacd-release.py running": f"running=1.4.2\ncommit={head}\nimages={json.dumps(running)}\ncopy_revision=6",
             "wacd-release.py earlier-release": "reuse=",
             "wacd-release.py unfinished-release": "unfinished=none",
             "wacd-release.py": "Verified",
@@ -1460,7 +1459,7 @@ class ReusableWorkflowTests(unittest.TestCase):
 
     def settings_plan(self, *, running="1.4.2", copy_revision="7", revision="7", source="hemi", charts=None,
                       workflow_change=False, rollback=False, extra_tags=(), claim="pushed", profile_images=None,
-                      running_copy="6", status_exit=0, earlier="reuse=", running_fleet="f" * 40, status_err=None,
+                      running_copy="6", status_exit=0, earlier="reuse=", status_err=None,
                       published=("1.3.9", "1.4.2"), unfinished_err=None):
         """Run plan's settings steps against a temp repo, real wacd-version.py and stub gateway and registry reads.
 
@@ -1515,8 +1514,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         source_commit = old if rollback else code
         images = {"web": {"repository": "localhost:30500/web", "tag": running,
                           "digest": "sha256:" + ("d" if rollback else "e") * 64}}
-        charts = {**(charts or {}), running: {"revision": source_commit, "images": images, "copy": running_copy,
-                                              "fleet": running_fleet}}
+        charts = {**(charts or {}), running: {"revision": source_commit, "images": images, "copy": running_copy}}
         log = tmp / "log"
         log.write_text("")
         (scripts / "wacd-release.py").write_text(
@@ -1559,7 +1557,6 @@ class ReusableWorkflowTests(unittest.TestCase):
             "print('commit=' + chart['revision'])\n"
             "print('images=' + json.dumps(chart['images'], separators=(',', ':'), sort_keys=True))\n"
             "print('copy_revision=' + chart['copy'])\n"
-            "print('fleet_commit=' + chart['fleet'])\n"
         )
         (scripts / "wacd-chart.py").write_text(
             "import json, os, sys\n"
@@ -1802,9 +1799,8 @@ class ReusableWorkflowTests(unittest.TestCase):
                                        r"--running 1\.4\.2 --versions 1\.4\.3 --claimed 1\.4\.3 --deadline \d+$")
 
     def test_wac_cd_settings_rerun_of_the_live_revision_after_another_apps_save_re_proves_it(self):
-        """The copy's fleet commit is wac.fleet's head, which moves with every app's save, so it decides nothing."""
-        plan = self.settings_plan(running="1.4.3", running_copy="7", extra_tags=(("v1.4.3", "code"),),
-                                  running_fleet="a" * 40)
+        """The copy's fleet commit is wac.fleet's head, which moves with every app's save, so it is not read."""
+        plan = self.settings_plan(running="1.4.3", running_copy="7", extra_tags=(("v1.4.3", "code"),))
         self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
         self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
         self.assertEqual((plan["version_outputs"]["mode"], plan["version_outputs"]["version"]), ("settings", "1.4.3"),

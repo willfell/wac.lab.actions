@@ -115,7 +115,7 @@ class Script:
         self.responses = list(responses)
         self.bodies = []
 
-    def __call__(self, body, trust, timeout):
+    def __call__(self, body, trust, timeout, mint_timeout=None):
         self.bodies.append(body)
         if len(self.responses) > 1:
             return self.responses.pop(0)
@@ -548,7 +548,7 @@ class SettingsModeTests(unittest.TestCase):
             self.assertEqual(json.loads(Path(receipt).read_text())["wac_cd"], plan)
 
 
-RELEASE = {"digest": CHART_DIGEST, "revision": SOURCE, "images": IMAGES, "copy": "6", "fleet_commit": "f" * 40}
+RELEASE = {"digest": CHART_DIGEST, "revision": SOURCE, "images": IMAGES, "copy": "6"}
 
 
 def unsteady(change):
@@ -603,8 +603,7 @@ class RunningTests(unittest.TestCase):
         self.assertEqual(
             out.splitlines(),
             [f"running={VERSION}", f"commit={SOURCE}",
-             "images=" + json.dumps(IMAGES, separators=(",", ":"), sort_keys=True), "copy_revision=6",
-             "fleet_commit=" + "f" * 40],
+             "images=" + json.dumps(IMAGES, separators=(",", ":"), sort_keys=True), "copy_revision=6"],
         )
         self.assertEqual(script.bodies, [wacd.STATUS_BODY()], "one status read; nothing is released")
         self.assertEqual(reads, [("travel", VERSION)])
@@ -642,6 +641,13 @@ class RunningTests(unittest.TestCase):
                 self.assertEqual(len(err.strip().splitlines()), 1)
                 self.assertGreater(len(script.bodies), 1)
                 self.assertLessEqual(clock.now - 1000.0, 31)
+
+    def test_the_rollout_refusal_names_the_seconds_it_waited(self):
+        """The wait stops with under MIN_READ_SECONDS left, so the sentence says what was measured."""
+        _, _, clock, (code, _, err, _) = self.run_cli((200, unsteady(UNSTEADY["degraded"])), timeout="31")
+        self.assertEqual(code, 3, err)
+        self.assertEqual(clock.now - 1000.0, 30, "the last poll left one second, too little for a read")
+        self.assertIn("for the whole 30 seconds", err)
 
     def test_an_unknown_or_malformed_running_version_is_a_fault_not_a_rollout(self):
         for value in ("", "bootstrap", "v1.4.2", None, 7):
@@ -692,7 +698,7 @@ class RunningTests(unittest.TestCase):
         self.assertEqual(calls, [("registry.network.svc.cluster.local:5000", "travel", VERSION, 30.0)])
 
     def test_the_token_is_never_printed(self):
-        def explode(body, trust, timeout):
+        def explode(body, trust, timeout, mint_timeout=None):
             raise RuntimeError(f"Authorization: Bearer {TOKEN}")
 
         with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", explode):
@@ -710,7 +716,7 @@ fixture = json.loads(os.environ["DRIVER_FIXTURE"])
 wacd.DEADLINE_MARGIN = fixture["margin"]
 wacd.POLL_SECONDS = 0.2
 wacd.trust_context = lambda: None
-wacd.transport = lambda body, trust, timeout: (200, fixture["status"])
+wacd.transport = lambda body, trust, timeout, mint_timeout=None: (200, fixture["status"])
 wacd.read_release = lambda app, version, timeout=30: fixture["release"]
 wacd.read_copy = lambda app, version: "7"
 argv = [a.replace("DEADLINE", str(time.time() + fixture["deadline"])) for a in sys.argv[2:]]
@@ -781,7 +787,7 @@ class DeadlineTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 6, "a body dripping one byte at a time is cut off at the deadline")
 
     def test_a_stuck_status_read_ends_at_the_deadline(self):
-        def stuck(body, trust, timeout):
+        def stuck(body, trust, timeout, mint_timeout=None):
             time.sleep(30)
 
         started = time.monotonic()
@@ -849,7 +855,41 @@ class DeadlineTests(unittest.TestCase):
                 self.assertEqual(code, expected, err)
                 self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
                 self.assertIs(signal.getsignal(signal.SIGALRM), mine)
-        time.sleep(1.5)
+
+    def test_a_slow_token_mint_on_the_last_pass_still_ends_in_the_rollout_refusal(self):
+        """GitHub's token endpoint answers after six seconds once the app has been seen rolling out.
+
+        The fake endpoint honours the timeout it is given, as a socket does: it answers when its delay
+        fits and fails as a transport error when it does not. The status wait is four seconds and the
+        backstop five, so an unbounded mint outlasts both.
+        """
+        gateway = Recorder(200, unsteady(UNSTEADY["out of sync"]))
+        self.addCleanup(gateway.close)
+        mints = []
+
+        def token_endpoint(request, context, timeout):
+            delay = 6 if len(mints) >= 2 else 0
+            mints.append(timeout)
+            time.sleep(min(delay, timeout))
+            if delay > timeout:
+                raise ReleaseError("release transport failed; check TLS trust and service readiness")
+            return 200, {"value": TOKEN}
+
+        grant = {"ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.actions.githubusercontent.com/token",
+                 "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "runner-bearer"}
+        started = time.monotonic()
+        with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd.ci, "URL", gateway.url), \
+                patch.object(wacd.ci, "fetch", token_endpoint), \
+                patch.object(wacd, "read_release", lambda app, version, timeout=30: RELEASE), \
+                patch.object(wacd, "DEADLINE_MARGIN", 1), patch.object(wacd, "POLL_SECONDS", 0.2), \
+                patch.dict(os.environ, grant):
+            code, out, err = CliTests.main(
+                self, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", str(time.time() + 5))
+        self.assertEqual((code, out), (wacd.ROLLING_OUT_EXIT, ""), err)
+        self.assertIn("travel was rolling out 0.1.0", err)
+        self.assertGreaterEqual(len(gateway.requests), 2, "the app was seen rolling out before the slow mint")
+        self.assertLess(time.monotonic() - started, 5, "decided before the backstop")
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
 
 class EarlierReleaseTests(unittest.TestCase):
