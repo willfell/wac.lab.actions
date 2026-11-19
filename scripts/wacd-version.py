@@ -13,9 +13,10 @@ registry. A tagged HEAD whose chart is absent (`false`) is built and published
 again, which is how a version is recovered after a registry loss and how a HEAD
 tagged by an older pipeline gets its first chart. `true` and `unknown` resume.
 
-A deploying run whose HEAD's highest tag is lower than the highest tag with the
-prefix merged into origin/main fails: what is running changes by a rollback
-or a new release, never by replaying an old build.
+A deploying run fails when origin/main carries a tag with the prefix that HEAD
+does not contain, or when HEAD's highest tag is lower than the highest tag with
+the prefix on origin/main: what is running changes by a rollback or a new
+release, never by replaying an old build.
 """
 
 import argparse
@@ -116,6 +117,25 @@ def tag_lines(repo, *args):
     return [line for line in git(repo, "tag", *args).splitlines() if line]
 
 
+def replaced_by(tag):
+    return (
+        f"This commit is older than {tag}, which is already published and contains "
+        "or replaces it. Roll back or release anew; an old build is never replayed."
+    )
+
+
+def published_tags(repo, prefix, main_ref):
+    if commit_of_ref(repo, main_ref) is None:
+        raise VersionError(
+            f"{main_ref} is not in the checkout, so the newest published version cannot be judged; fetch with full depth"
+        )
+    on_main = tag_lines(repo, "--merged", main_ref)
+    in_head = set(tag_lines(repo, "--merged", "HEAD"))
+    newest = newest_tag(on_main, prefix)
+    unmerged = newest_tag([tag for tag in on_main if tag not in in_head], prefix)
+    return newest, unmerged
+
+
 def plan(
     repo, prefix, source, caller_version, deploy=True, published="unknown", main_ref=MAIN_REF
 ):
@@ -140,16 +160,14 @@ def plan(
     if at_head:
         parsed, tag = max(at_head)
         if deploy:
-            if commit_of_ref(repo, main_ref) is None:
-                raise VersionError(
-                    f"{main_ref} is not in the checkout, so the newest published version cannot be judged; fetch with full depth"
-                )
-            newest = newest_tag(tag_lines(repo, "--merged", main_ref), prefix)
+            newest, unmerged = published_tags(repo, prefix, main_ref)
             if newest is not None and parsed < newest[0]:
                 raise VersionError(
                     f"This run is for {tag}, but {newest[1]} is already published. "
                     "Roll back or release anew; an old build is never replayed."
                 )
+            if unmerged is not None:
+                raise VersionError(replaced_by(unmerged[1]))
         result = {
             "mode": "release" if published == "false" else "resume",
             "version": ".".join(str(part) for part in parsed),
@@ -173,6 +191,11 @@ def plan(
             log = git(repo, "log", "--format=%B%x00", f"refs/tags/{prefix}{latest}..HEAD")
         messages = [m.strip("\n") for m in log.split("\0") if m.strip()]
         new = bump(latest, messages)
+
+    if deploy:
+        _, unmerged = published_tags(repo, prefix, main_ref)
+        if unmerged is not None:
+            raise VersionError(replaced_by(unmerged[1]))
 
     tag = f"{prefix}{new}"
     existing = commit_of(repo, tag)

@@ -425,7 +425,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                 cwd=repo, check=True, capture_output=True, text=True,
             ).stdout.strip()
 
-        def run(case_head, rollback="", extra_commit=False, origin=True):
+        def run(case_head, rollback="", extra_commit=False, origin=True, untagged_old=False):
             with tempfile.TemporaryDirectory() as tmp:
                 tmp = Path(tmp)
                 repo, scripts = tmp / "repo", tmp / "scripts"
@@ -436,12 +436,16 @@ class ReusableWorkflowTests(unittest.TestCase):
                 git(repo, "commit", "--allow-empty", "-q", "-m", "feat: first")
                 first = git(repo, "rev-parse", "HEAD")
                 git(repo, "tag", "v0.1.0")
+                git(repo, "commit", "--allow-empty", "-q", "-m", "fix: failed before it was tagged")
+                old = git(repo, "rev-parse", "HEAD")
                 git(repo, "commit", "--allow-empty", "-q", "-m", "feat: second")
                 git(repo, "tag", "v0.2.0")
                 if origin:
                     git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
                 if case_head == "first":
                     git(repo, "checkout", "-q", first)
+                if untagged_old:
+                    git(repo, "checkout", "-q", old)
                 if extra_commit:
                     git(repo, "commit", "--allow-empty", "-q", "-m", "fix: next")
                 head = git(repo, "rev-parse", "HEAD")
@@ -481,6 +485,14 @@ class ReusableWorkflowTests(unittest.TestCase):
         result, outputs, _ = run("main", extra_commit=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((outputs["mode"], outputs["version"]), ("release", "0.2.1"))
+
+        result, outputs, summary = run("main", untagged_old=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(outputs, {})
+        old_sentence = ("This commit is older than v0.2.0, which is already published and contains or replaces it. "
+                        "Roll back or release anew; an old build is never replayed.")
+        self.assertIn(old_sentence, result.stderr)
+        self.assertIn(old_sentence, summary)
 
         result, outputs, _ = run("main", rollback="0.1.0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

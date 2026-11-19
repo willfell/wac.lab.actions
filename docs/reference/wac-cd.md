@@ -305,20 +305,27 @@ the version being released, it fails naming both and pointing at a rollback
 dispatch. A rollback skips that refusal; an equal, older or non-`X.Y.Z`
 running version (the bootstrap tag before the first release) proceeds.
 
-**No replay of an old version.** A `resume` or `release` run whose HEAD's
-highest tag is lower than the highest `<tag_prefix>X.Y.Z` tag merged into
-`origin/main` (the same tags and the same version order that pick the next
-version) fails `plan` with `This run is for <tag>, but <newest> is already
-published. Roll back or release anew; an old build is never replayed.`, in the
-run summary and on stderr, before the chart is checked or anything is built.
-Only tags on `main` count, so a stray higher tag on another branch cannot block
-a re-run; the full-depth checkout `plan` already makes carries `origin/main`,
-and a checkout without it fails the plan rather than judging by every tag. A
-commit carrying several tags counts by its highest, so a re-run of the newest
-version still resumes. What is running changes by a rollback or a new release,
-never by replaying an old build. A rollback is not refused: it names its
-version and does not consult this rule. A `deploy: false` run is not refused
-either, since it never deploys.
+**No replay of an old version.** A `release` or `resume` run is refused when
+`origin/main` carries a `<tag_prefix>X.Y.Z` tag that HEAD does not contain, tagged
+HEAD or not (a re-run of a run whose first attempt failed before it tagged, for
+instance), or when HEAD's highest tag is lower than the highest tag on
+`origin/main`. The same tags and the same version order that pick the next
+version are used. A tagged HEAD gets `This run is for <tag>, but <newest> is
+already published. Roll back or release anew; an old build is never replayed.`
+An untagged HEAD, or a tagged one that lacks a tag on main, gets `This commit is
+older than <tag>, which is already published and contains or replaces it. Roll
+back or release anew; an old build is never replayed.` The sentence goes to the
+run summary and stderr, and `plan` fails before the chart is checked, before
+`claim-tag` pushes a tag and before anything is built, so no tag or chart is
+left behind. Only tags on `main` count, so a stray tag on another branch cannot
+block a run; the full-depth checkout `plan` already makes carries `origin/main`,
+and a checkout without it fails the plan rather than judging by every tag. The
+tip of `main`, and a re-run of the newest version (every tag on `main` is then
+contained in HEAD), proceed as before; a commit carrying several tags counts by
+its highest. What is running changes by a rollback or a new release, never by
+replaying an old build. A rollback is not refused: it names its version and does
+not consult this rule. A `deploy: false` run is not refused either, since it
+never deploys.
 
 **Rollback** is a `workflow_dispatch` of `cd.yml` with `version`. `plan` reads
 the chart's recorded revision and requires it to be an ancestor of `main`;

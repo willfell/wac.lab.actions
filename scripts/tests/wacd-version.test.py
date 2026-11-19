@@ -192,6 +192,58 @@ class RepoTest(unittest.TestCase):
             "This run is for v0.1.0, but v0.3.0 is already published", self.refusal()
         )
 
+    def old_untagged_commit(self):
+        self.commit("feat: first")
+        self.tag("v1.4.0")
+        old = self.commit("fix: failed before it was tagged")
+        self.commit("feat: next")
+        self.tag("v1.5.0")
+        git(self.repo, "checkout", "-q", old)
+
+    def test_an_old_untagged_commit_behind_a_newer_tag_is_refused(self):
+        self.old_untagged_commit()
+        sentence = (
+            "This commit is older than v1.5.0, which is already published and "
+            "contains or replaces it. "
+            "Roll back or release anew; an old build is never replayed."
+        )
+        self.assertEqual(self.refusal(), sentence)
+        self.assertEqual(self.refusal(source="caller", caller="9.0.0"), sentence)
+        self.assertEqual(self.plan(source="caller", caller="")["mode"], "none")
+
+    def test_an_untagged_head_that_is_mains_tip_releases_above_the_newest(self):
+        self.old_untagged_commit()
+        git(self.repo, "checkout", "-q", "main")
+        self.commit("fix: after 1.5.0")
+        self.assertEqual(
+            self.plan(), {"mode": "release", "version": "1.5.1", "tag": "v1.5.1"}
+        )
+        self.assertEqual(
+            self.plan(source="caller", caller="2.0.0")["version"], "2.0.0"
+        )
+
+    def test_a_tag_on_main_that_a_tagged_head_does_not_contain_refuses_it(self):
+        self.commit("feat: base")
+        base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "checkout", "-q", "-b", "side")
+        self.commit("feat: side")
+        self.tag("v0.1.5")
+        git(self.repo, "checkout", "-q", "main")
+        self.commit("feat: head")
+        self.tag("v0.3.0")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+        git(self.repo, "checkout", "-q", "main~1")
+        self.assertEqual(
+            self.refusal(),
+            "This commit is older than v0.1.5, which is already published and "
+            "contains or replaces it. "
+            "Roll back or release anew; an old build is never replayed.",
+        )
+
+    def test_publish_only_runs_are_not_judged_for_a_new_version(self):
+        self.old_untagged_commit()
+        self.assertEqual(self.plan(deploy=False)["mode"], "publish")
+
     def test_a_missing_main_ref_fails_instead_of_judging_by_every_tag(self):
         self.two_releases()
         message = self.refusal(main_ref="origin/main")
