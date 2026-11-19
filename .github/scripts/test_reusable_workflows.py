@@ -1512,6 +1512,31 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(first["name"], "Require the contract job's success")
                 self.assertEqual(first["env"], {"CONTRACT_RESULT": "${{ needs.contract.result }}"})
 
+    def test_wac_ci_contract_job_runs_on_the_callers_runner(self):
+        def runs_on(expression, inputs, variables):
+            body = re.fullmatch(r"\$\{\{ (.*) \}\}", expression).group(1)
+            for term in body.split(" || "):
+                scope, name = term.split(".")
+                value = {"inputs": inputs, "vars": variables}[scope].get(name, "")
+                if value:
+                    return value
+            return ""
+
+        expression = self.wac_ci()["jobs"]["contract"]["runs-on"]
+        variables = {"CI_RUNNER_SMALL": "ci-light", "CI_RUNNER_STANDARD": "ci-standard"}
+        for inputs, expected in (({"runner": "ci-standard"}, "ci-standard"), ({"runner": ""}, "ci-light"),
+                                 ({"runner": "", "build_runner": "ci-large"}, "ci-light"),
+                                 ({"runner": "ci-standard", "build_runner": "ci-large"}, "ci-standard")):
+            with self.subTest(inputs=inputs):
+                self.assertEqual(runs_on(expression, inputs, variables), expected)
+
+    def test_wac_ci_contract_job_is_the_check_the_rulesets_require(self):
+        """The organisation ruleset requires `wacd-ci / contract`: the caller's job id, then this job's id."""
+        jobs = self.wac_ci()["jobs"]
+        self.assertIn("contract", jobs)
+        self.assertNotIn("name", jobs["contract"], "a name would replace `contract` in the check's name")
+        self.assertNotIn("if", jobs["contract"], "a skipped contract job would count as passing")
+
     def test_wac_ci_a_job_after_a_failed_contract_job_fails_rather_than_passing(self):
         import subprocess
 
