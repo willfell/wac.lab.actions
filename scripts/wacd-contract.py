@@ -80,8 +80,9 @@ dropping `id-token` from its own ci.yml:
 | 200 `files` | absent | absent | fails: wait for the restore pull request (or, for a new app, nothing to check) |
 | 200 `files` | present | any | the files, as before |
 | anything else | present | present | the files, as before; the summary names hemi's status |
-| anything else | present | removes one | fails: hemi did not answer and the pull request removes the files |
-| 401 or 403 | absent | any | fails: hemi refused the token (or the event, outside `pull_request`); register a new app first |
+| anything else | present | removes one | fails: the cause (silence, a refused token, a status, a runner outside the cluster, ...) and that the pull request removes the files |
+| 403 `{"error":"not registered"}` | absent | any | fails: hemi does not know the app; register it, wait for hemi to list it, re-run |
+| any other 401 or 403 | absent | any | fails: hemi refused the token (or the event, outside `pull_request`); a new app registers first, a cut-over one waits for hemi to admit the run |
 | no answer, a timeout or 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
 | an address that does not resolve, three times | absent | any | fails: the job must run on a Lab runner |
 | no token minted | absent | any | fails: GitHub would not mint a job token |
@@ -90,17 +91,28 @@ dropping `id-token` from its own ci.yml:
 "Files on main" is `.github/wacd.json` on main, the profile that holds the
 gates; the paths checked in the merge commit are that file, the values path
 main's profile names and the copy's `delivery.valuesFile`. A `files` answer is
-read for its source alone: hemi answers a registered app that was never cut
-over with `version`, `identity.repositoryId`, `identity.repository`,
-`identity.app` and `flags.source` and nothing else, so only `flags.source` is
-required, and `identity.repositoryId`, when present, must be the token's. A
+read for its source and repository: hemi answers a registered app that was
+never cut over with `version`, `identity.repositoryId`, `identity.repository`,
+`identity.app` and `flags.source` and nothing else, so `flags.source` and an
+`identity.repositoryId` equal to the token's are required. A
 `hemi` answer is read in full. A 200 that cannot be read, names another
 repository than the token's or does not derive a profile is treated as an
-answer but a 200, and so is a job with no `id-token` grant.
-No answer, a 5xx and an address that does not resolve are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
+answer but a 200, and so is a job with no `id-token` grant. A 403's body is
+read only to tell hemi's `{"error":"not registered"}` apart, at most
+MAX_REFUSAL_BODY bytes, and only exactly that: UTF-8 with no BOM, one object
+whose one key is `error` and whose value is that string, no key twice. A
+longer body, or any other, reads as any other 403.
+No answer (a connection closed or reset after the request, or an answer
+shorter than its Content-Length), a 5xx and an address that does not resolve are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
 apart; each attempt, token mint included, is bounded at PR_ATTEMPT_SECONDS by
 a worker thread, so a reply that trickles in counts as silence. On success it prints
-`source=hemi|files` and `revision=<n>|`, and with source `hemi` leaves
+`source=hemi|files`, `revision=<n>|` and `docs_paths=<JSON list>|` (wacd-docs.py's
+effective documentation patterns of the settings the run uses: hemi's copy,
+checked against the values path its `delivery.valuesFile` names as
+`--contract` and wac-cd's plan check it, or
+with source `files` the merge commit's `.github/wacd.json`; empty when that
+list cannot be read or is refused, which wac-ci's `scope` job reads as "run
+the checks", and the `checks` job then refuses it with its sentence), and with source `hemi` leaves
 `contract.json`, `profile.json` and `values.json` under `<out>` as `fetch`
 does; otherwise `<out>` is removed. A failure prints one `wacd contract:`
 line to stderr and exits 1. Either way the job summary says why, naming hemi's
@@ -144,14 +156,14 @@ CONTRACT_BODY = {"operation": "contract"}
 FIRST_POLL_SECONDS = 5
 MAX_POLL_SECONDS = 30
 MAX_WAIT = release.MAX_WAIT
-# plan's job timeout (40 minutes) is sized for this wait plus its other steps,
+# plan's job timeout (72 minutes) is sized for this wait plus its other steps,
 # and a workflow test ties the two. A larger wait_timeout still bounds deploy,
 # but plan stops here so it fails with its summary line, not the job timeout.
 PLAN_WAIT_CAP = 2100
 # The gateway's Deployment is Recreate: a rollout leaves about 35 s with no
 # endpoint. A refused or reset connection is retried for at most this long
 # from the first refusal in a row, and never past the overall wait.
-RESTART_WINDOW = 90
+RESTART_WINDOW = release.RESTART_WINDOW
 # The gateway answers a token it could not check (a failed signing-key fetch,
 # a busy replay store) with the same uncoded 403 as a caller it refuses, so an
 # uncoded 403 is asked this many times in all, UNCODED_PAUSE seconds apart.
@@ -172,9 +184,15 @@ PR_ATTEMPT_SECONDS = 15
 GIT_SECONDS = 30
 MAX_ANSWER = 1048576
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-RUNNER_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+RUNNER_NAME = re.compile(r"[A-Za-z0-9_.-](?:[A-Za-z0-9 _.-]{0,98}[A-Za-z0-9_.-])?")
 EVENT_NAME = re.compile(r"[a-z_]{1,40}")
 GRANT_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+MAX_REFUSAL_BODY = 4096
+NOT_REGISTERED = "not registered"
+NEW_OR_CUT_OVER = (
+    "if {app} is new, register it with lab first and re-run; if it is cut over, its settings live in hemi "
+    "and the checks cannot run until hemi admits this run."
+)
 CUT_OVER_CLAUSE = "{app}'s settings live in hemi, so the checks cannot run"
 CUT_OVER = CUT_OVER_CLAUSE + "."
 UNREACHABLE = (
@@ -186,7 +204,34 @@ PR_SENTENCES = {
     "added_back": "{path} was added back; {app}'s settings live in hemi.",
     "changed": "{path} was changed; {app}'s settings live in hemi, so change them there.",
     "stale": "This run's merge commit is older than {app}'s clean-up; update the branch and re-run.",
-    "removed": "hemi did not answer, and this pull request removes {app}'s files; re-run when hemi answers.",
+    "removed_silent": "hemi did not answer, and this pull request removes {app}'s files; re-run when hemi answers.",
+    "removed_refused": (
+        "hemi refused this pull request's token (HTTP {status}), and this pull request removes {app}'s files; "
+        "if {app} is new, register it with lab first and re-run."
+    ),
+    "removed_refused_event": (
+        "hemi refused the job token of this {event} run (HTTP {status}): it admits wac-ci only for "
+        "pull_request runs, and this pull request removes {app}'s files."
+    ),
+    "removed_status": (
+        "hemi answered HTTP {status}, and this pull request removes {app}'s files; re-run once hemi serves "
+        "this repository."
+    ),
+    "removed_unreachable": (
+        "the contract job must run on a Lab runner: {runner} cannot reach hemi's in-cluster address, and this "
+        "pull request removes {app}'s files. Pass a Lab pool as `runner`."
+    ),
+    "removed_no_mint": (
+        "GitHub would not mint a job token for hemi, and this pull request removes {app}'s files; re-run the checks."
+    ),
+    "removed_no_grant": (
+        "no job token for hemi: the caller's ci.yml must grant id-token: write, and this pull request removes "
+        "{app}'s files."
+    ),
+    "removed_unreadable": (
+        "hemi's answer could not be read, and this pull request removes {app}'s files; re-run once hemi "
+        "serves this repository."
+    ),
     "still_on_main": (
         "{path} is still on main until hemi's clean-up pull request merges; hemi's settings were used."
     ),
@@ -214,10 +259,14 @@ PR_SENTENCES = {
     "no_mint_files": "GitHub would not mint a job token for hemi; using the repository's files.",
     "unreachable_files": UNREACHABLE,
     "unreadable_files": "hemi's answer could not be read; using the repository's files.",
-    "refused": "hemi refused this pull request's token (HTTP {status}); " + CUT_OVER_CLAUSE + "; " + REGISTER_FIRST,
+    "refused": "hemi refused this pull request's token (HTTP {status}): " + NEW_OR_CUT_OVER,
     "refused_event": (
         "hemi refused the job token of this {event} run (HTTP {status}): it admits wac-ci only for "
-        "pull_request runs, and " + CUT_OVER_CLAUSE + "; " + REGISTER_FIRST
+        "pull_request runs; " + NEW_OR_CUT_OVER
+    ),
+    "not_registered": (
+        "hemi does not know {app}: it is not registered with lab, or hemi holds no active copy of its settings. "
+        "If it is new, register it (lab:lab-onboard-app), wait for hemi to list it, then re-run the checks."
     ),
     "silent": "hemi did not answer; re-run when it does.",
     "no_mint": "GitHub would not mint a job token for hemi; re-run the checks.",
@@ -323,6 +372,7 @@ def ask(trust, wait):
         try:
             status, value, token = post(trust, max(1, deadline - time.monotonic()))
         except release.Unanswered:
+            last_uncoded = False
             now = time.monotonic()
             refused_since = now if refused_since is None else refused_since
             if now - refused_since >= RESTART_WINDOW:
@@ -540,7 +590,9 @@ def hemi_attempt():
 
     Without an answer the status says why instead: "no_mint" when GitHub
     minted no token, "unreachable" when hemi's address does not resolve (a
-    runner outside the cluster), and None for silence.
+    runner outside the cluster), and None for silence, which includes a
+    connection reset after the request was sent and an answer shorter than
+    the Content-Length it declares.
     """
     try:
         token = shadow.oidc_token()
@@ -553,18 +605,58 @@ def hemi_attempt():
     try:
         response = opener.open(request, timeout=PR_ATTEMPT_SECONDS)
     except urllib.error.HTTPError as error:
+        body = None
+        if error.code == 403:
+            try:
+                body = error.read(MAX_REFUSAL_BODY + 1)
+            except (OSError, ValueError, http.client.HTTPException):
+                body = None
         error.close()
-        return error.code, None, token
+        return error.code, body, token
     except urllib.error.URLError as error:
         return ("unreachable" if isinstance(error.reason, socket.gaierror) else None), None, token
     except (OSError, ValueError, http.client.HTTPException):
         return None, None, token
     try:
         with response:
+            declared = response.length
             raw = response.read(MAX_ANSWER + 1)
     except (OSError, ValueError, http.client.HTTPException):
         return None, None, token
+    if declared is not None and len(raw) < min(declared, MAX_ANSWER + 1):
+        return None, None, token
     return response.status, raw, token
+
+
+class DuplicateKey(ValueError):
+    """A JSON object names one key twice."""
+
+
+def unique_keys(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise DuplicateKey("duplicate key")
+    return dict(pairs)
+
+
+def not_registered(raw):
+    """True only when a 403's body is exactly hemi's {"error": "not registered"}.
+
+    The body must be UTF-8 with no BOM and decode to a JSON object with one
+    key, `error`, whose value is the string NOT_REGISTERED; whitespace and
+    escapes that decode to the same text are the same body. A duplicate key,
+    another key, another encoding (json.loads would guess UTF-16 or UTF-32
+    from bytes, so the bytes are decoded here first), anything longer than
+    MAX_REFUSAL_BODY, or any other shape reads as an uncoded 403. The body is
+    the server's and is never printed.
+    """
+    if not isinstance(raw, bytes) or len(raw) > MAX_REFUSAL_BODY:
+        return False
+    try:
+        body = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_keys)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return False
+    return type(body) is dict and body == {"error": NOT_REGISTERED}
 
 
 def bounded_attempt():
@@ -577,7 +669,7 @@ def bounded_attempt():
 
 
 def ask_hemi():
-    """("ok", copy), ("status", code) or (silent | no_mint | unreachable | no_grant | unreadable, None).
+    """("ok", copy), ("status", code), ("not_registered", 403) or (silent | no_mint | unreachable | no_grant | unreadable, None).
 
     Silence, a 5xx, a token GitHub would not mint and an address that does
     not resolve are asked again: a lookup can fail once on a Lab runner, and
@@ -599,6 +691,8 @@ def ask_hemi():
         if status is None or 500 <= status <= 599:
             last = "silent"
             continue
+        if status == 403 and not_registered(raw):
+            return "not_registered", status
         if status != 200:
             return "status", status
         copy = read_pr_copy(raw, token)
@@ -609,11 +703,10 @@ def ask_hemi():
 def read_pr_copy(raw, token):
     """hemi's answer to a pull request's job, or None when it cannot be used.
 
-    A `files` answer is read for flags.source alone, and for
-    identity.repositoryId when present, which must be the token's: hemi answers
-    a registered app that was never cut over with no revision and no settings
-    document, and the pull request runs on its own files whatever else the
-    answer holds. A `hemi` answer is checked as fetch checks the gateway's copy.
+    A `files` answer is read for flags.source and identity.repositoryId,
+    which must be the token's: hemi answers a registered app that was never
+    cut over with no revision and no settings document, and the pull request
+    runs on its own files whatever else the answer holds. A `hemi` answer is checked as fetch checks the gateway's copy.
     """
     if raw is None or len(raw) > MAX_ANSWER:
         return None
@@ -627,10 +720,9 @@ def read_pr_copy(raw, token):
     if not isinstance(flags, dict) or flags.get("source") not in SOURCES:
         return None
     if flags["source"] == "files":
-        if isinstance(identity, dict) and "repositoryId" in identity:
-            owner = token_repository_id(token) if token else None
-            if owner is None or identity["repositoryId"] != owner:
-                return None
+        owner = token_repository_id(token) if token else None
+        if not isinstance(identity, dict) or owner is None or identity.get("repositoryId") != owner:
+            return None
         return copy
     if (
         type(copy.get("version")) is not int
@@ -684,8 +776,29 @@ def files_answer(copy):
     return app, chart.revision_annotation(revision)
 
 
+def effective_docs_paths(data):
+    """The compact JSON of a profile's effective documentation patterns, or "" when unreadable or refused."""
+    if not isinstance(data, dict) or not isinstance(data.get("ci"), dict):
+        return ""
+    try:
+        patterns = profile.docs.check_docs_paths(data["ci"], "ci", data)
+    except profile.ProfileError:
+        return ""
+    return json.dumps(patterns, separators=(",", ":"))
+
+
+def head_docs_paths(head):
+    """effective_docs_paths of the merge commit's .github/wacd.json, read as data."""
+    try:
+        raw = git(head, ["cat-file", "blob", f"HEAD:{FILES_PROFILE.as_posix()}"], "pull request's tree")
+        data = json.loads(raw)
+    except (Refusal, ValueError):
+        return ""
+    return effective_docs_paths(data)
+
+
 def pull_request(out, main, head):
-    """Decide a pull request's settings source; returns (source, revision, sentences)."""
+    """Decide a pull request's settings source; returns (source, revision, sentences, docs_paths)."""
     clear(out)
     profile_path = FILES_PROFILE.as_posix()
     on_main = tree_entries(main, [profile_path], "default branch's tree")
@@ -695,17 +808,28 @@ def pull_request(out, main, head):
         if values is not None:
             paths.append(values)
     outcome, answer = ask_hemi()
+    unknown_app = outcome == "not_registered"
+    if unknown_app:
+        outcome = "status"
     files_on_main = profile_path in on_main
     if outcome != "ok":
+        app, event = repository_name(), event_name()
+        refused = "refused" if event == "pull_request" else "refused_event"
         if files_on_main:
             if set(paths) - set(tree_entries(head, paths, "pull request's tree")):
-                raise Refusal(PR_SENTENCES["removed"].format(app=repository_name()))
-            return "files", "", [PR_SENTENCES[f"{outcome}_files"].format(status=answer, runner=runner_name())]
-        app, event = repository_name(), event_name()
+                cause = outcome
+                if outcome == "status":
+                    cause = refused if answer in (401, 403) else "status"
+                raise Refusal(PR_SENTENCES["removed_" + cause].format(
+                    app=app, status=answer, runner=runner_name(), event=event))
+            return "files", "", [PR_SENTENCES[f"{outcome}_files"].format(status=answer, runner=runner_name())], \
+                head_docs_paths(head)
         if outcome == "status":
             key = "status"
-            if answer in (401, 403):
-                key = "refused" if event == "pull_request" else "refused_event"
+            if unknown_app:
+                key = "not_registered"
+            elif answer in (401, 403):
+                key = refused
             raise Refusal(PR_SENTENCES[key].format(status=answer, app=app, event=event))
         raise Refusal(PR_SENTENCES[outcome].format(app=app, runner=runner_name()))
     copy = answer
@@ -713,10 +837,12 @@ def pull_request(out, main, head):
         app, revision = files_answer(copy)
         if files_on_main:
             key = "files" if revision else "new"
-            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)]
+            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)], \
+                head_docs_paths(head)
         if profile_path in tree_entries(head, [profile_path], "pull request's tree"):
             key = "restore" if revision else "new"
-            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)]
+            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)], \
+                head_docs_paths(head)
         raise Refusal(PR_SENTENCES["returning" if revision else "new_nothing"].format(app=app))
     app, revision = copy["identity"]["app"], chart.revision_annotation(copy["identity"]["revision"])
     paths.append(copy["delivery"]["valuesFile"])
@@ -736,7 +862,8 @@ def pull_request(out, main, head):
     derived = profile.from_contract(copy, profile.DERIVED_VALUES)
     write(out, {"contract.json": copy, "profile.json": derived, "values.json": copy["runtime"]})
     notes = [PR_SENTENCES["still_on_main"].format(path=path) for path in kept]
-    return "hemi", revision, [PR_SENTENCES["hemi"].format(revision=revision), *notes]
+    as_released = profile.from_contract(copy, copy["delivery"]["valuesFile"])
+    return "hemi", revision, [PR_SENTENCES["hemi"].format(revision=revision), *notes], effective_docs_paths(as_released)
 
 
 def summarize(source, revision, commit, sentence):
@@ -795,7 +922,7 @@ def build_parser():
 def main_pr(args):
     out = Path(args.out)
     try:
-        source, revision, sentences = pull_request(out, Path(args.main), Path(args.head))
+        source, revision, sentences, docs_paths = pull_request(out, Path(args.main), Path(args.head))
     except Exception as error:
         sentence = str(error) if isinstance(error, Refusal) else PR_SENTENCES["unexpected"]
         try:
@@ -805,7 +932,7 @@ def main_pr(args):
         summarize_pr(None, None, [sentence])
         print("wacd contract: " + sentence, file=sys.stderr)
         return 1
-    print(f"source={source}\nrevision={revision}")
+    print(f"source={source}\nrevision={revision}\ndocs_paths={docs_paths}")
     summarize_pr(source, revision, sentences)
     return 0
 

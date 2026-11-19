@@ -8,6 +8,9 @@ CA_FILE, ReleaseError, NoRedirect and oidc_token(), minting a fresh token for
 every POST it sends with its own post(), which keeps a 403's refusal code that
 fetch() drops; wac.lab's .github/jobs/ci-deploy-proof.py uses URL, CA_FILE,
 oidc_token(), fetch() and migrated(). request() is this CLI's own transport.
+oidc_token() waits OIDC_TIMEOUT seconds for GitHub unless a caller passes a
+shorter bound; wacd-release.py's settings status read passes the time left in
+its wait.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from typing import Any
 URL = "https://ci-deploy.ci-deploy.svc.cluster.local:8443/v1/release"
 AUDIENCE = "wacwini:ci-deploy"
 CA_FILE = "/etc/ci-deploy/ca.crt"
+OIDC_TIMEOUT = 20
 
 
 class ReleaseError(Exception):
@@ -72,7 +76,7 @@ def fetch(
     return response.status, value
 
 
-def oidc_token() -> str:
+def oidc_token(timeout: float = OIDC_TIMEOUT) -> str:
     url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
     bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
     parsed = urllib.parse.urlsplit(url)
@@ -93,7 +97,7 @@ def oidc_token() -> str:
     status, value = fetch(
         urllib.request.Request(url, headers={"Authorization": "Bearer " + bearer}),
         ssl.create_default_context(),
-        20,
+        timeout,
     )
     token = value.get("value")
     if (

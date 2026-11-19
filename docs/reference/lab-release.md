@@ -50,7 +50,10 @@ loads. `wacd-release.py` (and `wacd-contract.py` through it) uses `URL`,
 `CA_FILE`, `NoRedirect`, `ReleaseError` and `oidc_token`, sending its own POST
 so that a 403's refusal code survives, and wac.lab's `.github/jobs/ci-deploy-proof.py`
 loads it from a checkout of this repo at its pinned tag and uses `CA_FILE`,
-`URL`, `fetch`, `oidc_token` and `migrated`. Renaming any of them breaks
+`URL`, `fetch`, `oidc_token` and `migrated`. `oidc_token` waits 20 seconds
+(`OIDC_TIMEOUT`) for GitHub unless its caller passes a shorter bound, as
+`wacd-release.py`'s settings status read does with the time left in its wait;
+this action and the denial proof pass none. Renaming any of them breaks
 `wac-cd` or wac.lab's denial proof at its next bump;
 `test_loaders_find_the_names_they_depend_on` in
 `scripts/tests/ci-release.test.py` fails first.

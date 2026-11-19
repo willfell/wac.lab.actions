@@ -16,6 +16,7 @@ import json
 import os
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -508,6 +509,24 @@ class AnswerTests(FetchCase):
                 self.assertEqual(len(self.gateway.seen), 1)
                 self.assertEqual(self.clock.sleeps, [5, 10])
 
+    def test_the_last_failure_names_the_cause_when_an_uncoded_denial_is_followed_by_silence(self):
+        """An uncoded 403, then nothing answers until the wait ends: the gateway could not be reached."""
+        real_post = contract.release.post
+        dead = self.dead_port_url()
+        attempts = []
+
+        def post(body, trust, timeout):
+            attempts.append(timeout)
+            with patch.object(contract.ci, "URL", self.gateway.url if len(attempts) == 1 else dead):
+                return real_post(body, trust, timeout)
+
+        with patch.object(contract.release, "post", post):
+            code = self.fetch((403, {}), wait=30)
+        self.assertRefused(code, "could not be reached")
+        self.assertNotIn("refused this run's token", self.stderr)
+        self.assertEqual(len(self.gateway.seen), 1)
+        self.assertGreater(len(attempts), 2, "the silence was asked again within the wait")
+
     def test_a_certificate_that_fails_verification_fails_at_once(self):
         def unverified(*args, **kwargs):
             raise ssl.SSLCertVerificationError(1, "certificate verify failed: self-signed certificate")
@@ -630,13 +649,21 @@ FILES = {
 }
 REPOSITORY = "wacwini/wac.app.travel"
 NO_ANSWER = "hemi did not answer; re-run when it does."
+NEW_OR_CUT_OVER = (f"if {REPOSITORY} is new, register it with lab first and re-run; if it is cut over, its "
+                   "settings live in hemi and the checks cannot run until hemi admits this run.")
+NOT_REGISTERED = (f"hemi does not know {REPOSITORY}: it is not registered with lab, or hemi holds no active copy "
+                  "of its settings. If it is new, register it (lab:lab-onboard-app), wait for hemi to list it, "
+                  "then re-run the checks.")
 
 
 class Hemi:
     """A stand-in for hemi's GET /api/v1/contract.
 
-    Each response is (status, body), (status, body, delay seconds) or "drop",
-    which closes the connection without an answer. The last one repeats.
+    Each response is (status, body), (status, body, delay seconds), "drop",
+    which closes the connection without an answer, "reset", which resets it
+    after the request was read, or "partial", which sends the status line,
+    the headers and half the body it declares, then closes. The last one
+    repeats.
     """
 
     def __init__(self, *responses):
@@ -651,6 +678,23 @@ class Hemi:
                 if response == "drop":
                     self.close_connection = True
                     self.connection.shutdown(2)
+                    return
+                if response == "reset":
+                    self.close_connection = True
+                    self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    self.connection.close()
+                    return
+                if response == "partial":
+                    raw = json.dumps(fixture_copy("hemi")).encode()
+                    self.close_connection = True
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw[:len(raw) // 2])
+                        self.wfile.flush()
+                    except OSError:
+                        pass
                     return
                 if response == "trickle":
                     raw = json.dumps(fixture_copy("hemi")).encode()
@@ -773,7 +817,8 @@ class PullRequestCase(unittest.TestCase):
         self.sleeps = []
         self.minted = []
         env = {"GITHUB_STEP_SUMMARY": str(self.summary), "GITHUB_REPOSITORY": REPOSITORY,
-               "GITHUB_EVENT_NAME": getattr(self, "event", "pull_request"), "JOB_RUNNER_NAME": "ci-light-abc12"}
+               "GITHUB_EVENT_NAME": getattr(self, "event", "pull_request"),
+               "JOB_RUNNER_NAME": getattr(self, "runner", "ci-light-abc12")}
         if self.grant:
             env.update({"ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.actions.githubusercontent.com/t",
                         "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "runner-bearer"})
@@ -903,9 +948,10 @@ class PullRequestDecisionTests(PullRequestCase):
                          "hemi holds no settings for travel yet, and neither main nor this pull request has "
                          ".github/wacd.json, so there is nothing to check.")
 
-    def test_a_files_answer_needs_only_its_source_and_a_repository_id_that_is_the_tokens(self):
+    def test_a_files_answer_needs_its_source_and_the_tokens_repository_id(self):
         for label, body, readable in (
-            ("the source alone", {"flags": {"source": "files"}}, True),
+            ("the source alone", {"flags": {"source": "files"}}, False),
+            ("an identity with no id", {"identity": {"app": "travel"}, "flags": {"source": "files"}}, False),
             ("an id that is the token's", {"identity": {"repositoryId": REPOSITORY_ID}, "flags": {"source": "files"}},
              True),
             ("another repository's id", {"identity": {"repositoryId": "111"}, "flags": {"source": "files"}}, False),
@@ -942,6 +988,8 @@ class PullRequestDecisionTests(PullRequestCase):
             ("500", (500, {}), "hemi did not answer; using the repository's files"),
             ("503", (503, {"error": "not connected"}), "hemi did not answer; using the repository's files"),
             ("no answer", "drop", "hemi did not answer; using the repository's files"),
+            ("reset after the request", "reset", "hemi did not answer; using the repository's files"),
+            ("a partial answer", "partial", "hemi did not answer; using the repository's files"),
             ("timeout", (200, fixture_copy("hemi"), 1), "hemi did not answer; using the repository's files"),
         ):
             with self.subTest(answer=label):
@@ -951,14 +999,45 @@ class PullRequestDecisionTests(PullRequestCase):
 
     def test_hemis_clean_up_pull_request_during_a_hemi_outage_fails_saying_so(self):
         """It deletes the files from main; run on its own files, checks and render would fail reading them."""
-        sentence = (f"hemi did not answer, and this pull request removes {REPOSITORY}'s files; re-run when hemi "
-                    "answers.")
-        for label, response in (("503", (503, {})), ("401", (401, {})), ("no answer", "drop")):
+        removes = f"and this pull request removes {REPOSITORY}'s files"
+        for label, response, sentence in (
+            ("503", (503, {}), f"hemi did not answer, {removes}; re-run when hemi answers."),
+            ("no answer", "drop", f"hemi did not answer, {removes}; re-run when hemi answers."),
+            ("401", (401, {}), f"hemi refused this pull request's token (HTTP 401), {removes}; if {REPOSITORY} "
+                               "is new, register it with lab first and re-run."),
+            ("403", (403, {}), f"hemi refused this pull request's token (HTTP 403), {removes}; if {REPOSITORY} "
+                               "is new, register it with lab first and re-run."),
+            ("404", (404, {}), f"hemi answered HTTP 404, {removes}; re-run once hemi serves this repository."),
+            ("unreadable", (200, BODY_MARKER.encode()), f"hemi's answer could not be read, {removes}; re-run once "
+                                                         "hemi serves this repository."),
+        ):
             for head_label, head in (("both", {}), ("the values file", {PROFILE: FILES[PROFILE]}),
                                      ("the profile", {VALUES: FILES[VALUES]})):
                 with self.subTest(answer=label, removes=head_label):
                     self.summary.unlink(missing_ok=True)
                     self.assertFails(self.run_pr(response, main=FILES, head=head), sentence)
+
+    def test_a_clean_up_pull_request_that_cannot_reach_or_ask_hemi_names_the_cause(self):
+        removes = f"and this pull request removes {REPOSITORY}'s files"
+        head = {PROFILE: FILES[PROFILE]}
+        self.hemi_url = "http://hemi-app.hemi.invalid:3000"
+        self.assertFails(self.run_pr((200, fixture_copy("hemi")), main=FILES, head=head),
+                         f"the contract job must run on a Lab runner: ci-light-abc12 cannot reach hemi's in-cluster "
+                         f"address, {removes}. Pass a Lab pool as `runner`.")
+        del self.hemi_url
+        self.summary.unlink(missing_ok=True)
+
+        def refuse():
+            raise contract.shadow.Unanswered("GitHub did not return a usable OIDC token")
+
+        self.minter = refuse
+        self.assertFails(self.run_pr((200, fixture_copy("hemi")), main=FILES, head=head),
+                         f"GitHub would not mint a job token for hemi, {removes}; re-run the checks.")
+        del self.minter
+        self.summary.unlink(missing_ok=True)
+        self.grant = False
+        self.assertFails(self.run_pr((200, fixture_copy("hemi")), main=FILES, head=head),
+                         f"no job token for hemi: the caller's ci.yml must grant id-token: write, {removes}.")
 
     def test_a_refused_token_with_no_files_on_main_fails(self):
         for status in (401, 403):
@@ -966,13 +1045,59 @@ class PullRequestDecisionTests(PullRequestCase):
                 with self.subTest(status=status, head=head_label):
                     self.summary.unlink(missing_ok=True)
                     code = self.run_pr((status, {"error": BODY_MARKER}), main={}, head=head)
-                    self.assertFails(code, f"hemi refused this pull request's token (HTTP {status}); "
-                                           f"{REPOSITORY}'s settings live in hemi, so the checks cannot run; "
-                                           "if this app is new, register it with lab first.")
+                    self.assertFails(code, f"hemi refused this pull request's token (HTTP {status}): "
+                                           + NEW_OR_CUT_OVER)
                     self.assertEqual(len(self.hemi.seen), 1, "a refusal is not asked again")
 
+    def test_hemis_not_registered_refusal_says_hemi_does_not_know_the_app(self):
+        """hemi answers {"error":"not registered"} for an unregistered app and for one with no active copy."""
+        for event in ("pull_request", "push"):
+            for head_label, head in (("absent", {}), ("both added", FILES)):
+                with self.subTest(event=event, head=head_label):
+                    self.event = event
+                    self.summary.unlink(missing_ok=True)
+                    self.assertFails(self.run_pr((403, {"error": "not registered"}), main={}, head=head),
+                                     NOT_REGISTERED)
+                    self.assertEqual(len(self.hemi.seen), 1, "a refusal is not asked again")
+        self.event = "pull_request"
+        for label, body in (("whitespace", b' {\n  "error" : "not registered"\n} '),
+                            ("an escaped letter", b'{"error": "not \\u0072egistered"}')):
+            with self.subTest(body=label):
+                self.summary.unlink(missing_ok=True)
+                self.assertFails(self.run_pr((403, body), main={}, head={}), NOT_REGISTERED)
+
+    def test_any_other_403_body_reads_as_an_uncoded_refusal(self):
+        """The body is parsed defensively and bounded: anything but hemi's exact code is the generic sentence."""
+        oversized = json.dumps({"error": "not registered", "pad": "x" * contract.MAX_REFUSAL_BODY}).encode()
+        for label, response in (
+            ("no body", (403, b"")),
+            ("not JSON", (403, b"not registered")),
+            ("a list", (403, [{"error": "not registered"}])),
+            ("another code", (403, {"error": "forbidden"})),
+            ("the code in another case", (403, {"error": "Not Registered"})),
+            ("the code under another key", (403, {"reason": "not registered"})),
+            ("past the bound", (403, oversized)),
+            ("deeply nested", (403, b"[" * 4000)),
+            ("not UTF-8", (403, b'{"error": "not registered\xff"}')),
+            ("UTF-16 with its BOM", (403, '{"error": "not registered"}'.encode("utf-16"))),
+            ("UTF-16 without a BOM", (403, '{"error": "not registered"}'.encode("utf-16-le"))),
+            ("UTF-32", (403, '{"error": "not registered"}'.encode("utf-32"))),
+            ("UTF-8 with a BOM", (403, b'\xef\xbb\xbf{"error": "not registered"}')),
+            ("an extra key", (403, {"error": "not registered", "detail": "x"})),
+            ("a duplicate key ending in the code", (403, b'{"error": "forbidden", "error": "not registered"}')),
+            ("a duplicate key of the code", (403, b'{"error": "not registered", "error": "not registered"}')),
+            ("the code as a list", (403, {"error": ["not registered"]})),
+            ("the code on a 401", (401, {"error": "not registered"})),
+        ):
+            with self.subTest(body=label):
+                self.summary.unlink(missing_ok=True)
+                status = response[0]
+                self.assertFails(self.run_pr(response, main={}, head={}),
+                                 f"hemi refused this pull request's token (HTTP {status}): " + NEW_OR_CUT_OVER)
+
     def test_no_answer_with_no_files_on_main_fails(self):
-        for label, response in (("no answer", "drop"), ("timeout", (200, fixture_copy("hemi"), 1)),
+        for label, response in (("no answer", "drop"), ("reset after the request", "reset"),
+                                ("a partial answer", "partial"), ("timeout", (200, fixture_copy("hemi"), 1)),
                                 ("500", (500, {})), ("503", (503, {"error": "not connected"}))):
             for head_label, head in (("absent", {}), ("both added", FILES)):
                 with self.subTest(answer=label, head=head_label):
@@ -1005,9 +1130,7 @@ class PullRequestTests(PullRequestCase):
     def test_a_stacked_pull_request_is_judged_by_main_not_by_its_base(self):
         self.branch("base", FILES)
         for label, response, sentence in (
-            ("401", (401, {}), f"hemi refused this pull request's token (HTTP 401); {REPOSITORY}'s settings "
-                               "live in hemi, so the checks cannot run; if this app is new, register it with lab "
-                               "first."),
+            ("401", (401, {}), "hemi refused this pull request's token (HTTP 401): " + NEW_OR_CUT_OVER),
             ("hemi", (200, fixture_copy("hemi")),
              f"{PROFILE} was added back; travel's settings live in hemi. {VALUES} was added back; travel's "
              "settings live in hemi."),
@@ -1041,6 +1164,28 @@ class PullRequestTests(PullRequestCase):
         self.summary.unlink(missing_ok=True)
         self.assertSource(self.run_pr((200, fixture_copy("hemi")), main=FILES, head=FILES), "files")
         self.assertIn(unreachable, self.summary_text)
+
+    def test_the_runner_is_named_when_its_name_is_safe_to_print(self):
+        """A hosted runner's name has spaces; a name with a workflow-command or shell character is not printed."""
+        self.hemi_url = "http://hemi-app.hemi.invalid:3000"
+        for name, shown in (
+            ("GitHub Actions 1000000123", "GitHub Actions 1000000123"),
+            ("ci-light-abc12", "ci-light-abc12"),
+            ("x::error::y", "this runner"),
+            ("a\nb", "this runner"),
+            ("a%0Ab", "this runner"),
+            ("a$(id)", "this runner"),
+            ("a;b", "this runner"),
+            ("`id`", "this runner"),
+            (" padded", "this runner"),
+            ("", "this runner"),
+        ):
+            with self.subTest(name=name):
+                self.runner = name
+                self.summary.unlink(missing_ok=True)
+                self.assertFails(self.run_pr((200, fixture_copy("hemi")), main={}, head={}),
+                                 f"the contract job must run on a Lab runner: {shown} cannot reach hemi's in-cluster "
+                                 "address. Pass a Lab pool as `runner`.")
 
     def test_a_lookup_that_fails_once_on_a_lab_runner_is_asked_again(self):
         real = socket.getaddrinfo
@@ -1093,9 +1238,15 @@ class PullRequestTests(PullRequestCase):
         """hemi admits wac-ci only for pull_request runs; a push run's 401 is about the event."""
         self.event = "push"
         code = self.run_pr((401, {"error": "unauthorized"}), main={}, head={})
-        self.assertFails(code, f"hemi refused the job token of this push run (HTTP 401): it admits wac-ci only "
-                               f"for pull_request runs, and {REPOSITORY}'s settings live in hemi, so the checks "
-                               "cannot run; if this app is new, register it with lab first.")
+        self.assertFails(code, "hemi refused the job token of this push run (HTTP 401): it admits wac-ci only "
+                               "for pull_request runs; " + NEW_OR_CUT_OVER)
+        self.assertNotIn("pull request's", self.stderr)
+
+    def test_a_clean_up_refused_outside_a_pull_request_names_the_event(self):
+        self.event = "push"
+        code = self.run_pr((401, {"error": "unauthorized"}), main=FILES, head={})
+        self.assertFails(code, "hemi refused the job token of this push run (HTTP 401): it admits wac-ci only "
+                               f"for pull_request runs, and this pull request removes {REPOSITORY}'s files.")
         self.assertNotIn("pull request's", self.stderr)
 
     def test_an_answer_that_trickles_in_past_the_attempt_bound_is_silence(self):
@@ -1143,6 +1294,75 @@ class PullRequestTests(PullRequestCase):
         )
         self.assertEqual(contract.shadow.URL, "http://hemi-app.hemi.svc.cluster.local:3000")
         self.assertEqual(contract.shadow.AUDIENCE, "wacwini:hemi")
+
+
+DEFAULT_DOCS = '["docs/**","mkdocs.yml","*.md"]'
+
+
+def profile_with(**ci):
+    data = json.loads(FILES[PROFILE])
+    data["ci"].update(ci)
+    return {PROFILE: json.dumps(data), VALUES: FILES[VALUES]}
+
+
+class DocsPathsTests(PullRequestCase):
+    """`docs_paths` is the scope job's only source of patterns: the list the settings this run uses hold.
+
+    It is the effective list, the default when the key is absent, from hemi's copy when the source is hemi
+    and from the merge commit's .github/wacd.json when it is the files; empty whenever that list cannot be
+    read or is refused, which the scope job reads as "run the checks".
+    """
+
+    def docs_paths(self, code, source):
+        self.assertSource(code, source)
+        return self.outputs()["docs_paths"]
+
+    def copy_with(self, **delivery):
+        value = fixture_copy("hemi")
+        value["delivery"].update(delivery)
+        return 200, value
+
+    def test_hemi_source_reads_the_copys_list_and_keeps_absent_apart_from_empty(self):
+        for label, answer, expected in (
+            ("absent", self.hemi_answer(), DEFAULT_DOCS),
+            ("empty", self.copy_with(docsPaths=[]), "[]"),
+            ("a list", self.copy_with(docsPaths=["docs/guides/**", "*.md"]), '["docs/guides/**","*.md"]'),
+        ):
+            with self.subTest(docs_paths=label):
+                self.assertEqual(self.docs_paths(self.run_pr(answer, main={}, head={}), "hemi"), expected)
+
+    def test_a_copys_refused_list_leaves_the_output_empty_and_the_contract_job_green(self):
+        for label, docs in (("code", ["src/**"]), ("null", None), ("a gate's path", ["docs/**"])):
+            with self.subTest(docs_paths=label):
+                answer = self.copy_with(docsPaths=docs)
+                if label == "a gate's path":
+                    answer[1]["gates"][0]["commands"].append("node scripts/check.mjs docs/llc.md")
+                self.assertEqual(self.docs_paths(self.run_pr(answer, main={}, head={}), "hemi"), "")
+
+    def test_a_copys_values_file_is_protected_by_the_path_the_copy_names(self):
+        """The copy's delivery.valuesFile is the values path checks and plan protect, not .wacd-contract/values.json."""
+        answer = self.copy_with(valuesFile="docs/values.yaml", docsPaths=["docs/**"])
+        self.assertEqual(self.docs_paths(self.run_pr(answer, main={}, head={}), "hemi"), "")
+        answer = self.copy_with(valuesFile="docs/values.yaml", docsPaths=["docs/guides/**"])
+        self.assertEqual(self.docs_paths(self.run_pr(answer, main={}, head={}), "hemi"), '["docs/guides/**"]')
+
+    def test_files_source_reads_the_merge_commits_profile(self):
+        for label, head, expected in (
+            ("absent", FILES, DEFAULT_DOCS),
+            ("empty", profile_with(docs_paths=[]), "[]"),
+            ("a list", profile_with(docs_paths=["docs/**"]), '["docs/**"]'),
+            ("refused", profile_with(docs_paths=["**"]), ""),
+            ("unreadable", {PROFILE: "{not json", VALUES: FILES[VALUES]}, ""),
+            ("removed", {}, ""),
+        ):
+            with self.subTest(head=label):
+                self.summary.unlink(missing_ok=True)
+                code = self.run_pr(self.hemi_answer("files"), main=FILES, head=head)
+                self.assertEqual(self.docs_paths(code, "files"), expected)
+
+    def test_files_source_without_hemi_still_names_the_list(self):
+        code = self.run_pr("drop", "drop", "drop", main=FILES, head=profile_with(docs_paths=["docs/**"]))
+        self.assertEqual(self.docs_paths(code, "files"), '["docs/**"]')
 
 
 if __name__ == "__main__":

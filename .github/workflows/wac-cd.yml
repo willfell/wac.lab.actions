@@ -43,6 +43,9 @@ on:
       npm_token:
         description: Token for private npm packages; empty uses the job's GitHub token
         required: false
+      build_secrets:
+        description: Newline-separated KEY=VALUE build-time values mounted into every image build as docker build secrets with id the lower-cased KEY; empty mounts none
+        required: false
     outputs:
       mode:
         description: release, publish, resume, rollback, settings or none
@@ -67,7 +70,7 @@ concurrency:
 jobs:
   plan:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
-    timeout-minutes: 40
+    timeout-minutes: 74
     env:
       PYTHONSAFEPATH: "1"
     permissions:
@@ -109,12 +112,18 @@ jobs:
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
-              except Exception:
-                  print(name)
+              except BaseException as error:
+                  print(name + " (" + type(error).__name__ + ")")
                   sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
                 exit 0
+              else
+                status=$?
               fi
-              found="$found, which cannot import ${missing:-its standard modules}"
+              if [[ -n "$missing" ]]; then
+                found="$found, which cannot import $missing"
+              else
+                found="$found, which stopped with exit status $status while importing its standard modules"
+              fi
             fi
           fi
           echo "::error::wac-cd: plan needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
@@ -163,9 +172,9 @@ jobs:
           if [[ -n "$settings" && "$DEPLOY" != true ]]; then
             fail "settings_revision cannot be combined with deploy: false"
           fi
-      - name: Check out the app (actions/checkout v4)
+      - name: Check out the app (actions/checkout v7.0.1)
         timeout-minutes: 5
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -174,9 +183,9 @@ jobs:
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - name: Check out the shared scripts (actions/checkout v4)
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
         timeout-minutes: 3
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -202,9 +211,9 @@ jobs:
             exit 1
           fi
           cat "$RUNNER_TEMP/contract.out" >> "$GITHUB_OUTPUT"
-      - name: Upload the settings copy (actions/upload-artifact v4)
+      - name: Upload the settings copy (actions/upload-artifact v7.0.2)
         timeout-minutes: 3
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: steps.contract.outputs.source == 'hemi'
         with:
           name: wac-cd-contract
@@ -298,9 +307,25 @@ jobs:
           version="$(sed -n 's/^version=//p' <<< "$planned")"
           claimed="$(sed -n 's/^claimed=//p' <<< "$planned")"
           above="$(sed -n 's/^above=//p' <<< "$planned")"
+          codes="$(sed -n 's/^codes=//p' <<< "$planned")"
+          left=""
           if [[ "$live" == "$SETTINGS_REVISION" ]]; then
             version="$running"
           else
+            code=0
+            unfinished="$(python3 "$WACD_SCRIPTS"/wacd-release.py unfinished-release --app "$APP" --prefix "$TAG_PREFIX" \
+              --running "$running" --versions "$above" --codes "$codes" \
+              --deadline "$deadline" 2> "$RUNNER_TEMP/settings.err")" || code=$?
+            if [[ "$code" -eq 5 ]]; then
+              reason="$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/^wacd release: //; s/ *$//')"
+              [[ -n "$reason" ]] || fail "The settings release was refused behind an unfinished code release, and the refusal gave no reason."
+              printf 'unfinished_refused=%s\n' "$reason" >> "$GITHUB_OUTPUT"
+              echo "wac-cd: settings release refused behind an unfinished code release; the next step reports it"
+              exit 0
+            elif [[ "$code" -ne 0 ]]; then
+              fail "$(tr '\r\n' '  ' < "$RUNNER_TEMP/settings.err" | sed 's/ *$//')"
+            fi
+            left="$(sed -n 's/^left=//p' <<< "$unfinished")"
             code=0
             earlier="$(python3 "$WACD_SCRIPTS"/wacd-release.py earlier-release --app "$APP" --prefix "$TAG_PREFIX" \
               --revision "$SETTINGS_REVISION" --running "$running" --versions "$above" --claimed "$claimed" \
@@ -333,6 +358,7 @@ jobs:
             echo "commit=$commit"
             echo "images=$images"
             echo "summary=$summary"
+            echo "unfinished_left=$left"
           } | tee -a "$GITHUB_OUTPUT"
       - name: Refuse a settings release while the app is rolling out
         timeout-minutes: 1
@@ -340,6 +366,21 @@ jobs:
         shell: bash
         env:
           REASON: ${{ steps.settings.outputs.rollout_refused }}
+        run: |
+          echo "wac-cd: $REASON" >&2
+          echo "::error::wac-cd: $REASON"
+          {
+            echo "### wac-cd plan"
+            echo
+            echo "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - name: Refuse a settings release behind an unfinished code release
+        timeout-minutes: 1
+        if: ${{ steps.settings.outputs.unfinished_refused != '' }}
+        shell: bash
+        env:
+          REASON: ${{ steps.settings.outputs.unfinished_refused }}
         run: |
           echo "wac-cd: $REASON" >&2
           echo "::error::wac-cd: $REASON"
@@ -365,7 +406,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
       - name: Plan the version
-        timeout-minutes: 6
+        timeout-minutes: 10
         id: version
         shell: bash
         env:
@@ -381,8 +422,14 @@ jobs:
           SETTINGS_TAG: ${{ steps.settings.outputs.tag }}
           SETTINGS_COMMIT: ${{ steps.settings.outputs.commit }}
           SETTINGS_SUMMARY: ${{ steps.settings.outputs.summary }}
+          SETTINGS_UNFINISHED: ${{ steps.settings.outputs.unfinished_left }}
+          EVENT_NAME: ${{ github.event_name }}
+          DOCS_PATHS: ${{ steps.profile.outputs.docs_paths }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          bootstrap=""
+          docs_since=""
           registry=registry.network.svc.cluster.local:5000
           revision_of() {
             local line
@@ -427,34 +474,64 @@ jobs:
                   echo "wac-cd: replay refused; the next step reports it"
                   exit 0
                 fi
-                echo "wac-cd: $reason" >&2
                 echo "::error::wac-cd: $reason"
                 {
                   echo "### wac-cd plan"
                   echo
                   echo "$reason"
                 } >> "$GITHUB_STEP_SUMMARY"
-                exit 1
+                exit "$code"
               fi
               mode="$(sed -n 's/^mode=//p' <<< "$planned")"
               version="$(sed -n 's/^version=//p' <<< "$planned")"
               tag="$(sed -n 's/^tag=//p' <<< "$planned")"
             }
-            plan_version unknown
-            if [[ "$mode" == resume || ( "$mode" == none && -n "$version" ) ]]; then
-              if ! state="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-state --registry "$registry" \
-                --app "$APP" --version "$version" --source-sha "$GITHUB_SHA" 2> "$RUNNER_TEMP/chart-state.err")"; then
-                echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/chart-state.err")"
-                exit 1
+            if [[ "${EVENT_NAME:-}" == push && "$VERSION_SOURCE" == commits ]]; then
+              scope="$(python3 -I "$WACD_SCRIPTS"/wacd-docs.py release-scope --prefix "$TAG_PREFIX" 2> /dev/null || true)"
+              if [[ "$(sed -n 's/^docs_only=//p' <<< "$scope")" == true ]]; then
+                docs_since="$(sed -n 's/^since=//p' <<< "$scope")"
+              else
+                echo "wac-cd: a release, since $(sed -n 's/^reason=//p' <<< "$scope")"
               fi
-              case "$state" in
-                state=present) plan_version true ;;
-                state=absent) plan_version false ;;
-                *)
-                  echo "::error::wac-cd: unexpected chart state for deploy/$APP:$version: $state"
+            fi
+            if [[ -n "${docs_since:-}" ]]; then
+              mode=none
+              version=""
+              tag=""
+            else
+              plan_version unknown
+              if [[ "$mode" == resume || ( "$mode" == none && -n "$version" ) ]]; then
+                if ! state="$(python3 "$WACD_SCRIPTS"/wacd-chart.py chart-state --registry "$registry" \
+                  --app "$APP" --version "$version" --source-sha "$GITHUB_SHA" 2> "$RUNNER_TEMP/chart-state.err")"; then
+                  echo "::error::wac-cd: $(tr '\n' ' ' < "$RUNNER_TEMP/chart-state.err")"
                   exit 1
-                  ;;
-              esac
+                fi
+                case "$state" in
+                  state=present) plan_version true ;;
+                  state=absent) plan_version false ;;
+                  *)
+                    echo "::error::wac-cd: unexpected chart state for deploy/$APP:$version: $state"
+                    exit 1
+                    ;;
+                esac
+              fi
+              if [[ "${EVENT_NAME:-}" == push && "$mode" == release ]]; then
+                tagged="$(python3 -I "$WACD_SCRIPTS"/wacd-version.py --mode tagged --prefix "$TAG_PREFIX" 2> /dev/null || true)"
+                if [[ "$tagged" == tagged=false ]]; then
+                  if answer="$(python3 -I "$WACD_SCRIPTS"/wacd-release.py bootstrap --deadline "$(( $(date +%s) + 60 ))" \
+                    2> "$RUNNER_TEMP/bootstrap.err")"; then
+                    bootstrap="$(sed -n 's/^bootstrap=//p' <<< "$answer")"
+                    if [[ -z "$bootstrap" ]]; then
+                      echo "wac-cd: a release, since the gateway's target has been released"
+                    fi
+                  else
+                    echo "wac-cd: a release, since the gateway's status could not be read: $(tr '\r\n' '  ' < "$RUNNER_TEMP/bootstrap.err" | sed 's/^wacd release: //; s/ *$//')"
+                  fi
+                fi
+                if [[ -n "${bootstrap:-}" ]]; then
+                  mode=publish
+                fi
+              fi
             fi
             expected_sha="$GITHUB_SHA"
           fi
@@ -501,11 +578,21 @@ jobs:
                 ;;
             esac
           fi
+          publish_only=""
+          if [[ "$mode" == publish && -n "${bootstrap:-}" ]]; then
+            publish_only="$APP has not been released yet (the gateway's target is at its bootstrap revision $bootstrap), so this merge publishes $version without releasing it; the next merge releases."
+          fi
           {
             echo "mode=$mode"
             echo "version=$version"
             echo "tag=$tag"
             echo "expected_sha=$expected_sha"
+            if [[ -n "${docs_since:-}" ]]; then
+              echo "docs_since=$docs_since"
+            fi
+            if [[ -n "$publish_only" ]]; then
+              echo "publish_only=$publish_only"
+            fi
           } | tee -a "$GITHUB_OUTPUT"
           {
             echo "### wac-cd plan"
@@ -521,11 +608,23 @@ jobs:
               echo
               echo "$resumed"
             fi
+            if [[ -n "${docs_since:-}" ]]; then
+              echo
+              echo "nothing to release: only documentation changed since $docs_since."
+            fi
+            if [[ -n "$publish_only" ]]; then
+              echo
+              echo "$publish_only"
+            fi
             if [[ -n "${SETTINGS_REVISION:-}" && "$mode" == settings ]]; then
               echo
               echo "mode: settings"
               echo
               echo "${SETTINGS_SUMMARY:-}"
+              if [[ -n "${SETTINGS_UNFINISHED:-}" ]]; then
+                echo
+                echo "$SETTINGS_UNFINISHED"
+              fi
             elif [[ -n "${SETTINGS_REVISION:-}" ]]; then
               echo
               echo "mode: none (${SETTINGS_SUMMARY:-})"
@@ -546,6 +645,22 @@ jobs:
             echo "$REASON"
           } >> "$GITHUB_STEP_SUMMARY"
           exit 1
+      - name: "Nothing to release: only documentation changed"
+        timeout-minutes: 1
+        if: ${{ steps.version.outputs.docs_since != '' }}
+        shell: bash
+        env:
+          SINCE: ${{ steps.version.outputs.docs_since }}
+        run: |
+          echo "::notice::wac-cd: nothing to release: only documentation changed since $SINCE."
+      - name: "Publish only: the app has not been released yet"
+        timeout-minutes: 1
+        if: ${{ steps.version.outputs.publish_only != '' }}
+        shell: bash
+        env:
+          SENTENCE: ${{ steps.version.outputs.publish_only }}
+        run: |
+          echo "::notice::wac-cd: $SENTENCE"
 
   shadow:
     needs: plan
@@ -581,26 +696,32 @@ jobs:
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
-              except Exception:
-                  print(name)
+              except BaseException as error:
+                  print(name + " (" + type(error).__name__ + ")")
                   sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
                 exit 0
+              else
+                status=$?
               fi
-              found="$found, which cannot import ${missing:-its standard modules}"
+              if [[ -n "$missing" ]]; then
+                found="$found, which cannot import $missing"
+              else
+                found="$found, which stopped with exit status $status while importing its standard modules"
+              fi
             fi
           fi
           echo "::error::wac-cd: shadow needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
           exit 1
-      - name: Check out the app (actions/checkout v4)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - name: Check out the shared scripts (actions/checkout v4)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -632,14 +753,16 @@ jobs:
     outputs:
       images: ${{ steps.images.outputs.images }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -651,7 +774,8 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Install crane
@@ -667,6 +791,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
           BUILD_ARGS: ${{ inputs.build_args }}
           NODE_AUTH_TOKEN: ${{ secrets.npm_token || github.token }}
+          BUILD_SECRETS: ${{ secrets.build_secrets }}
         run: |
           set -euo pipefail
           registry=registry.network.svc.cluster.local:5000
@@ -677,6 +802,18 @@ jobs:
               extra+=(--build-arg "$line")
             done <<< "$validated"
           fi
+          secret_args=()
+          if [[ -n "${BUILD_SECRETS:-}" ]]; then
+            secrets_dir="$(mktemp -d "$RUNNER_TEMP/build-secrets.XXXXXX")"
+            trap 'rm -rf "$secrets_dir"' EXIT
+            python3 -I "$WACD_SCRIPTS"/wacd-chart.py build-secrets --dir "$secrets_dir"
+            for file in "$secrets_dir"/*; do
+              if [[ -f "$file" ]]; then
+                secret_args+=(--secret "id=${file##*/},src=$file")
+              fi
+            done
+          fi
+          unset BUILD_SECRETS
           python3 -c 'import json, os
           for image in json.loads(os.environ["PROFILE_IMAGES"]):
               print("\t".join([image["name"], image["dockerfile"], image["context"], image.get("sha_build_arg", "")]))' \
@@ -699,7 +836,8 @@ jobs:
                 args+=(--build-arg "$sha_arg=$GITHUB_SHA")
               fi
               args+=("${extra[@]}")
-              args+=(--secret "id=node_auth_token,env=NODE_AUTH_TOKEN" -t "$name:$VERSION" "$context")
+              args+=(--secret "id=node_auth_token,env=NODE_AUTH_TOKEN" ${secret_args[@]+"${secret_args[@]}"})
+              args+=(-t "$name:$VERSION" "$context")
               docker build "${args[@]}"
               docker save "$name:$VERSION" -o "$RUNNER_TEMP/image.tar"
               crane push --insecure "$RUNNER_TEMP/image.tar" "$ref"
@@ -744,7 +882,8 @@ jobs:
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -756,7 +895,8 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Retag the running images
@@ -779,14 +919,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -798,7 +940,8 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Install helm
@@ -819,12 +962,21 @@ jobs:
       - name: Clear any copy in the checkout
         shell: bash
         run: rm -rf .wacd-contract
-      - name: Download the settings copy plan read (actions/download-artifact v4)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - name: Download the settings copy plan read (actions/download-artifact v8.0.2)
+        id: copy
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         if: needs.plan.outputs.source == 'hemi'
         with:
           name: wac-cd-contract
           path: .wacd-contract
+      - name: Say how to recover a settings copy that could not be downloaded
+        if: failure() && steps.copy.outcome == 'failure'
+        shell: bash
+        run: |
+          sentence="The settings copy this run's earlier job uploaded could not be downloaded. It is kept for one day, so a re-run more than a day after the run started must re-run all jobs, not only the failed ones."
+          echo "::error::wac-cd: $sentence"
+          echo "$sentence" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - name: Publish the deploy chart and the tag
         shell: bash
         env:
@@ -920,12 +1072,18 @@ jobs:
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
-              except Exception:
-                  print(name)
+              except BaseException as error:
+                  print(name + " (" + type(error).__name__ + ")")
                   sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
                 exit 0
+              else
+                status=$?
               fi
-              found="$found, which cannot import ${missing:-its standard modules}"
+              if [[ -n "$missing" ]]; then
+                found="$found, which cannot import $missing"
+              else
+                found="$found, which stopped with exit status $status while importing its standard modules"
+              fi
             fi
           fi
           echo "::error::wac-cd: deploy needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
@@ -934,8 +1092,8 @@ jobs:
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - name: Check out the shared scripts (actions/checkout v4)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -987,8 +1145,8 @@ jobs:
             --images "$IMAGES" --wait-timeout "$WAIT_TIMEOUT" \
             --mode "$MODE" --tag "$TAG" --expected-sha "$EXPECTED_SHA" \
             --receipt "$RUNNER_TEMP/wac-cd-release.json"
-      - name: Upload the release receipt (actions/upload-artifact v4)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - name: Upload the release receipt (actions/upload-artifact v7.0.2)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: wac-cd-release-${{ needs.plan.outputs.version }}
           path: ${{ runner.temp }}/wac-cd-release.json
@@ -1021,14 +1179,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}

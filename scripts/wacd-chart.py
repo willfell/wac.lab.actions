@@ -11,7 +11,8 @@ a decimal string, and `wacwini.com/fleet-commit`, the wac.fleet commit the copy
 was read at. The gateway holds such a chart to the copy it names.
 
 Every CLI prints single-line key=value output for $GITHUB_OUTPUT, except
-build-args, which prints the validated KEY=VALUE build args one per line. Any
+build-args, which prints the validated KEY=VALUE build args one per line, and
+build-secrets, which prints one ::add-mask:: workflow command per value. Any
 problem exits 1 with a one-line "wacd chart: ..." message.
 """
 
@@ -20,6 +21,7 @@ import hashlib
 import http.client
 import importlib.util
 import json
+import os
 import re
 import shutil
 import sys
@@ -66,6 +68,8 @@ TOP_LEVEL_KEY = re.compile(
 )
 TOP_LEVEL_ITEM = re.compile(r"-(\s|$)")
 BUILD_ARG_KEY = re.compile(r"[A-Z_][A-Z0-9_]*")
+BUILD_SECRET_KEY = re.compile(r"[A-Z][A-Z0-9_]*")
+RESERVED_BUILD_SECRETS = {"NODE_AUTH_TOKEN": "wac-cd already mounts as node_auth_token from npm_token"}
 DECIMAL = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
 MAX_REVISION = 9999999999
 
@@ -445,8 +449,7 @@ def chart_release(registry, app, version, timeout=TIMEOUT):
     None when deploy/<app>:<version> is not in the registry. wac-cd's settings
     plan holds the gateway's status to it: the status's chart_digest must be
     this digest, and every running image one of these. copy is the copy
-    revision the chart ships, as chart_copy_revision reports it, and
-    fleet_commit the wac.fleet commit that copy was read at, or "none".
+    revision the chart ships, as chart_copy_revision reports it.
     """
     found = chart_with_digest(registry, app, version, timeout)
     if found is None:
@@ -464,7 +467,6 @@ def chart_release(registry, app, version, timeout=TIMEOUT):
         "revision": revision,
         "images": parse_image_refs(text),
         "copy": copy_of(annotations),
-        "fleet_commit": fleet_commit_of(annotations),
     }
 
 
@@ -474,14 +476,6 @@ def copy_of(annotations):
     if text is None:
         return "none"
     return revision_annotation(revision_from_annotation(text))
-
-
-def fleet_commit_of(annotations):
-    """The wac.fleet commit a chart's copy was read at: "none" or 40 hex."""
-    text = annotations.get(FLEET_COMMIT_ANNOTATION)
-    if text is None:
-        return "none"
-    return check(text, SHA40, FLEET_COMMIT_ANNOTATION)
 
 
 def chart_copy_revision(registry, app, version):
@@ -582,6 +576,77 @@ def build_args(text):
     return accepted
 
 
+def build_secrets(text):
+    """Validate wac-cd's newline-separated KEY=VALUE build secrets.
+
+    Blank lines are skipped and a trailing carriage return is dropped, as for
+    build args. Every refusal names the line number, and the KEY only once the
+    KEY is known to be a name, so no sentence can carry a value. An empty
+    value is refused: a secret the caller never set reaches here as KEY=, and
+    mounting it empty would build without it. A value is one line; the
+    sentences for a line that is not KEY=VALUE, or whose KEY is not a name,
+    say so, since that is what the second line of a multi-line value becomes.
+    Returns (KEY, VALUE) pairs in the order given.
+    """
+    accepted, seen = [], {}
+    for number, line in enumerate(text.split("\n"), start=1):
+        line = line.removesuffix("\r")
+        if not line.strip():
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            raise ChartError(f"build_secrets line {number} is not KEY=VALUE; a value must not span lines.")
+        if not key:
+            raise ChartError(f"build_secrets line {number} has an empty KEY.")
+        if not BUILD_SECRET_KEY.fullmatch(key):
+            raise ChartError(
+                f"build_secrets line {number} has a KEY that does not match ^[A-Z][A-Z0-9_]*$; "
+                "a value must not span lines."
+            )
+        if key in RESERVED_BUILD_SECRETS:
+            raise ChartError(
+                f"build_secrets line {number} names {key}, which {RESERVED_BUILD_SECRETS[key]}; remove the line."
+            )
+        if key in seen:
+            raise ChartError(f"build_secrets line {number} repeats {key} from line {seen[key]}; give each KEY once.")
+        if not value:
+            raise ChartError(
+                f"build_secrets line {number} gives {key} an empty value; set the secret it is read from, "
+                "or remove the line."
+            )
+        seen[key] = number
+        accepted.append((key, value))
+    return accepted
+
+
+def mask_command(value):
+    """The ::add-mask:: workflow command for one value, escaped as the runner unescapes command data."""
+    escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return f"::add-mask::{escaped}\n"
+
+
+def write_build_secrets(text, directory):
+    """Write each secret to <directory>/<lowercased KEY>, mode 0600, and return the mask commands.
+
+    The whole set is validated before the first file is written. A value of
+    only whitespace gets no mask: the runner refuses to mask one.
+    """
+    secrets = build_secrets(text)
+    masks = []
+    for key, value in secrets:
+        path = os.path.join(directory, key.lower())
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as err:
+            raise ChartError(f"build_secrets: cannot create the file for {key}: {err.strerror}") from err
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(value.encode("utf-8", "surrogateescape"))
+        if value.strip():
+            masks.append(mask_command(value))
+    return "".join(masks)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="wacd-chart.py")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -611,6 +676,8 @@ def build_parser():
     ci.add_argument("--profile", required=True)
     args = sub.add_parser("build-args")
     args.add_argument("--text", required=True)
+    secrets = sub.add_parser("build-secrets")
+    secrets.add_argument("--dir", required=True)
     return parser
 
 
@@ -636,6 +703,8 @@ def run(args):
         return f"chart_dir={chart_dir}"
     if args.command == "build-args":
         return "".join(line + "\n" for line in build_args(args.text))
+    if args.command == "build-secrets":
+        return write_build_secrets(os.environ.get("BUILD_SECRETS", ""), args.dir)
     if args.command == "ci-images":
         compact = json.dumps(ci_images(load_profile(args.profile)), separators=(",", ":"))
         return f"images={compact}"
@@ -666,7 +735,7 @@ def main(argv):
     except ChartError as err:
         print("wacd chart: " + " ".join(str(err).split()), file=sys.stderr)
         return 1
-    print(line, end="" if args.command == "build-args" else "\n")
+    print(line, end="" if args.command in ("build-args", "build-secrets") else "\n")
     return 0
 
 

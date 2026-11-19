@@ -237,7 +237,7 @@ def run_bounded(repos, *argv, env=None):
 
 
 class NetworkBoundTests(TagCase):
-    """A stalled remote must not hold plan's runner and the cd concurrency group for 40 minutes."""
+    """A stalled remote must not hold plan's runner and the cd concurrency group for the job's 68 minutes."""
 
     def run_in_process(self, *argv, env=None):
         return run_bounded(self.repos, *argv, env=env)
@@ -265,6 +265,36 @@ class NetworkBoundTests(TagCase):
         self.assertEqual(err, "wacd tag: git push did not finish within 1 seconds\n")
         self.assertLess(elapsed, 10)
         self.assertEqual(r.origin_tags(), {})
+
+    def test_a_helper_that_left_gits_group_cannot_hold_the_pipes_past_the_bound(self):
+        """A daemonizing credential helper survives the group kill with git's stderr still open."""
+        r = self.repos
+        pid_file = r.root / "daemon.pid"
+        ssh = r.root / "daemon-ssh"
+        ssh.write_text(
+            "#!/bin/sh\n"
+            f"\"{sys.executable}\" -c 'import os, time; os.setsid(); "
+            f"open(\"{pid_file}\", \"w\").write(str(os.getpid())); time.sleep(30)' &\n"
+            "exec sleep 30\n"
+        )
+        ssh.chmod(0o755)
+
+        def stop_daemon():
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (OSError, ValueError):
+                pass
+
+        self.addCleanup(stop_daemon)
+        r.git("remote", "set-url", "origin", "ssh://hang.invalid/origin.git")
+        code, err, elapsed = self.run_in_process(
+            "claim-tag", "--tag", "v1.0.0", "--sha", r.second,
+            env={"GIT_SSH_COMMAND": str(ssh), "GIT_SSH_VARIANT": "ssh"},
+        )
+        self.assertTrue(pid_file.exists(), "the helper never left git's group, so this proves nothing")
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "wacd tag: git ls-remote did not finish within 1 seconds\n")
+        self.assertLess(elapsed, 10)
 
     def test_the_bound_is_a_few_minutes_at_most(self):
         spec = importlib.util.spec_from_file_location("wacd_tag", SCRIPT)

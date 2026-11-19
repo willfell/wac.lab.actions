@@ -1,6 +1,7 @@
 """wacd-version computes the release version from conventional commits and tags."""
 
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -502,13 +503,13 @@ class SettingsTest(unittest.TestCase):
         self.commit("feat: merged, not released yet")
         self.assertEqual(
             self.settings(self.code, "1.4.2"),
-            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": ""},
+            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": "", "codes": ""},
         )
 
     def test_after_a_rollback_it_still_releases_above_the_newest(self):
         self.assertEqual(
             self.settings(self.old, "1.3.9"),
-            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": "1.4.2"},
+            {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "claimed": "", "above": "1.4.2", "codes": "1.4.2"},
         )
 
     def test_above_names_every_version_on_main_newer_than_the_running_one_newest_first(self):
@@ -526,11 +527,25 @@ class SettingsTest(unittest.TestCase):
         git(self.repo, "tag", "v1.4.3", self.code)
         self.assertEqual(
             self.settings(self.code, "1.4.2"),
-            {"mode": "settings", "version": "1.4.4", "tag": "v1.4.4", "claimed": "1.4.3", "above": "1.4.3"},
+            {"mode": "settings", "version": "1.4.4", "tag": "v1.4.4", "claimed": "1.4.3", "above": "1.4.3", "codes": ""},
         )
         self.assertEqual(self.settings(self.code, "1.4.3")["claimed"], "", "a running version is not a pending claim")
         git(self.repo, "tag", "v1.4.0", self.old)
         self.assertEqual(self.settings(self.old, "1.3.9")["claimed"], "", "only main's newest tag can be a claim")
+
+    def test_codes_names_the_versions_above_that_a_code_release_claimed(self):
+        """A code release tags a commit no lower tag names; a settings release tags code an earlier version ran."""
+        git(self.repo, "tag", "v1.4.3", self.code)
+        git(self.repo, "tag", "-a", "-m", "settings", "v1.4.4", self.old)
+        self.assertEqual(self.settings(self.code, "1.4.2")["codes"], "", "settings tags, lightweight or annotated")
+        claimed = self.commit("fix: claimed, build failed")
+        git(self.repo, "tag", "v1.4.5", claimed)
+        git(self.repo, "tag", "ui-v0.1.0", claimed)
+        planned = self.settings(self.code, "1.4.2")
+        self.assertEqual((planned["above"], planned["codes"]), ("1.4.5,1.4.4,1.4.3", "1.4.5"))
+        self.assertEqual(self.settings(self.old, "1.3.9")["codes"], "1.4.5,1.4.2",
+                         "after a rollback the newer code releases are named too")
+        self.assertEqual(self.settings(claimed, "1.4.5")["codes"], "", "only versions above the running one")
 
     def test_other_tag_families_do_not_count(self):
         git(self.repo, "tag", "ui-v5.0.0")
@@ -654,6 +669,39 @@ class CliTest(unittest.TestCase):
         self.assertTrue(result.stderr.startswith("wacd version:"))
         self.assertEqual(len(result.stderr.strip().splitlines()), 1)
 
+    def test_cli_tagged_mode_counts_any_tag_with_the_prefix(self):
+        self.assertEqual(self.cli("--prefix", "v", "--mode", "tagged").stdout, "tagged=false\n")
+        git(self.repo, "tag", "ui-v0.1.0")
+        git(self.repo, "tag", "v1.2")
+        self.assertEqual(self.cli("--prefix", "v", "--mode", "tagged").stdout, "tagged=false\n",
+                         "another prefix's tag and a tag that is not X.Y.Z are not counted")
+        git(self.repo, "checkout", "-q", "-b", "side")
+        git(self.repo, "commit", "--allow-empty", "-q", "-m", "fix: side")
+        git(self.repo, "tag", "v0.9.0")
+        git(self.repo, "checkout", "-q", "main")
+        result = self.cli("--prefix", "v", "--mode", "tagged")
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "tagged=true\n", ""),
+                         "a tag off main counts")
+
+    def test_cli_tagged_mode_fails_with_one_line_when_it_cannot_tell(self):
+        """Its caller reads only an exact `tagged=false` as no tag, so each failure prints nothing on stdout."""
+        elsewhere = tempfile.TemporaryDirectory()
+        self.addCleanup(elsewhere.cleanup)
+        outside = Path(elsewhere.name)
+        for label, args, cwd, said in (
+            ("git fails", ("--prefix", "v"), outside, "wacd version: git tag failed:"),
+            ("a line break in the prefix", ("--prefix", "v\n"), self.repo,
+             "wacd version: tag prefix contains a line break"),
+        ):
+            with self.subTest(case=label):
+                env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+                env["GIT_CEILING_DIRECTORIES"] = str(outside.parent)
+                result = subprocess.run([sys.executable, str(SCRIPT), *args, "--mode", "tagged"], cwd=cwd, env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual((result.returncode, result.stdout), (1, ""))
+                self.assertTrue(result.stderr.startswith(said), result.stderr)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+
     def test_cli_published_false_on_a_tagged_head_releases(self):
         git(self.repo, "tag", "v0.1.0")
         result = self.cli("--prefix", "v", "--published", "false")
@@ -700,7 +748,7 @@ class CliTest(unittest.TestCase):
         result = self.cli("--mode", "settings", "--prefix", "v", "--commit", head, "--running", "1.4.2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            result.stdout.splitlines(), ["mode=settings", "version=1.4.3", "tag=v1.4.3", "claimed=", "above="]
+            result.stdout.splitlines(), ["mode=settings", "version=1.4.3", "tag=v1.4.3", "claimed=", "above=", "codes="]
         )
         for args in (
             ["--commit", head, "--running", "v1.4.2"],

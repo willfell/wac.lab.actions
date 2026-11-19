@@ -65,6 +65,89 @@ not passed through `env:`. Every other input above is data and rides `env:`
 inside the workflow; treat `postbuild_command` and `install_command` as
 untrusted-caller-writable code, not as data values.
 
+### Three jobs, and the one that runs the site's code holds no token
+
+A GitHub OIDC token does not say which step asked for it, so any code that runs
+in a job holding `id-token: write` can mint the deploy role's credentials. The
+site's own code (its `package.json` scripts, every package `yarn install`
+fetches, `install_command`, `postbuild_command`) therefore runs only in `build`,
+which holds `contents: read` and nothing else. The two jobs that assume the role
+run nothing from the site.
+
+| Job | Needs | Holds | Runs | Hands on |
+| --- | --- | --- | --- | --- |
+| `image-cache` | | `contents: read`, `id-token: write`, the role | this repository's scripts at the defining commit (`job.workflow_sha`), and `aws s3 sync` of `s3://<bucket>/images` (`*.webp`, `*.avif`, `.image-manifest.json`) | artifact `nextjs-image-cache`, kept one day, only when the sync found a file |
+| `build` | `image-cache` | `contents: read` | the caller's checkout (`persist-credentials: false`, so no token is left on disk where the site's code runs), the node, npm and yarn fallbacks, setup-node, `install_command`, the image cache unpacked into `<app_dir>/public/images`, `yarn images:validate`, `yarn images:optimize`, `yarn build` with `build_env`, `postbuild_command`, the `out` check | artifact `nextjs-site-out` (the contents of `<app_dir>/out`), kept one day |
+| `deploy` | `build` | `contents: read`, `id-token: write`, the role | this repository's scripts at the defining commit, then the image sync (skipped when the export has no `images/`), the app-file sync and the CloudFront invalidation | the site, in S3 |
+
+The hand-offs:
+
+- **`nextjs-image-cache`** is read-only input to `build`. An empty or missing
+  S3 prefix, or a sync that fails, is no cache, as before: `image-cache`
+  passes, uploads nothing, and `build` skips the download. A cache artifact
+  that cannot be downloaded (one older than a day, on a re-run of `build`
+  alone) is also no cache; `images:optimize` then re-creates every image.
+- **`nextjs-site-out`** is data to `deploy`. It is downloaded to
+  `$RUNNER_TEMP/site-out`, never executed, and named to `aws s3 sync` only
+  as an argument. Before the role is assumed, `scripts/check-site-export.sh`
+  walks it and fails the job, naming every entry, on any symbolic link (one
+  whose target resolves outside the export is named as such), on any entry
+  that is neither a regular file nor a directory, and on any entry whose real
+  path lies outside it; `aws s3 sync` follows links, so a link could
+  otherwise publish a file from anywhere on the runner. Both syncs also pass
+  `--no-follow-symlinks`. The names and link targets in those annotations
+  are escaped as workflow-command data (`%`, CR and LF), so a name the build
+  chose cannot end its annotation and start a command of its own.
+- An artifact keeps no empty directory, so a site whose `out/images` is
+  empty, or absent, reaches `deploy` with no `images/`; the image sync is then
+  skipped with a line saying so, where a sync of the missing directory would
+  fail the deploy.
+- Both artifacts include hidden files, so `images/.image-manifest.json`
+  travels with the images it describes, as the old single job's sync did.
+
+`image-cache` and `deploy` check out no caller code, run no `node`, `yarn`,
+`npm` or Python, set `PYTHONSAFEPATH: "1"` for the job, and use only the
+commit-pinned checkout, artifact and `configure-aws-credentials` actions.
+`.github/scripts/test_reusable_workflows.py` fails when any of that, or the
+job graph and permissions above, changes.
+
+Each token job runs `scripts/install-awscli.sh` before it assumes the role.
+It uses the runner's own `aws` only when the `aws` on `PATH` is
+`/usr/bin/aws` or `/usr/local/bin/aws` and that directory, the file it
+resolves to and that file's directory are all owned by root (uid 0) and
+neither group- nor world-writable. Those three paths are all it checks: not
+their parent directories, not the directory of a link between the two, and
+not what the CLI loads at run time, and the later steps find `aws` by `PATH`
+again. Root ownership keeps out an `aws` planted by a build without root, but
+the job's user may have sudo (it does on GitHub's hosted runners and the
+fleet's pools; `build`'s own fallback runs `sudo apt-get`), and a build with
+sudo can put a root-owned `aws` there. So the check is not what keeps a
+build's files out of a token job: the fresh runner each job starts on is
+(below). Any other `aws` is never run: the script says it is not used and
+installs AWS CLI 2.39.4 under `$RUNNER_TEMP` (no sudo), first on `PATH` for
+the later steps: it downloads AWS's per-architecture zip and its `.sig`, and runs
+nothing from it until the zip matches the sha256 committed in the script and
+`gpgv` finds a valid signature by the AWS CLI key, fingerprint
+`FB5D B77F D5C1 18B8 0511 ADA8 A631 0ACC 4672 475C`, committed as
+`scripts/awscli-public-key.asc` from AWS's install guide. It needs `curl`,
+`sha256sum`, `gpgv`, `base64` and `unzip` on the runner, and says which is
+missing. Moving to another CLI version means re-resolving the version, both
+digests and the key from AWS and updating `scripts/tests/install-awscli.test.sh`,
+which fails on any other values.
+
+The split assumes each job starts on a fresh runner, as the fleet's
+ephemeral pools and GitHub's hosted runners give. On a runner reused between
+jobs, `build`, which runs the site's code with a user that may have sudo,
+could leave files for a later token job to run, a root-owned `aws` among
+them, and nothing here would catch it; the `aws` rule above stops only a
+build without root. That assumption is the defence, so never pass a
+persistent runner as `runner`.
+
+The three jobs each take a runner from `runner` (or the caller's
+`CI_RUNNER_SMALL`), so a deploy now holds three runner slots in turn rather
+than one. Their names, `image-cache`, `build` and `deploy`, are stable: a
+caller's required check or concurrency rule may name them.
+
 ## nextjs-site-check
 
 Runs the same install (with the yarn dependency cache restored via

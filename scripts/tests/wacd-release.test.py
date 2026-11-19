@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -115,7 +116,7 @@ class Script:
         self.responses = list(responses)
         self.bodies = []
 
-    def __call__(self, body, trust, timeout):
+    def __call__(self, body, trust, timeout, mint_timeout=None):
         self.bodies.append(body)
         if len(self.responses) > 1:
             return self.responses.pop(0)
@@ -548,7 +549,7 @@ class SettingsModeTests(unittest.TestCase):
             self.assertEqual(json.loads(Path(receipt).read_text())["wac_cd"], plan)
 
 
-RELEASE = {"digest": CHART_DIGEST, "revision": SOURCE, "images": IMAGES, "copy": "6", "fleet_commit": "f" * 40}
+RELEASE = {"digest": CHART_DIGEST, "revision": SOURCE, "images": IMAGES, "copy": "6"}
 
 
 def unsteady(change):
@@ -603,8 +604,7 @@ class RunningTests(unittest.TestCase):
         self.assertEqual(
             out.splitlines(),
             [f"running={VERSION}", f"commit={SOURCE}",
-             "images=" + json.dumps(IMAGES, separators=(",", ":"), sort_keys=True), "copy_revision=6",
-             "fleet_commit=" + "f" * 40],
+             "images=" + json.dumps(IMAGES, separators=(",", ":"), sort_keys=True), "copy_revision=6"],
         )
         self.assertEqual(script.bodies, [wacd.STATUS_BODY()], "one status read; nothing is released")
         self.assertEqual(reads, [("travel", VERSION)])
@@ -642,6 +642,13 @@ class RunningTests(unittest.TestCase):
                 self.assertEqual(len(err.strip().splitlines()), 1)
                 self.assertGreater(len(script.bodies), 1)
                 self.assertLessEqual(clock.now - 1000.0, 31)
+
+    def test_the_rollout_refusal_names_the_seconds_it_waited(self):
+        """The wait stops with under MIN_READ_SECONDS left, so the sentence says what was measured."""
+        _, _, clock, (code, _, err, _) = self.run_cli((200, unsteady(UNSTEADY["degraded"])), timeout="31")
+        self.assertEqual(code, 3, err)
+        self.assertEqual(clock.now - 1000.0, 30, "the last poll left one second, too little for a read")
+        self.assertIn("for the whole 30 seconds", err)
 
     def test_an_unknown_or_malformed_running_version_is_a_fault_not_a_rollout(self):
         for value in ("", "bootstrap", "v1.4.2", None, 7):
@@ -692,7 +699,7 @@ class RunningTests(unittest.TestCase):
         self.assertEqual(calls, [("registry.network.svc.cluster.local:5000", "travel", VERSION, 30.0)])
 
     def test_the_token_is_never_printed(self):
-        def explode(body, trust, timeout):
+        def explode(body, trust, timeout, mint_timeout=None):
             raise RuntimeError(f"Authorization: Bearer {TOKEN}")
 
         with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd, "transport", explode):
@@ -710,7 +717,7 @@ fixture = json.loads(os.environ["DRIVER_FIXTURE"])
 wacd.DEADLINE_MARGIN = fixture["margin"]
 wacd.POLL_SECONDS = 0.2
 wacd.trust_context = lambda: None
-wacd.transport = lambda body, trust, timeout: (200, fixture["status"])
+wacd.transport = lambda body, trust, timeout, mint_timeout=None: (200, fixture["status"])
 wacd.read_release = lambda app, version, timeout=30: fixture["release"]
 wacd.read_copy = lambda app, version: "7"
 argv = [a.replace("DEADLINE", str(time.time() + fixture["deadline"])) for a in sys.argv[2:]]
@@ -781,7 +788,7 @@ class DeadlineTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 6, "a body dripping one byte at a time is cut off at the deadline")
 
     def test_a_stuck_status_read_ends_at_the_deadline(self):
-        def stuck(body, trust, timeout):
+        def stuck(body, trust, timeout, mint_timeout=None):
             time.sleep(30)
 
         started = time.monotonic()
@@ -792,6 +799,51 @@ class DeadlineTests(unittest.TestCase):
         self.assertEqual((code, out), (1, ""))
         self.assertIn("did not finish within the settings plan's deadline", err)
         self.assertLess(time.monotonic() - started, 5)
+
+    def test_the_first_release_read_is_one_request_that_ends_at_its_deadline(self):
+        """plan's bootstrap read: a gateway that never answers, or trickles, costs one request and its deadline."""
+        seen = []
+
+        class Silent(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.server.drip:
+                    self.send_response(200)
+                    self.send_header("Content-Length", "100000")
+                    self.end_headers()
+                try:
+                    for _ in range(100):
+                        if self.server.drip:
+                            self.wfile.write(b" ")
+                            self.wfile.flush()
+                        time.sleep(0.1)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        for drip in (False, True):
+            with self.subTest(drip=drip):
+                seen.clear()
+                server = ThreadingHTTPServer(("127.0.0.1", 0), Silent)
+                server.drip = drip
+                server.daemon_threads = True
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                self.addCleanup(server.server_close)
+                self.addCleanup(server.shutdown)
+                started = time.monotonic()
+                with patch.object(wacd, "trust_context", lambda: None), \
+                        patch.object(wacd.ci, "URL", f"http://127.0.0.1:{server.server_address[1]}/v1/release"), \
+                        patch.object(wacd.ci, "oidc_token", lambda timeout=20: "t0k"), \
+                        patch.object(wacd, "DEADLINE_MARGIN", 1):
+                    code, out, err = CliTests.main(self, "bootstrap", "--deadline", str(time.time() + 4))
+                self.assertEqual((code, out), (1, ""), err)
+                self.assertTrue(err.startswith("wacd release: "), err)
+                self.assertNotIn("t0k", err)
+                self.assertEqual(seen, [json.dumps(wacd.STATUS_BODY()).encode()], "one request, never asked again")
+                self.assertLess(time.monotonic() - started, 6)
+                self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
     def test_a_deadline_already_past_or_too_close_reads_nothing(self):
         for offset in (-1, 10):
@@ -849,8 +901,97 @@ class DeadlineTests(unittest.TestCase):
                 self.assertEqual(code, expected, err)
                 self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
                 self.assertIs(signal.getsignal(signal.SIGALRM), mine)
-        time.sleep(1.5)
 
+    def test_a_slow_token_mint_on_the_last_pass_still_ends_in_the_rollout_refusal(self):
+        """GitHub's token endpoint answers after six seconds once the app has been seen rolling out.
+
+        The fake endpoint honours the timeout it is given, as a socket does: it answers when its delay
+        fits and fails as a transport error when it does not. The status wait is four seconds and the
+        backstop five, so an unbounded mint outlasts both.
+        """
+        gateway = Recorder(200, unsteady(UNSTEADY["out of sync"]))
+        self.addCleanup(gateway.close)
+        mints = []
+
+        def token_endpoint(request, context, timeout):
+            delay = 6 if len(mints) >= 2 else 0
+            mints.append(timeout)
+            time.sleep(min(delay, timeout))
+            if delay > timeout:
+                raise ReleaseError("release transport failed; check TLS trust and service readiness")
+            return 200, {"value": TOKEN}
+
+        grant = {"ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.actions.githubusercontent.com/token",
+                 "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "runner-bearer"}
+        started = time.monotonic()
+        with patch.object(wacd, "trust_context", lambda: None), patch.object(wacd.ci, "URL", gateway.url), \
+                patch.object(wacd.ci, "fetch", token_endpoint), \
+                patch.object(wacd, "read_release", lambda app, version, timeout=30: RELEASE), \
+                patch.object(wacd, "DEADLINE_MARGIN", 1), patch.object(wacd, "POLL_SECONDS", 0.2), \
+                patch.dict(os.environ, grant):
+            code, out, err = CliTests.main(
+                self, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", str(time.time() + 5))
+        self.assertEqual((code, out), (wacd.ROLLING_OUT_EXIT, ""), err)
+        self.assertIn("travel was rolling out 0.1.0", err)
+        self.assertGreaterEqual(len(gateway.requests), 2, "the app was seen rolling out before the slow mint")
+        self.assertLess(time.monotonic() - started, 5, "decided before the backstop")
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+
+    def test_a_slow_mint_then_a_slow_gateway_still_ends_the_read_within_the_wait(self):
+        """The mint takes two seconds of the last pass, then the gateway takes longer than the pass has left.
+
+        Each read, its token mint included, is bounded by the time left in the wait, so the request gets only
+        what the mint left of it and the step decides before the deadline's backstop, never with its sentence.
+        """
+        seen = []
+
+        class Slow(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append(time.monotonic())
+                if len(seen) > 2:
+                    time.sleep(8)
+                raw = json.dumps(unsteady(UNSTEADY["out of sync"])).encode()
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        mints = []
+
+        def token_endpoint(request, context, timeout):
+            mints.append(timeout)
+            if len(mints) > 2:
+                time.sleep(2)
+            return 200, {"value": TOKEN}
+
+        grant = {"ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.actions.githubusercontent.com/token",
+                 "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "runner-bearer"}
+        started = time.monotonic()
+        with patch.object(wacd, "trust_context", lambda: None), \
+                patch.object(wacd.ci, "URL", f"http://127.0.0.1:{server.server_address[1]}/v1/release"), \
+                patch.object(wacd.ci, "fetch", token_endpoint), \
+                patch.object(wacd, "read_release", lambda app, version, timeout=30: RELEASE), \
+                patch.object(wacd, "DEADLINE_MARGIN", 1), patch.object(wacd, "POLL_SECONDS", 0.2), \
+                patch.dict(os.environ, grant):
+            code, out, err = CliTests.main(
+                self, "running", "--app", "travel", "--wait-timeout", "120", "--deadline", str(time.time() + 5))
+        self.assertEqual((code, out), (1, ""), err)
+        self.assertEqual(len(seen), 3, "the app was seen rolling out twice before the slow pass")
+        self.assertNotIn("deadline", err)
+        self.assertLess(time.monotonic() - started, 4.8, "decided within the wait, before the backstop")
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
 class EarlierReleaseTests(unittest.TestCase):
     """Rule B: an earlier version above the running one counts as released only if its GitHub Release exists."""
@@ -957,6 +1098,163 @@ class EarlierReleaseTests(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_API_URL": "http://127.0.0.1:9", "GITHUB_REPOSITORY": "willfell/travel",
                                      "GITHUB_TOKEN": "t0k"}), self.assertRaises(ReleaseError):
             wacd.release_exists("v1.4.4")
+
+
+_CHART_TESTS_SPEC = importlib.util.spec_from_file_location(
+    "wacd_release_chart_tests", Path(__file__).with_name("wacd-chart.test.py")
+)
+_CHART_TESTS = importlib.util.module_from_spec(_CHART_TESTS_SPEC)
+_CHART_TESTS_SPEC.loader.exec_module(_CHART_TESTS)
+Registry = _CHART_TESTS.Registry
+
+
+class UnfinishedReleaseTests(unittest.TestCase):
+    """A settings release waits for an unfinished code release above the running version, unless it was rolled back.
+
+    The evidence of a rollback is a version above the running one with a GitHub
+    Release, which github-release creates only after deploy proved the build.
+    """
+
+    SENTENCE = ("wacd release: {tag} was claimed by a code release that never published; re-run that release, "
+                "or release a new commit, before releasing settings.\n")
+    LEFT = "left={tag} was left unfinished and can now ship only as a new commit.\n"
+    UNREADABLE = ("wacd release: the GitHub Releases of travel could not be read, so this settings release cannot "
+                  "tell a rollback from an unfinished release; run it again.\n")
+
+    def setUp(self):
+        self.registry = Registry()
+        self.addCleanup(self.registry.close)
+        address = patch.object(wacd.chart, "PUSH_REGISTRY", self.registry.address)
+        address.start()
+        self.addCleanup(address.stop)
+
+    def run_cli(self, versions, codes, published=(), deadline=60.0, prefix="v", releases=(404,)):
+        """releases: the GitHub API's answers to the Release reads, in order (the last repeats)."""
+        for version in published:
+            self.registry.put_chart("travel", version)
+        self.registry.requests.clear()
+        self.api = ReleasesApi(list(releases))
+        self.addCleanup(self.api.close)
+        env = {"GITHUB_API_URL": self.api.url, "GITHUB_REPOSITORY": "willfell/travel", "GITHUB_TOKEN": "t0k"}
+        with patch.dict(os.environ, env):
+            code, out, err = CliTests.main(
+                self, "unfinished-release", "--app", "travel", "--prefix", prefix, "--running", "1.4.2",
+                "--versions", versions, "--codes", codes, "--deadline", str(time.time() + deadline))
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0), "the backstop is disarmed")
+        self.assertNotIn("t0k", out + err)
+        read = [path.split("/manifests/")[1] for path, _ in self.registry.requests if "/manifests/" in path]
+        return read, (code, out, err)
+
+    def asked(self):
+        return [path.rsplit("/", 1)[-1] for _, path, _, _ in self.api.seen]
+
+    def test_the_newest_code_claim_with_no_chart_refuses_naming_its_tag(self):
+        read, result = self.run_cli("1.4.3", "1.4.3", published=("1.4.2",))
+        self.assertEqual(result, (wacd.UNFINISHED_EXIT, "", self.SENTENCE.format(tag="v1.4.3")))
+        self.assertEqual(read, ["1.4.3"], "only versions above the running one are read")
+        _, result = self.run_cli("2.0.0", "2.0.0", prefix="travel-v")
+        self.assertEqual(result[2], self.SENTENCE.format(tag="travel-v2.0.0"))
+
+    def test_a_newest_published_version_with_no_code_claim_above_it_says_nothing_and_reads_no_release(self):
+        """No unfinished code claim sits above the newest published chart, so the first chart read settles it."""
+        for label, versions, codes, published in (
+            ("a rollback target's newer releases", "1.4.4,1.4.3", "1.4.4,1.4.3", ("1.4.4", "1.4.3")),
+            ("a code claim below a published release", "1.4.5,1.4.4,1.4.3", "1.4.5,1.4.3", ("1.4.5", "1.4.4")),
+        ):
+            with self.subTest(case=label):
+                read, result = self.run_cli(versions, codes, published=published)
+                self.assertEqual(result, (0, "left=\n", ""))
+                self.assertEqual(read, [versions.split(",")[0]], "the newest published version settles it")
+                self.assertEqual(self.asked(), [])
+
+    def test_after_a_rollback_the_newest_unfinished_code_claim_is_left_behind(self):
+        for label, codes, left in (
+            ("code claims only", "1.4.5,1.4.4,1.4.3", "v1.4.5"),
+            ("a settings claim above them", "1.4.4,1.4.3", "v1.4.4"),
+        ):
+            with self.subTest(case=label):
+                read, result = self.run_cli("1.4.5,1.4.4,1.4.3", codes, published=("1.4.3",), releases=(200,))
+                self.assertEqual(result, (0, self.LEFT.format(tag=left), ""))
+                self.assertEqual(read, ["1.4.5", "1.4.4", "1.4.3"], "read down to the published version")
+                self.assertEqual(self.asked(), ["v1.4.3"], "its Release proves the rollback")
+
+    def test_a_published_version_with_no_release_is_no_rollback(self):
+        """1.4.2 runs; 1.4.3 published and never deployed (a failed deploy, or deploy: false); 1.4.4 failed in build."""
+        read, result = self.run_cli("1.4.4,1.4.3", "1.4.4,1.4.3", published=("1.4.3",), releases=(404,))
+        self.assertEqual(result, (wacd.UNFINISHED_EXIT, "", self.SENTENCE.format(tag="v1.4.4")))
+        self.assertEqual((read, self.asked()), (["1.4.4", "1.4.3"], ["v1.4.3"]))
+        read, result = self.run_cli("1.4.5,1.4.4,1.4.3", "1.4.5", published=("1.4.4", "1.4.3"), releases=(404,))
+        self.assertEqual(result, (wacd.UNFINISHED_EXIT, "", self.SENTENCE.format(tag="v1.4.5")),
+                         "behind a settings release whose deploy failed, too")
+        self.assertEqual(self.asked(), ["v1.4.4", "v1.4.3"])
+
+    def test_a_rollback_is_found_past_a_published_version_that_never_ran(self):
+        """1.4.3 released and rolled back to 1.4.2; 1.4.4 published and never deployed; 1.4.5 failed in build."""
+        read, result = self.run_cli("1.4.5,1.4.4,1.4.3", "1.4.5,1.4.4,1.4.3", published=("1.4.4", "1.4.3"),
+                                    releases=(404, 200))
+        self.assertEqual(result, (0, self.LEFT.format(tag="v1.4.5"), ""))
+        self.assertEqual(self.asked(), ["v1.4.4", "v1.4.3"])
+
+    def test_releases_that_cannot_be_read_conclude_nothing(self):
+        for status in (401, 403, 500, 502):
+            with self.subTest(status=status):
+                _, result = self.run_cli("1.4.4,1.4.3", "1.4.4", published=("1.4.3",), releases=(status,))
+                self.assertEqual(result, (1, "", self.UNREADABLE), "neither a refusal nor a rollback")
+
+    def test_a_settings_claim_with_no_chart_is_passed_over(self):
+        read, result = self.run_cli("1.4.4,1.4.3", "1.4.3")
+        self.assertEqual(result, (wacd.UNFINISHED_EXIT, "", self.SENTENCE.format(tag="v1.4.3")))
+        self.assertEqual(read, ["1.4.4", "1.4.3"])
+        read, result = self.run_cli("1.4.4", "")
+        self.assertEqual(result, (0, "left=\n", ""), "its own re-run takes that claim again")
+
+    def test_no_versions_above_reads_nothing(self):
+        read, result = self.run_cli("", "")
+        self.assertEqual((read, result), ([], (0, "left=\n", "")))
+
+    def test_a_registry_that_cannot_be_read_is_a_fault_never_absent(self):
+        self.registry.put_manifest("deploy/travel", "1.4.3", "sha256:" + "b" * 64, "x", status=500)
+        read, (code, out, err) = self.run_cli("1.4.3", "1.4.3")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("the registry answered HTTP 500", err)
+        with patch.object(wacd.chart, "PUSH_REGISTRY", "127.0.0.1:9"):
+            read, (code, out, err) = self.run_cli("1.4.3", "1.4.3")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("cannot reach the registry", err)
+
+    def test_the_count_is_bounded_with_a_sentence(self):
+        versions = ",".join(f"1.5.{n}" for n in range(40, 0, -1))
+        read, (code, out, err) = self.run_cli(versions, "")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(len(read), wacd.MAX_EARLIER)
+        self.assertIn(f"{wacd.MAX_EARLIER} versions above 1.4.2", err)
+
+    def test_the_arguments_are_checked_before_any_read(self):
+        for versions, codes in (("1.4.3", "1.4.4"), ("v1.4.3", ""), ("1.4.3", "x")):
+            with self.subTest(versions=versions, codes=codes):
+                read, (code, _, err) = self.run_cli(versions, codes)
+                self.assertEqual((code, read), (1, []), err)
+
+    def test_the_reads_end_at_the_deadline(self):
+        class Silent(BaseHTTPRequestHandler):
+            def do_GET(self):
+                time.sleep(10)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Silent)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        started = time.monotonic()
+        with patch.object(wacd.chart, "PUSH_REGISTRY", f"127.0.0.1:{server.server_address[1]}"):
+            _, (code, out, err) = self.run_cli("1.4.3", "1.4.3", deadline=2)
+        self.assertEqual((code, out), (1, ""), err)
+        self.assertLess(time.monotonic() - started, 5, "a registry that never answers is cut off at the deadline")
+        _, (code, _, err) = self.run_cli("1.4.3", "1.4.3", deadline=-1)
+        self.assertEqual(code, 1)
+        self.assertIn("deadline had passed", err)
 
 
 class ServedTests(unittest.TestCase):
@@ -1138,34 +1436,209 @@ class PostTests(unittest.TestCase):
         self.assertEqual(json.loads(request["body"]), wacd.STATUS_BODY())
 
 
-class UnansweredReleaseTests(unittest.TestCase):
-    """Only plan's contract call rides out a gateway that answers nothing; deploy's release fails at once."""
+class Silent:
+    """A listener that reads a whole request and closes without answering: "reset" sends an RST, "eof" a FIN."""
 
-    def test_a_release_nothing_answers_fails_at_once_with_one_token(self):
+    def __init__(self, how):
+        self.bodies = []
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen()
+        self.how = how
+        self.url = f"http://127.0.0.1:{self.server.getsockname()[1]}/v1/release"
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while True:
+            try:
+                connection, _ = self.server.accept()
+            except OSError:
+                return
+            with connection:
+                connection.settimeout(5)
+                received = b""
+                try:
+                    while b"\r\n\r\n" not in received:
+                        received += connection.recv(65536)
+                    head, body = received.split(b"\r\n\r\n", 1)
+                    length = int(next(line.split(b":", 1)[1] for line in head.split(b"\r\n")
+                                      if line.lower().startswith(b"content-length:")))
+                    while len(body) < length:
+                        body += connection.recv(65536)
+                    self.bodies.append(json.loads(body))
+                except (OSError, ValueError, StopIteration):
+                    pass
+                if self.how == "reset":
+                    connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+
+    def close(self):
+        self.server.close()
+
+
+class RestartTests(unittest.TestCase):
+    """deploy rides out the gateway's Recreate rollout, about 35 s with nothing listening, at the CLI."""
+
+    def setUp(self):
         closed = Gateway((200, {}))
         closed.close()
+        self.refused_url = closed.url
+        self.silent = {how: Silent(how) for how in ("reset", "eof")}
+        for silent in self.silent.values():
+            self.addCleanup(silent.close)
 
+    def deploy(self, gateway, plan, rest=None, timeout="600", trust=lambda: None, connect=None):
+        """Run `release`, sending attempt i as plan[i] says (rest after the plan): None reaches the gateway,
+        "refused" a closed port, "reset" or "eof" a listener that reads the request and drops it."""
+        real_post = wacd.post
+        attempts, minted = [], []
+
+        def mint():
+            minted.append(f"minted.token.{len(minted)}")
+            return minted[-1]
+
+        def post(body, trust, timeout, mint_timeout=None):
+            how = plan[len(attempts)] if len(attempts) < len(plan) else rest
+            attempts.append((how, body["operation"]))
+            url = {None: gateway.url, "refused": self.refused_url}.get(how) or self.silent[how].url
+            with patch.object(wacd.ci, "URL", url):
+                return real_post(body, trust, timeout, mint_timeout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            summary, receipt = Path(tmp) / "summary.md", Path(tmp) / "receipt.json"
+            out, err = io.StringIO(), io.StringIO()
+            stack, clock = fake_clock()
+            with stack, patch.object(wacd, "post", post), patch.object(wacd.ci, "oidc_token", mint), \
+                    patch.object(wacd, "trust_context", trust), contextlib.ExitStack() as connecting, \
+                    patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                if connect is not None:
+                    connecting.enter_context(patch.object(socket, "create_connection", connect))
+                code = wacd.main(["wacd-release.py", *CliTests.release_argv(self, str(receipt), timeout=timeout)])
+            self.summary = summary.read_text() if summary.exists() else ""
+            self.receipt = json.loads(receipt.read_text()) if receipt.exists() else None
+        self.attempts, self.minted, self.clock, self.err = attempts, minted, clock, err.getvalue()
+        for token in minted:
+            self.assertNotIn(token, out.getvalue() + self.err + self.summary)
+        return code
+
+    def gateway(self, *responses):
+        gateway = Gateway(*responses)
+        self.addCleanup(gateway.close)
+        return gateway
+
+    def assertFreshTokens(self, gateway):
+        self.assertEqual(len(self.minted), len(self.attempts), "each attempt mints its own token")
+        self.assertEqual(len(set(self.minted)), len(self.minted))
+        self.assertEqual(len({auth for auth, _ in gateway.seen}), len(gateway.seen))
+
+    def test_refused_connections_on_the_release_and_a_status_read_are_waited_out(self):
+        gateway = self.gateway((200, running("0.0.9")), (200, released(not_ready())), (200, evidence()))
+        code = self.deploy(gateway, [None, "refused", "refused", None, "refused", None])
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual([op for _, op in self.attempts], ["status", "release", "release", "release", "status", "status"])
+        self.assertEqual([body for _, body in gateway.seen],
+                         [wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION), wacd.STATUS_BODY()])
+        self.assertFreshTokens(gateway)
+        self.assertEqual(self.clock.sleeps, [5, 10, 5])
+        self.assertEqual(self.summary, "\nThe gateway was restarting; the release waited 20 s for it.\n")
+
+    def test_no_line_when_the_gateway_answered_every_request(self):
+        gateway = self.gateway((200, running("0.0.9")), (200, released()))
+        self.assertEqual(self.deploy(gateway, []), 0, self.err)
+        self.assertEqual(self.summary, "")
+
+    def test_a_gateway_that_stays_away_past_the_window_could_not_be_reached(self):
         def no_route(*args, **kwargs):
             raise OSError(errno.EHOSTUNREACH, "No route to host")
 
-        for label, url, connect in (("refused", closed.url, None), ("no route to host", "http://127.0.0.1:9/v1/release",
-                                                                     no_route)):
-            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
-                minted = []
-                stack, clock = fake_clock()
-                out, err = io.StringIO(), io.StringIO()
-                with stack, patch.object(wacd.ci, "URL", url), \
-                        patch.object(wacd.ci, "oidc_token", lambda: minted.append(TOKEN) or TOKEN), \
-                        patch.object(wacd, "trust_context", lambda: None), \
-                        contextlib.ExitStack() as connecting, \
-                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                    if connect is not None:
-                        connecting.enter_context(patch.object(socket, "create_connection", connect))
-                    code = wacd.main(["wacd-release.py", *CliTests.release_argv(self, str(Path(tmp) / "r.json"))])
+        for label, how, connect in (("refused", "refused", None), ("no route to host", None, no_route)):
+            with self.subTest(case=label):
+                gateway = self.gateway((200, released()))
+                code = self.deploy(gateway, [], rest=how, connect=connect)
                 self.assertEqual(code, 1)
-                self.assertEqual(err.getvalue(), "wacd release: release transport failed; check TLS trust and "
-                                                 "service readiness\n")
-                self.assertEqual((len(minted), clock.sleeps), (1, []), "nothing is retried on the release path")
+                self.assertEqual(self.err, "wacd release: " + wacd.UNREACHABLE.format(seconds=90) + "\n")
+                self.assertIn("could not be reached", self.err)
+                self.assertEqual(gateway.seen, [])
+                self.assertGreater(len(self.minted), 2)
+                self.assertEqual(self.clock.now - 1000.0, sum(self.clock.sleeps))
+                self.assertGreaterEqual(sum(self.clock.sleeps), 90)
+                self.assertLess(sum(self.clock.sleeps), 90.1)
+                self.assertEqual(self.summary, "")
+
+    def test_the_window_never_outlasts_the_wait(self):
+        gateway = self.gateway((200, released()))
+        self.assertEqual(self.deploy(gateway, [], rest="refused", timeout="20"), 1)
+        self.assertIn("could not be reached for 20 s", self.err)
+        self.assertLessEqual(self.clock.now - 1000.0, 20.1)
+
+    def test_a_release_dropped_after_it_was_sent_goes_on_when_the_status_shows_it(self):
+        for how in ("reset", "eof"):
+            with self.subTest(drop=how):
+                self.silent[how].bodies.clear()
+                gateway = self.gateway((200, running("0.0.9")), (200, not_ready()), (200, evidence()))
+                code = self.deploy(gateway, [None, how])
+                self.assertEqual(code, 0, self.err)
+                self.assertEqual(self.silent[how].bodies, [wacd.RELEASE_BODY(VERSION)])
+                self.assertEqual([body for _, body in gateway.seen], [wacd.STATUS_BODY()] * 3,
+                                 "the release is never sent again")
+                self.assertEqual(self.receipt["released"],
+                                 {"version": VERSION, "chart_digest": CHART_DIGEST, "from_status": True})
+                self.assertFreshTokens(gateway)
+                self.assertEqual(self.summary, "")
+
+    def test_a_status_read_dropped_after_it_was_sent_is_asked_again(self):
+        gateway = self.gateway((200, running("0.0.9")), (200, released(not_ready())), (200, evidence()))
+        self.assertEqual(self.deploy(gateway, [None, None, "reset", None]), 0, self.err)
+        self.assertEqual(len(gateway.seen), 3)
+        self.assertIn("waited 5 s", self.summary)
+
+    def test_a_release_dropped_with_the_status_not_showing_it_is_sent_again_once(self):
+        gateway = self.gateway((200, running("0.0.9")), (200, running("0.0.9")), (200, released()))
+        code = self.deploy(gateway, [None, "reset"])
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual([body for _, body in gateway.seen],
+                         [wacd.STATUS_BODY(), wacd.STATUS_BODY(), wacd.RELEASE_BODY(VERSION)])
+        self.assertEqual(self.silent["reset"].bodies, [wacd.RELEASE_BODY(VERSION)])
+        self.assertFreshTokens(gateway)
+        self.assertEqual(self.receipt["released"], released()["released"])
+
+    def test_a_release_dropped_twice_without_the_status_showing_it_stops(self):
+        gateway = self.gateway((200, running("0.0.9")))
+        code = self.deploy(gateway, [None, "reset", None, "reset", None])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.err, "wacd release: " + wacd.RESEND_LOST.format(version=VERSION) + "\n")
+        self.assertEqual(self.silent["reset"].bodies, [wacd.RELEASE_BODY(VERSION)] * 2)
+        self.assertEqual(len(self.attempts), 5)
+        self.assertIsNone(self.receipt)
+
+    def test_a_release_dropped_with_its_status_unreadable_until_the_deadline_says_so(self):
+        gateway = self.gateway((200, running("0.0.9")), (503, {}))
+        code = self.deploy(gateway, [None, "reset"], timeout="20")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.err, "wacd release: " + wacd.DROPPED_UNREAD.format(version=VERSION) + "\n")
+        self.assertEqual(self.silent["reset"].bodies, [wacd.RELEASE_BODY(VERSION)], "never sent again blind")
+        self.assertGreater(len(gateway.seen), 2)
+        self.assertEqual({json.dumps(body) for _, body in gateway.seen}, {json.dumps(wacd.STATUS_BODY())})
+        self.assertLessEqual(self.clock.now - 1000.0, 20.1)
+        self.assertIsNone(self.receipt)
+
+    def test_a_tls_failure_still_fails_at_once(self):
+        def unverified(*args, **kwargs):
+            raise ssl.SSLCertVerificationError(1, "certificate verify failed: self-signed certificate")
+
+        for label, patches in (("wrong protocol", ()), ("certificate", ((ssl.SSLContext, "wrap_socket", unverified),))):
+            with self.subTest(case=label), contextlib.ExitStack() as stack:
+                for target, name, value in patches:
+                    stack.enter_context(patch.object(target, name, value))
+                gateway = self.gateway((200, released()))
+                tls = Gateway.__new__(Gateway)
+                tls.url = gateway.url.replace("http://", "https://")
+                code = self.deploy(tls, [], trust=ssl.create_default_context)
+                self.assertEqual(code, 1)
+                self.assertEqual(self.err, "wacd release: release transport failed; check TLS trust and "
+                                           "service readiness\n")
+                self.assertEqual((len(self.minted), self.clock.sleeps), (1, []))
+                self.assertEqual(gateway.seen, [])
 
 
 class RefusalTests(unittest.TestCase):

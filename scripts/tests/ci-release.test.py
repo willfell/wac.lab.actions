@@ -137,6 +137,7 @@ class ReleaseTests(unittest.TestCase):
             url = fetch.call_args.args[0].full_url
             self.assertIn("audience=wacwini%3Aci-deploy", url)
             self.assertNotIn("wrong", url)
+            self.assertEqual(fetch.call_args.args[2], 20, "lab-release and wac.lab's proof still wait 20 seconds")
 
     def test_every_poll_obtains_new_oidc_and_denial_is_not_retried(self):
         with (

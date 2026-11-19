@@ -21,6 +21,11 @@ release, never by replaying an old build. When that higher tag does not contain
 HEAD (a settings release tagged it on older running code after HEAD's run
 claimed its version and failed before releasing), the refusal says HEAD was
 never released and a new commit releases it, instead of calling it a replay.
+wac-cd refuses such a settings release while HEAD's chart is unpublished
+and no version above the running one has a GitHub Release (codes= below), so
+this is left for a run that failed after publishing its chart, for a claim a
+settings release passed after a rollback, and for tags placed by hand or under
+an older pin.
 
 `--mode settings --commit C --running V` plans a settings-only release: the
 running version V's images, built from C, released again under a new version
@@ -32,7 +37,20 @@ claimed=: claimed names main's newest version when that tag already sits on C
 above V (an earlier settings release of this code that never went live), so
 wac-cd can take it again rather than spend a second version on one revision.
 above= lists every version on main newer than V, newest first, comma-separated,
-so wac-cd can find one that already shipped the dispatched revision.
+so wac-cd can find one that already shipped the dispatched revision. codes=
+lists those of them a code release claimed, in the same order: a code release
+tags a commit that no tag with the prefix names yet, while a settings release
+tags code an earlier version already ran, so a version is a code release's when
+no lower tag with the prefix sits on its commit. wac-cd refuses the settings
+release while the newest of them has no published chart and no version above
+V has a GitHub Release, so that re-running the unfinished code release stays
+the way out; a Release above V proves a rollback, and the settings release
+proceeds.
+
+`--mode tagged` prints tagged=true when any tag <prefix>X.Y.Z exists in the
+checkout, merged into main or not, and tagged=false when none does: wac-cd's
+plan asks the gateway whether a push is an app's first only when no such tag
+exists, so an app that ever claimed a version is never asked about.
 """
 
 import argparse
@@ -281,6 +299,11 @@ def plan_settings(repo, prefix, commit, running, main_ref=MAIN_REF):
         reverse=True,
     )
     above = ",".join(".".join(str(part) for part in parsed) for parsed, _ in merged if parsed > current)
+    codes = ",".join(
+        ".".join(str(part) for part in parsed)
+        for parsed, tag in merged
+        if parsed > current and first_on_its_commit(repo, prefix, parsed, tag)
+    )
     claimed = ""
     if commit_of(repo, newest_name) == commit and newest[0] > current:
         claimed = f"{major}.{minor}.{patch}"
@@ -289,7 +312,26 @@ def plan_settings(repo, prefix, commit, running, main_ref=MAIN_REF):
     existing = commit_of(repo, tag)
     if existing is not None and existing != commit:
         raise VersionError(f"tag {tag} already exists on {existing}, not on {commit}")
-    return {"mode": "settings", "version": new, "tag": tag, "claimed": claimed, "above": above}
+    return {"mode": "settings", "version": new, "tag": tag, "claimed": claimed, "above": above, "codes": codes}
+
+
+def first_on_its_commit(repo, prefix, parsed, tag):
+    """Whether tag is the lowest tag with the prefix on its commit: a code release's, not a settings release's."""
+    commit = commit_of(repo, tag)
+    if commit is None:
+        raise VersionError(f"tag {tag} names no commit")
+    return not any(
+        found < parsed
+        for other in tag_lines(repo, "--points-at", commit)
+        if (found := parse_tag(other, prefix)) is not None
+    )
+
+
+def tagged(repo, prefix):
+    """Whether any tag with the prefix and an X.Y.Z suffix exists in the checkout."""
+    if any(ch in prefix for ch in "\r\n\0"):
+        raise VersionError("tag prefix contains a line break")
+    return any(parse_tag(tag, prefix) for tag in tag_lines(Path(repo), "--list"))
 
 
 def finish(result, deploy):
@@ -307,17 +349,25 @@ def main(argv):
     parser.add_argument("--deploy", choices=("true", "false"), default="true")
     parser.add_argument("--published", choices=PUBLISHED, default="unknown")
     parser.add_argument("--main-ref", default=MAIN_REF)
-    parser.add_argument("--mode", choices=("code", "settings"), default="code")
+    parser.add_argument("--mode", choices=("code", "settings", "tagged"), default="code")
     parser.add_argument("--commit", default="")
     parser.add_argument("--running", default="")
     args = parser.parse_args(argv[1:])
+    if args.mode == "tagged":
+        try:
+            found = tagged(Path.cwd(), args.prefix)
+        except VersionError as err:
+            print(f"wacd version: {' '.join(str(err).split())}", file=sys.stderr)
+            return 1
+        print(f"tagged={'true' if found else 'false'}")
+        return 0
     if args.mode == "settings":
         try:
             result = plan_settings(Path.cwd(), args.prefix, args.commit, args.running, args.main_ref)
         except VersionError as err:
             print(f"wacd version: {' '.join(str(err).split())}", file=sys.stderr)
             return 1
-        for key in ("mode", "version", "tag", "claimed", "above"):
+        for key in ("mode", "version", "tag", "claimed", "above", "codes"):
             print(f"{key}={result[key]}")
         return 0
     try:

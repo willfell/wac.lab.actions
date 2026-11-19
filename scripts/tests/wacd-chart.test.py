@@ -252,18 +252,11 @@ class RegistryReadTests(RegistryCase):
         _, _, manifest = self.registry.routes["/v2/deploy/travel/manifests/0.1.0"]
         self.assertEqual(
             chart.chart_release(self.address, "travel", "0.1.0"),
-            {"digest": digest_of(manifest), "revision": SHA, "images": IMAGES, "copy": "none", "fleet_commit": "none"},
+            {"digest": digest_of(manifest), "revision": SHA, "images": IMAGES, "copy": "none"},
         )
-        fleet = "f" * 40
         self.registry.put_chart("travel", "0.4.0", images=refs,
-                                extra={"wacwini.com/revision": "7", "wacwini.com/fleet-commit": fleet})
-        found = chart.chart_release(self.address, "travel", "0.4.0")
-        self.assertEqual((found["copy"], found["fleet_commit"]), ("7", fleet))
-        self.registry.put_chart("travel", "0.5.0", images=refs,
-                                extra={"wacwini.com/revision": "7", "wacwini.com/fleet-commit": "abc"})
-        with self.assertRaises(chart.ChartError) as ctx:
-            chart.chart_release(self.address, "travel", "0.5.0")
-        self.assertIn("wacwini.com/fleet-commit", str(ctx.exception))
+                                extra={"wacwini.com/revision": "7", "wacwini.com/fleet-commit": "f" * 40})
+        self.assertEqual(chart.chart_release(self.address, "travel", "0.4.0")["copy"], "7")
         self.assertIsNone(chart.chart_release(self.address, "travel", "0.2.0"))
         self.registry.put_chart("travel", "0.3.0")
         with self.assertRaises(chart.ChartError) as ctx:
@@ -855,6 +848,80 @@ class BuildArgsTests(unittest.TestCase):
         self.assertEqual((bad.returncode, bad.stdout), (1, ""))
         self.assertTrue(bad.stderr.startswith("wacd chart: "), bad.stderr)
         self.assertEqual(len(bad.stderr.strip().splitlines()), 1)
+
+
+PLANTED = "planted-value-7f3a"
+
+
+class BuildSecretsTests(unittest.TestCase):
+    """`build-secrets` reads BUILD_SECRETS from its environment, never from its arguments."""
+
+    def run_secrets(self, text):
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "build-secrets", "--dir", str(out)],
+            env={**os.environ, "BUILD_SECRETS": text}, capture_output=True, text=True, check=False,
+        )
+        return result, out
+
+    def test_each_line_becomes_a_0600_file_named_by_the_lowercased_key_and_a_mask(self):
+        result, out = self.run_secrets(
+            "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY=abc=def%25 x\r\n\n  \nSENTRY_AUTH_TOKEN=tok\nBLANK=   \nIN_CR=a\rb\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["::add-mask::abc=def%2525 x", "::add-mask::tok", "::add-mask::a%0Db"],
+        )
+        files = {path.name: path for path in out.iterdir()}
+        self.assertEqual(
+            {name: path.read_bytes() for name, path in files.items()},
+            {
+                "next_server_actions_encryption_key": b"abc=def%25 x",
+                "sentry_auth_token": b"tok",
+                "blank": b"   ",
+                "in_cr": b"a\rb",
+            },
+        )
+        for name, path in files.items():
+            with self.subTest(file=name):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_refusals_name_the_line_or_the_key_and_never_the_value(self):
+        cases = (
+            ("no equals sign", f"GOOD={PLANTED}\n{PLANTED}", "build_secrets line 2 is not KEY=VALUE"),
+            ("an empty KEY", f"={PLANTED}", "build_secrets line 1 has an empty KEY"),
+            ("a lower-case KEY", f"lower={PLANTED}", "build_secrets line 1 has a KEY that does not match ^[A-Z][A-Z0-9_]*$"),
+            ("a leading digit", f"1ABC={PLANTED}", "line 1 has a KEY that does not match"),
+            ("a leading underscore", f"_KEY={PLANTED}", "line 1 has a KEY that does not match"),
+            ("a leading space", f" KEY={PLANTED}", "line 1 has a KEY that does not match"),
+            ("a hyphen", f"KEY-NAME={PLANTED}", "line 1 has a KEY that does not match"),
+            ("the value before an equals sign", f"A=1\n{PLANTED.upper().replace('-', '_')}x-y=z",
+             "line 2 has a KEY that does not match"),
+            ("the npm token", f"NODE_AUTH_TOKEN={PLANTED}",
+             "build_secrets line 1 names NODE_AUTH_TOKEN, which wac-cd already mounts as node_auth_token"),
+            ("a repeated KEY", f"A={PLANTED}\nB=x\nA={PLANTED}2", "build_secrets line 3 repeats A from line 1"),
+            ("an empty value", f"A={PLANTED}\nEMPTY=", "build_secrets line 2 gives EMPTY an empty value; set the "
+                                                     "secret it is read from, or remove the line."),
+            ("an empty value with a carriage return", "EMPTY=\r\n", "build_secrets line 1 gives EMPTY an empty value"),
+            ("a value's second line", f"PEM=-----BEGIN {PLANTED}\n{PLANTED}\n",
+             "build_secrets line 2 is not KEY=VALUE; a value must not span lines."),
+            ("a value's second line holding an equals sign", f"PEM=x\n{PLANTED}=y",
+             "build_secrets line 2 has a KEY that does not match ^[A-Z][A-Z0-9_]*$; a value must not span lines."),
+        )
+        for label, text, expected in cases:
+            with self.subTest(case=label):
+                result, out = self.run_secrets(text)
+                self.assertEqual((result.returncode, result.stdout), (1, ""))
+                self.assertTrue(result.stderr.startswith("wacd chart: "), result.stderr)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn(PLANTED, result.stderr)
+                self.assertNotIn(PLANTED.upper().replace("-", "_"), result.stderr)
+                self.assertEqual(list(out.iterdir()), [], "a refused set writes no file")
+
 
 if __name__ == "__main__":
     unittest.main()

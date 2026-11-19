@@ -2,7 +2,9 @@
 
 The pull-request half of wacd: it runs the profile's checks, renders and
 validates the deploy chart, and runs the fleet gates. It builds no image and
-pushes nothing. The profile it reads is in [The wacd profile](wacd-profile.md).
+pushes nothing, so it takes no `build_secrets` (`wac-cd`'s build-time secret
+mounts) and a pull request's `ci.commands` run without them. The profile it
+reads is in [The wacd profile](wacd-profile.md).
 
 ```yaml
 name: ci
@@ -28,7 +30,7 @@ Callers' obligations from `v1.35.0`:
 
 - The calling job grants `id-token: write`, as above.
 - The calling job's id is `wacd-ci`, with no `name:`. It is load-bearing:
-  the jobs show as `wacd-ci / contract`, `wacd-ci / checks` and the rest, and
+  the jobs show as `wacd-ci / contract`, `wacd-ci / scope`, `wacd-ci / checks` and the rest, and
   hemi and the organization ruleset read the required check
   `wacd-ci / contract` by that name. A renamed job leaves the required check
   unreported, and every merge waits for it.
@@ -49,14 +51,19 @@ Callers' obligations from `v1.35.0`:
 | --- | --- |
 | `npm_token` | optional token for private npm packages; empty uses the job's GitHub token |
 
-It runs six jobs. `contract` runs first and decides where `checks` and
+It runs seven jobs, whose names are stable: `contract`, `scope`, `checks`,
+`render`, `lint`, `techdocs` and `agents-md`. `contract` runs first and decides where `checks` and
 `render` read their settings (below); those two need it, while `lint`,
-`techdocs` and `agents-md` read no settings and start at once. `checks` sets up node or go for `ci.stack` and runs
+`techdocs` and `agents-md` read no settings and start at once. `scope` runs
+after `contract` and decides whether `checks` runs at all: a pull request that
+changes only documentation skips it (**The scope job**, below). `checks` sets up node or go for `ci.stack` and runs
 `ci.commands` in order, each in its own log group. For `stack: node` it runs
 `npm ci` first, but only when the repo has a root `package.json`; a repo
 without one, such as finance, lists `npm ci --prefix <dir>` in `ci.commands`
-itself. The npm cache is keyed on every `package-lock.json` in the repo.
-Nothing implicit runs for `go`; setup-go takes `ci.go_version`, or reads the version from `ci.go_version_file` when the profile names one. When the profile lists `ci.apt_packages`,
+itself. The npm cache is keyed on every `package-lock.json` in the repo. Before
+the root `npm ci` and `ci.commands`, it probes the private `@willfell`
+packages every lockfile pins (below).
+Nothing implicit runs for `go`; setup-go takes `ci.go_version`, or reads the version from `ci.go_version_file` when the profile names one (from a `go.mod`, its `toolchain` line before its `go` line). setup-go sets `GOTOOLCHAIN=local` for every later step, so the commands run on the Go it installed and never download another toolchain. A `ci.go_version` (hemi's `build.goVersion`) below the `go` line of the repo's `go.mod` therefore fails `checks`; before `v1.36.0` Go downloaded the newer toolchain and the run passed. The durable setting is `go_version_file: go.mod` (hemi's `build.goVersionFile`) with `go_version` dropped, since the profile refuses the two together, so the gate always runs the Go the module asks for. When the profile lists `ci.apt_packages`,
 `checks` first runs `sudo apt-get update` and
 `sudo apt-get install -y --no-install-recommends` with those packages, before
 setup-node, the root `npm ci` and `ci.commands`; a profile without the field
@@ -79,8 +86,9 @@ It builds no image and pushes nothing.
 app's dependencies, runs its tests and builds it. `render`, `lint`, `techdocs`
 and `agents-md` peak under 400Mi and run for seconds to a minute. A caller
 that passes `build_runner: ${{ vars.CI_RUNNER_STANDARD }}` and no `runner`
-sends `checks` there and leaves the other five jobs on its `CI_RUNNER_SMALL`;
-`contract`, the sixth, reads two shallow trees and makes one request.
+sends `checks` there and leaves the other six jobs on its `CI_RUNNER_SMALL`;
+`contract` reads two shallow trees and makes one request, and `scope` makes
+one request and runs no repository code.
 Passing only `runner` still puts every job on that runner, as before
 `build_runner` existed. `render` pulls `wac-app` from the in-cluster registry, so this
 split fits only a caller whose `CI_RUNNER_SMALL` is a Lab pool. A repository
@@ -100,6 +108,155 @@ object by object, failing on any difference its normalization does not cover
 covered ones). The normalization is ported from lab's `tests/wac_app/render.py`
 and is the one copy outside lab. The caller removes the input at cutover step
 3, when `deploy/k8s` is deleted.
+
+## The private package probe
+
+From `v1.36.0`, for `stack: node`, `checks` probes the fleet's private
+`@willfell` packages after setup-node and before the root `npm ci` and
+`ci.commands`, so a locked version missing from the registry fails with one
+plain sentence instead of an install error midway through `npm ci`.
+`scripts/wacd-npm-probe.py` reads every `package-lock.json` the node-layout
+step found (finance's `app/package-lock.json` as much as hemi's root one) and
+takes each `node_modules/@willfell/<name>` entry, nested ones included. For
+each locked version it runs, in that lockfile's directory, with the
+`NODE_AUTH_TOKEN` `npm ci` gets (`npm_token`, or the job's GitHub token):
+
+```sh
+npm view "<name>@<version>" version --prefer-online --userconfig .npmrc
+```
+
+That is the probe hemi carries in its own `checks` gate, with the version
+taken from the lockfile and checked before npm runs, since
+`npm view <name>@` resolves the latest version and exits 0. Every lockfile is
+read first, and the step fails before any request when a lockfile cannot be
+read or is not JSON, has no `packages` map (lockfileVersion 1), has a
+`@willfell` entry whose name npm would not publish, whose entry is not an
+object or that has no exact version, or locks `@willfell` packages with no
+`.npmrc` beside it; a lockfile path that is not a repo-relative
+`package-lock.json` is refused too, though the node-layout step never passes
+one. The probes then run in
+order and stop at the first the registry does not confirm: npm exits
+non-zero, or prints anything but the locked version. A workspace link
+(`"link": true`, as the wac repo's own `@willfell/wac-ui` is) is installed
+from the repository and is named and skipped. A repo with no lockfile, or no
+`@willfell` entry, gets one line saying there is nothing to probe. The token
+reaches npm through the environment and is never printed; lockfile paths
+reach the script as arguments, never through `${{ }}` in the shell; and the
+script runs as `python3 -I` from the shared checkout and imports nothing from
+the repository.
+
+A repository that pins `v1.36.0` or later can drop its own probe commands,
+the `npm view "@willfell/...` lines (pinned or read from the lockfile), since
+`checks` now runs the same probe for every lockfile before them. On its files
+they are entries of `ci.commands` in `.github/wacd.json`; cut over, they are
+commands of hemi's `checks` gate, changed in hemi like any other setting. The
+list must keep at least one command, and a repository whose own tests require
+the probe commands (wac.hemi's `deploy-contract.test.ts` does) changes those
+tests in the same pull request. Nothing breaks if the commands stay: each
+then runs twice.
+
+## The scope job
+
+From `v1.36.0` a pull request that changes only documentation takes no build
+runner: `checks` is skipped, and `contract`, `render`, `lint`, `techdocs` and
+`agents-md` run as before. The standard runners `checks` takes are the
+fleet's bottleneck; a documentation change has nothing for them to build or
+test.
+
+`scope` needs `contract` and runs under `if: ${{ !cancelled() }}` on
+`runner`, or the caller's `CI_RUNNER_SMALL`. It holds `contents: read` and
+nothing else: no `id-token`, no secret, and no checkout of the pull request,
+only this repository at `job.workflow_sha` for its script, through the
+commit-pinned checkout, moved out of the workspace. It sets
+`PYTHONSAFEPATH=1` and runs `python3 -I "$WACD_SCRIPTS"/wacd-docs.py
+pr-scope`, which needs no `actions/setup-python`. Its one output is `heavy`,
+and `checks` runs under
+`if: ${{ !cancelled() && needs.scope.outputs.heavy != 'false' }}`: only the
+literal `false` skips it, so a `scope` that failed, was skipped or wrote
+nothing leaves the checks running. The skip rests on how GitHub counts a
+required check: a job skipped by its `if` concludes `skipped`, and a ruleset
+counts a skipped required check as passing. The rulesets of wac, wac.hemi,
+wac.app.wealth and wac.app.finance require `wacd-ci / checks` as well as
+`wacd-ci / contract`, `wacd-ci / render` and the gates, so a documentation-only
+pull request merges with `checks` skipped, while `contract` and `render`
+still run and still block on failure. Hemi reads a skipped `checks` as
+passing too.
+
+The patterns are the settings the run uses: `contract`'s new output
+`docs_paths`, the effective `ci.docs_paths` of hemi's copy
+(`delivery.docsPaths`) when the source is `hemi`, or of the merge commit's
+`.github/wacd.json`, read with `git cat-file` as data, when the source is the
+files ([The wacd profile](wacd-profile.md), **Documentation paths**). It is
+empty when that list cannot be read or is refused, and the `checks` job then
+refuses it with its sentence. So the skip needs no token of its own, and
+reads no settings `checks` would not read.
+
+`heavy` is `false` only when every one of these holds:
+
+- the event is `pull_request`, read from the runner's `GITHUB_EVENT_NAME`;
+- its base, read from the runner's event file (`GITHUB_EVENT_PATH`), is the
+  repository's default branch: a stacked pull request runs the checks;
+- `contract` succeeded and its `docs_paths` is a non-empty list the matcher
+  accepts;
+- the commit `checks` tests is judged, never the head: `GITHUB_SHA`, the
+  merge commit a `pull_request` run checks out. `GET
+  /repos/{repository}/commits/{GITHUB_SHA}` must name the event's `base.sha`
+  as its first parent;
+- `GET /repos/{repository}/compare/{base.sha}...{GITHUB_SHA}` is complete: a
+  `files` list of fewer than 300 entries, as many `commits` as its
+  `total_commits`, and a `merge_base_commit.sha` equal to `base.sha`. Both
+  reads use the job's `GITHUB_TOKEN`, within 20 seconds and 32 MiB each and
+  with redirects refused. With the first parent and the merge base both the
+  base, the files are exactly the tree difference between the base and what
+  `checks` would test;
+- it lists at least one file, no `filename` or `previous_filename` is under
+  `.github/`, and every one matches a pattern.
+
+Anything else runs the checks: a `merge_group` or any other event, an API
+error or timeout, a list that may be truncated, patterns that are missing,
+refused or `[]`, and any failure of the script itself.
+
+`scope` writes `### wac-ci scope` to the run summary every time, with one
+sentence. When it skips: `Only documentation changed, so the checks that build
+and test the app did not run.`, which is also a `::notice::` annotation. When
+it runs: `The checks ran because: <reason>`, where the reason is one of these
+fixed phrases:
+
+| reason | when |
+| --- | --- |
+| `this is not a pull request into the default branch` | any other event, a base that is not the default branch, or an event file that cannot be read |
+| `the documentation paths could not be read` | `contract` did not succeed, or its `docs_paths` is empty |
+| `a documentation path was refused` | `docs_paths` is not a list of patterns the matcher accepts |
+| `this repository sets no documentation paths` | `docs_paths` is `[]` |
+| `the merge commit could not be read` | the commit read answered anything but 200 with a `parents` list, or not JSON |
+| `the merge commit is not made on the pull request's base` | the merge commit's first parent is not `base.sha`, or it has none |
+| `the comparison's merge base is not the pull request's base` | the comparison's `merge_base_commit.sha` is missing or is not `base.sha` |
+| `the changed files could not be read` | any status but 200, a redirect, a timeout, an answer over 32 MiB or not JSON, a file entry with no name, a `GITHUB_SHA` that is not 40 hex characters, or a failure of the script |
+| `the list of changed files may be incomplete` | 300 or more files, fewer commits listed than counted, or no `files` list |
+| `the comparison lists no changed file` | an empty `files` list |
+| `a file under .github/ changed: <paths>` | a name under `.github/`, even one a pattern would match |
+| `a file outside the documentation paths changed: <paths>` | a name no pattern matches |
+
+Why the merge commit and not the head: GitHub's comparison is three-dot, one
+merge base of the two against the second. In a criss-cross history (both
+branches merged the same two commits, the pull request resolving them
+differently) the head can show only documentation against that base while
+the merge GitHub builds, with a recursive merge over both bases, changes
+code; GitHub's own "Files changed" shows the same three-dot diff.
+`scripts/tests/wacd-docs.test.py` builds that history with git and holds the
+rule.
+
+`<paths>` is the first three offending names, comma-separated, then
+`, and <n> more` when there are more; each name is escaped as workflow-command
+data (`%` as `%25`, a carriage return as `%0D`, a line feed as `%0A`), so a
+file name cannot end the output line or start a command. `scope` reads the
+base branch only to tell a pull request into the default branch; whether a
+repository is cut over is still main's to say (below).
+
+A repository whose `ci.commands` read a default path must set
+`ci.docs_paths` before its pin moves to `v1.36.0`, or a documentation-only
+pull request skips the checks that read it; `CONSUMERS.md` lists what each
+consumer needs.
 
 ## The contract job
 
@@ -134,7 +291,10 @@ uses, with a token of audience `wacwini:hemi` minted for each attempt. No
 answer, a 5xx and an address that does not resolve are asked three times, 5 and 10 seconds apart, each attempt
 bounded at 15 seconds. When the source is `hemi` it uploads `.wacd-contract/`
 (`contract.json`, `profile.json` and `values.json`, as `wac-cd`'s `plan`
-writes them) as the artifact `wac-ci-contract`, kept for one day.
+writes them) as the artifact `wac-ci-contract`, kept for one day. A re-run of
+failed jobs more than a day after the run finds it gone: `checks` or `render`
+then fails at its download, and the next step says, in an `::error::`
+annotation and the run summary, `The settings copy this run's earlier job uploaded could not be downloaded. It is kept for one day, so a re-run more than a day after the run started must re-run all jobs, not only the failed ones.`
 
 `checks` and `render` need `contract` and run under
 `if: ${{ !cancelled() }}`. A plain dependent of a failed job reports
@@ -159,19 +319,32 @@ are that file, the values path main's profile names and the copy's
 `delivery.valuesFile`. Nothing looks at the base branch, so a pull request
 into another pull request's branch is judged by main like any other.
 
+`contract` writes `### wac-ci settings` to the run summary: a table with the
+columns `source` and `revision` and one row (`hemi` and the revision, `files`
+and the revision or `-`, or `-` and `-` when the job fails), then the sentences
+the `result` column below quotes. Every result from
+hemi's copy opens with `Settings come from hemi's copy, revision <n>.`, then
+adds a sentence for each file still on main. A passing result's sentences
+are in the run summary only, not the job log. A failing result's sentence is
+also the script's stderr line `wacd contract: <sentence>`, which the step
+turns into the `::error::` annotation `wac-ci: wacd contract: <sentence>`, so
+it shows in the job log and on the run's page.
+
 | hemi's answer | files on main | files in the pull request | result |
 | --- | --- | --- | --- |
 | 200, source `hemi` | absent | present | fails: `<path> was added back; <app>'s settings live in hemi.`, or, when the merge commit's first parent is not main's head, `This run's merge commit is older than <app>'s clean-up; update the branch and re-run.` |
-| 200, source `hemi` | present | present, the same blob | hemi's settings; the summary says `<path> is still on main until hemi's clean-up pull request merges; hemi's settings were used.` |
+| 200, source `hemi` | present | present, the same blob | hemi's settings; after `Settings come from hemi's copy, revision <n>.` the summary says, for each such file, `<path> is still on main until hemi's clean-up pull request merges; hemi's settings were used.` |
+| 200, source `hemi` | present | absent: this pull request deletes the files | hemi's settings; the summary says only `Settings come from hemi's copy, revision <n>.`. This is hemi's clean-up pull request itself, and it passes |
 | 200, source `hemi` | present | present, another blob | fails: `<path> was changed; <app>'s settings live in hemi, so change them there.` |
-| 200, source `hemi` | absent | absent | hemi's settings |
-| 200, source `files` | absent | present | the pull request's own files: it is the restore pull request of a return to files, or a new app's first pull request (below) |
+| 200, source `hemi` | absent | absent | hemi's settings; the summary says only `Settings come from hemi's copy, revision <n>.` |
+| 200, source `files` | absent | present | the pull request's own files: it is the restore pull request of a return to files (`hemi's copy (revision <n>) says <app> is returning to its files and this pull request puts them back, so its own files were used.`), or a new app's first pull request (below) |
 | 200, source `files` | absent | absent | fails: wait for hemi's restore pull request and re-run after it merges; for an answer with no revision, `hemi holds no settings for <app> yet, and neither main nor this pull request has .github/wacd.json, so there is nothing to check.` |
-| 200, source `files` | present | any | the pull request's own files, as before |
+| 200, source `files` | present | any | the pull request's own files, as before; the summary says `hemi's copy (revision <n>) says <app>'s settings live in its files, so the pull request's own files were used.`, or, for an answer with no revision, `hemi holds no settings for <app> yet, so the pull request's own files were used.` |
 | anything but a readable 200 | present | present | the pull request's own files, as before; the summary names only hemi's status, such as `hemi answered 401; using the repository's files.` |
-| anything but a readable 200 | present | removes either file | fails: `hemi did not answer, and this pull request removes <repository>'s files; re-run when hemi answers.` This is hemi's clean-up pull request during a hemi outage. |
-| 401 or 403 | absent | any | fails: `hemi refused this pull request's token (HTTP <status>); <repository>'s settings live in hemi, so the checks cannot run; if this app is new, register it with lab first.` |
-| no answer, a timeout or a 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
+| anything but a readable 200 | present | removes either file | fails, naming the cause, then `and this pull request removes <repository>'s files`: `hemi did not answer, ...; re-run when hemi answers.` for silence or a 5xx (hemi's clean-up pull request during a hemi outage), `hemi refused this pull request's token (HTTP <status>), ...; if <repository> is new, register it with lab first and re-run.` for a 401 or 403 (outside a `pull_request` run, `hemi refused the job token of this <event> run (HTTP <status>): it admits wac-ci only for pull_request runs, and this pull request removes <repository>'s files.`), `hemi answered HTTP <status>, ...; re-run once hemi serves this repository.` for another status, `hemi's answer could not be read, ...; re-run once hemi serves this repository.` for an unreadable answer, the Lab-runner sentence for an address that does not resolve, and likewise for a token GitHub would not mint or no `id-token` grant. |
+| 403 with hemi's body `{"error":"not registered"}` (an app hemi does not know, or one with no active copy) | absent | any | fails: `hemi does not know <repository>: it is not registered with lab, or hemi holds no active copy of its settings. If it is new, register it (lab:lab-onboard-app), wait for hemi to list it, then re-run the checks.` |
+| any other 401 or 403 | absent | any | fails: `hemi refused this pull request's token (HTTP <status>): if <repository> is new, register it with lab first and re-run; if it is cut over, its settings live in hemi and the checks cannot run until hemi admits this run.` (outside a `pull_request` run: `hemi refused the job token of this <event> run (HTTP <status>): it admits wac-ci only for pull_request runs; ` and the same clauses). Only a 403's body is read, at most 4096 bytes, and only to find that code exactly: UTF-8 with no BOM, a JSON object whose one key is `error` and whose value is the string `not registered` (whitespace and escapes that decode to it are the same body). A longer body, another encoding (UTF-16, UTF-32, a UTF-8 BOM), an extra key, a key named twice, or anything else reads as this row |
+| no answer (a connection closed or reset after the request, or an answer shorter than the `Content-Length` it declares), a timeout or a 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
 | hemi's address does not resolve, on all three attempts | absent | any | fails: ``the contract job must run on a Lab runner: <runner> cannot reach hemi's in-cluster address. Pass a Lab pool as `runner`.`` |
 | GitHub mints no job token | absent | any | fails: `GitHub would not mint a job token for hemi; re-run the checks.` |
 | 404, 422 or any other status | absent | any | fails, naming the status |
@@ -189,9 +362,10 @@ Before the registration hemi answers 403 (`not registered`), and the pull
 request fails with the 401-or-403 sentence above, which says to register
 first.
 
-A `files` answer is read for its source alone: `contract` requires only
-`flags.source`, and `identity.repositoryId`, when it is present, must be the
-job token's. A `hemi` answer must carry the full copy. A 200 that cannot be
+A `files` answer is read for its source and its repository: `contract`
+requires `flags.source` and an `identity.repositoryId` equal to the job
+token's, which hemi sends in every `files` answer, the new app's included. A
+`hemi` answer must carry the full copy. A 200 that cannot be
 read, names another repository than the token's, or does not derive a profile
 counts as "anything but a readable 200". So do an
 address that does not resolve, a token GitHub would not mint, and a job with
@@ -200,7 +374,10 @@ then says which. An address that does not resolve is asked again, like
 silence, since a lookup can fail once on a Lab runner; one that never
 resolves means a runner outside the cluster, such as a hosted one, and the
 sentence names the runner (`runner.name`, passed to the step as
-`JOB_RUNNER_NAME`).
+`JOB_RUNNER_NAME`), when the name is letters, digits, `_`, `.`, `-` and inner
+spaces (a hosted runner's `GitHub Actions <n>` included), up to 100
+characters; any other name, one that could carry a workflow command or a shell
+character, is shown as `this runner`.
 
 Files on both main and the merge commit are compared by blob id
 (`git ls-tree`), never by content read from the checkout: the same blob is the

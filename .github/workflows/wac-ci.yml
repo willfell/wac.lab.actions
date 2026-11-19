@@ -34,6 +34,7 @@ jobs:
       id-token: write
     outputs:
       source: ${{ steps.contract.outputs.source }}
+      docs_paths: ${{ steps.contract.outputs.docs_paths }}
     steps:
       - name: Require the runner's python3 3.12 or later
         timeout-minutes: 1
@@ -54,12 +55,18 @@ jobs:
           for name in sys.argv[1:]:
               try:
                   importlib.import_module(name)
-              except Exception:
-                  print(name)
+              except BaseException as error:
+                  print(name + " (" + type(error).__name__ + ")")
                   sys.exit(1)' "${modules[@]}" 2> /dev/null)"; then
                 exit 0
+              else
+                status=$?
               fi
-              found="$found, which cannot import ${missing:-its standard modules}"
+              if [[ -n "$missing" ]]; then
+                found="$found, which cannot import $missing"
+              else
+                found="$found, which stopped with exit status $status while importing its standard modules"
+              fi
             fi
           fi
           echo "::error::wac-ci: contract needs python3 3.12 or later on the runner; found $found on $JOB_RUNNER_NAME ($JOB_RUNNER_OS, $JOB_RUNNER_ARCH)."
@@ -69,9 +76,9 @@ jobs:
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - name: Check out the shared scripts (actions/checkout v4)
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
         timeout-minutes: 3
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -84,9 +91,9 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-      - name: Read the default branch's tree (actions/checkout v4)
+      - name: Read the default branch's tree (actions/checkout v7.0.1)
         timeout-minutes: 3
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: refs/heads/${{ github.event.repository.default_branch }}
           path: .wacd-main
@@ -95,9 +102,9 @@ jobs:
           sparse-checkout: .github/wacd.json
           sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Read the pull request's tree (actions/checkout v4)
+      - name: Read the pull request's tree (actions/checkout v7.0.1)
         timeout-minutes: 3
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: .wacd-head
           fetch-depth: 1
@@ -119,9 +126,9 @@ jobs:
             exit 1
           fi
           cat "$RUNNER_TEMP/contract.out" >> "$GITHUB_OUTPUT"
-      - name: Upload the settings copy (actions/upload-artifact v4)
+      - name: Upload the settings copy (actions/upload-artifact v7.0.2)
         timeout-minutes: 3
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: steps.contract.outputs.source == 'hemi'
         with:
           name: wac-ci-contract
@@ -131,9 +138,62 @@ jobs:
           overwrite: true
           retention-days: 1
 
-  checks:
+  scope:
     needs: contract
     if: ${{ !cancelled() }}
+    runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
+    timeout-minutes: 5
+    env:
+      PYTHONSAFEPATH: "1"
+    permissions:
+      contents: read
+    outputs:
+      heavy: ${{ steps.scope.outputs.heavy }}
+    steps:
+      - name: Require the defining workflow commit
+        timeout-minutes: 1
+        env:
+          SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        timeout-minutes: 3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: willfell/wac.lab.actions
+          ref: ${{ job.workflow_sha }}
+          path: .wacd
+          persist-credentials: false
+      - name: Move the shared checkout out of the workspace
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/wacd"
+          mv .wacd "$RUNNER_TEMP/wacd"
+          echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
+      - name: Decide whether the checks need to run
+        id: scope
+        timeout-minutes: 2
+        shell: bash
+        env:
+          DOCS_PATHS: ${{ needs.contract.outputs.docs_paths }}
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if python3 -I "$WACD_SCRIPTS"/wacd-docs.py pr-scope > "$RUNNER_TEMP/scope.out" 2> "$RUNNER_TEMP/scope.err"; then
+            cat "$RUNNER_TEMP/scope.err"
+            cat "$RUNNER_TEMP/scope.out" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "heavy=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "### wac-ci scope"
+            echo
+            echo "The checks ran because: the changed files could not be read"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  checks:
+    needs: [contract, scope]
+    if: ${{ !cancelled() && needs.scope.outputs.heavy != 'false' }}
     runs-on: ${{ inputs.build_runner || inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 30
     permissions:
@@ -150,14 +210,16 @@ jobs:
             echo "::error::wac-ci: the contract job ended ${CONTRACT_RESULT:-without a result}, so this job's checks cannot run."
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -173,13 +235,23 @@ jobs:
         if: needs.contract.outputs.source == 'hemi'
         shell: bash
         run: rm -rf .wacd-contract
-      - name: Download the settings copy (actions/download-artifact v4)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - name: Download the settings copy (actions/download-artifact v8.0.2)
+        id: copy
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         if: needs.contract.outputs.source == 'hemi'
         with:
           name: wac-ci-contract
           path: .wacd-contract
-      - uses: actions/setup-python@v5
+      - name: Say how to recover a settings copy that could not be downloaded
+        if: failure() && steps.copy.outcome == 'failure'
+        shell: bash
+        run: |
+          sentence="The settings copy this run's earlier job uploaded could not be downloaded. It is kept for one day, so a re-run more than a day after the run started must re-run all jobs, not only the failed ones."
+          echo "::error::wac-ci: $sentence"
+          echo "$sentence" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Read the wacd profile
@@ -207,17 +279,33 @@ jobs:
         if: fromJSON(steps.profile.outputs.ci).stack == 'node'
         shell: bash
         run: python3 "$WACD_SCRIPTS"/wacd-profile.py node-layout . >> "$GITHUB_OUTPUT"
-      - if: fromJSON(steps.profile.outputs.ci).stack == 'node'
-        uses: actions/setup-node@v4
+      - name: Set up Node (actions/setup-node v7.1.0)
+        if: fromJSON(steps.profile.outputs.ci).stack == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: ${{ fromJSON(steps.profile.outputs.ci).node_version }}
           cache: ${{ steps.layout.outputs.lockfiles != '' && 'npm' || '' }}
           cache-dependency-path: ${{ steps.layout.outputs.lockfiles }}
-      - if: fromJSON(steps.profile.outputs.ci).stack == 'go'
-        uses: actions/setup-go@v5
+      - name: Set up Go (actions/setup-go v7.1.0)
+        if: fromJSON(steps.profile.outputs.ci).stack == 'go'
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
         with:
           go-version: ${{ fromJSON(steps.profile.outputs.ci).go_version }}
           go-version-file: ${{ fromJSON(steps.profile.outputs.ci).go_version_file }}
+      - name: Probe the private npm packages
+        if: fromJSON(steps.profile.outputs.ci).stack == 'node'
+        shell: bash
+        env:
+          LOCKFILES: ${{ steps.layout.outputs.lockfiles }}
+          NODE_AUTH_TOKEN: ${{ secrets.npm_token || github.token }}
+        run: |
+          lockfiles=()
+          while IFS= read -r lockfile; do
+            if [[ -n "$lockfile" ]]; then
+              lockfiles+=("$lockfile")
+            fi
+          done <<< "$LOCKFILES"
+          python3 -I "$WACD_SCRIPTS"/wacd-npm-probe.py . "${lockfiles[@]}"
       - name: Install root node dependencies
         if: fromJSON(steps.profile.outputs.ci).stack == 'node' && steps.layout.outputs.root_package == 'true'
         shell: bash
@@ -256,14 +344,16 @@ jobs:
             echo "::error::wac-ci: the contract job ended ${CONTRACT_RESULT:-without a result}, so this job's checks cannot run."
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - name: Check out the app (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
@@ -279,13 +369,23 @@ jobs:
         if: needs.contract.outputs.source == 'hemi'
         shell: bash
         run: rm -rf .wacd-contract
-      - name: Download the settings copy (actions/download-artifact v4)
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - name: Download the settings copy (actions/download-artifact v8.0.2)
+        id: copy
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         if: needs.contract.outputs.source == 'hemi'
         with:
           name: wac-ci-contract
           path: .wacd-contract
-      - uses: actions/setup-python@v5
+      - name: Say how to recover a settings copy that could not be downloaded
+        if: failure() && steps.copy.outcome == 'failure'
+        shell: bash
+        run: |
+          sentence="The settings copy this run's earlier job uploaded could not be downloaded. It is kept for one day, so a re-run more than a day after the run started must re-run all jobs, not only the failed ones."
+          echo "::error::wac-ci: $sentence"
+          echo "$sentence" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
       - name: Read the wacd profile
@@ -363,8 +463,9 @@ jobs:
           kubeconform -strict -summary -schema-location default \
             -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             "$RUNNER_TEMP/render.yaml"
-      - if: inputs.parity_kustomize_dir != ''
-        uses: astral-sh/setup-uv@v5
+      - name: Set up uv (astral-sh/setup-uv v10.3.3)
+        if: inputs.parity_kustomize_dir != ''
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
       - name: Render the kustomize tree
         if: inputs.parity_kustomize_dir != ''
         shell: bash

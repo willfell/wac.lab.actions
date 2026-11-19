@@ -1,5 +1,6 @@
 import ast
 import importlib.util
+import itertools
 import json
 import platform
 import re
@@ -15,16 +16,29 @@ spec.loader.exec_module(module)
 
 GUARD_RUN = '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
 
+# Every action a reusable workflow here uses, pinned by commit with the release tag the
+# commit was resolved from; the step that uses one says "<action> <tag>" in its
+# name. A tag can be moved, so a job holding a write token (or able to mint one)
+# would otherwise run whatever the tag points at today. One commit per action,
+# so every job of a run, upload and download alike, runs the same release.
+PINNED_ACTIONS = {
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1": "v7.0.1",
+    "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9": "v7.0.2",
+    "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333": "v8.0.2",
+    "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0": "v7.1.0",
+    "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1": "v7.1.0",
+    "actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5": "v7.1.0",
+    "astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2": "v10.3.3",
+    "raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7": "v2.2.0",
+    "aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd": "v6.3.0",
+}
 # A GitHub OIDC token does not say which step minted it, so any code that runs
 # in a job holding id-token: write can mint a gateway token. Such a job may use
-# only these actions, pinned by commit (the tag goes in the step's name), and
-# may not run a fetched installer. install-helm.sh is allowed: it checks a
-# committed digest before it runs anything.
-PINNED_ACTIONS = {
-    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262": "v4",
-    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02": "v4",
-    "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093": "v4",
-}
+# only these of the pinned actions, and may not run a fetched installer.
+# install-helm.sh is allowed: it checks a committed digest before it runs
+# anything.
+CALLED_WORKFLOW = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml@[0-9a-f]{40}")
+ID_TOKEN_ACTIONS = ("actions/checkout", "actions/upload-artifact", "actions/download-artifact")
 FETCHED_INSTALLERS = (
     ("install-tools.sh", re.compile(r"install-tools\.sh")),
     ("pip", re.compile(r"\bpip3?\b")),
@@ -34,6 +48,16 @@ FETCHED_INSTALLERS = (
     ("curl piped to a shell", re.compile(r"\bcurl\b[^\n]*\|\s*(sudo\s+)?(ba|z|da)?sh\b")),
     ("get-helm", re.compile(r"get-helm")),
 )
+# A token job runs no site or package code either: node and yarn run whatever a
+# package.json or a checkout names.
+SITE_CODE_RUNNERS = (
+    ("yarn", re.compile(r"\byarn\b")),
+    ("node", re.compile(r"\bnode\b")),
+)
+# nextjs-site-deploy's token jobs assume an AWS role, so they may also use the
+# pinned configure-aws-credentials. They check out no caller code at all: only
+# this repository, at the defining commit, for its scripts.
+SITE_TOKEN_ACTIONS = ID_TOKEN_ACTIONS + ("aws-actions/configure-aws-credentials",)
 KNOWN_ID_TOKEN_EXPOSURES_TO_REMOVE = ()
 SHA = "${{ job.workflow_sha }}"
 
@@ -76,24 +100,76 @@ def holds_id_token(doc, job):
     return isinstance(permissions, dict) and permissions.get("id-token") == "write"
 
 
-def id_token_problems(doc, job_name, job):
-    """What lets code other than wac-cd's own run in a job that can mint a gateway token."""
+def holds_write(doc, job):
+    """Whether a job holds any write permission, its own or else its workflow's."""
+    job = job or {}
+    permissions = job["permissions"] if "permissions" in job else doc.get("permissions")
+    if permissions == "write-all":
+        return True
+    return isinstance(permissions, dict) and "write" in permissions.values()
+
+
+def pinned_action_problems(job_name, job, allowed=None):
+    """Each step's action must be on the allowlist (and in `allowed`, when given) and named with its tag.
+
+    A job that calls a reusable workflow must name a local file, itself held to
+    this rule, or another repository's workflow at a full commit SHA.
+    """
+    problems = []
+    called = job.get("uses")
+    if called is not None and not (str(called).startswith("./.github/workflows/")
+                                   or CALLED_WORKFLOW.fullmatch(str(called))):
+        problems.append(f"{job_name}: calls {called}, which is neither a local workflow nor pinned by commit")
+    for index, step in enumerate(job.get("steps") or []):
+        uses = step.get("uses")
+        if uses is None:
+            continue
+        where = f"{job_name} steps[{index}]"
+        action = uses.split("@")[0]
+        tag = PINNED_ACTIONS.get(uses)
+        if tag is None or (allowed is not None and action not in allowed):
+            problems.append(f"{where}: {uses} is not a commit-pinned action on the allowlist")
+        elif f"{action} {tag}" not in str(step.get("name", "")):
+            problems.append(f"{where}: the step name does not say {action} {tag}")
+    return problems
+
+
+def id_token_problems(doc, job_name, job, allowed=ID_TOKEN_ACTIONS):
+    """What lets code other than this repository's own run in a job that can mint a token."""
     problems = []
     if "uses" in job:
         problems.append(f"{job_name}: calls {job['uses']} while holding id-token: write")
+    problems.extend(pinned_action_problems(job_name, job, allowed))
+    for index, step in enumerate(job.get("steps") or []):
+        for label, pattern in FETCHED_INSTALLERS + SITE_CODE_RUNNERS:
+            if pattern.search(str(step.get("run", ""))):
+                problems.append(f"{job_name} steps[{index}]: runs {label}")
+    return problems
+
+
+def site_token_job_problems(doc, job_name, job):
+    """A nextjs-site-deploy job that can mint an AWS role: no caller checkout, no site code, no python."""
+    problems = id_token_problems(doc, job_name, job, SITE_TOKEN_ACTIONS)
+    if (job.get("env") or {}).get("PYTHONSAFEPATH") != "1":
+        problems.append(f"{job_name}: env does not set PYTHONSAFEPATH to 1")
     for index, step in enumerate(job.get("steps") or []):
         where = f"{job_name} steps[{index}]"
-        uses = step.get("uses")
-        if uses is not None:
-            tag = PINNED_ACTIONS.get(uses)
-            if tag is None:
-                problems.append(f"{where}: {uses} is not a commit-pinned action on the allowlist")
-            elif f"{uses.split('@')[0]} {tag}" not in str(step.get("name", "")):
-                problems.append(f"{where}: the step name does not say {uses.split('@')[0]} {tag}")
-        for label, pattern in FETCHED_INSTALLERS:
-            if pattern.search(str(step.get("run", ""))):
-                problems.append(f"{where}: runs {label}")
+        if str(step.get("uses", "")).startswith("actions/checkout@"):
+            with_ = step.get("with") or {}
+            if (str(with_.get("repository") or "").lower() != module.SHARED_REPOSITORY
+                    or with_.get("ref") != SHA):
+                problems.append(f"{where}: checks out the calling repository's code")
+        if re.search(r"\bpython3?\b", str(step.get("run", ""))):
+            problems.append(f"{where}: runs python3, which the planted-repository test does not cover here")
     return problems
+
+
+INLINE_PYTHON = re.compile(r'(?:\bpython3|"\$python")((?:\s+-[A-Za-z]+)*)\s+-c\b')
+
+
+def unisolated_inline_python(run):
+    """Each inline `python3 -c` (or `"$python" -c`) in a run body whose flags do not include -I."""
+    return [match.group(0) for match in INLINE_PYTHON.finditer(run) if "-I" not in match.group(1).split()]
 
 
 def runner_problems(jobs, name="wac-ci.yml"):
@@ -300,7 +376,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(step["env"], {"APT_PACKAGES": "${{ steps.profile.outputs.apt_packages }}"})
         self.assertNotIn("${{", step["run"])
         self.assertLess(names.index("Read the wacd profile"), apt)
-        for later in ("actions/setup-node@v4", "Install root node dependencies", "Run the profile's CI commands"):
+        setup_node = next(s["name"] for s in steps if str(s.get("uses", "")).startswith("actions/setup-node@"))
+        for later in (setup_node, "Install root node dependencies", "Run the profile's CI commands"):
             with self.subTest(step=later):
                 self.assertLess(apt, names.index(later))
 
@@ -329,6 +406,72 @@ class ReusableWorkflowTests(unittest.TestCase):
                     "env|DEBIAN_FRONTEND=noninteractive|apt-get|install|-y|--no-install-recommends|python3|make|g++|",
                 ],
             )
+
+    def test_wac_ci_probes_the_private_packages_before_any_npm_install(self):
+        import yaml
+
+        doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
+        steps = doc["jobs"]["checks"]["steps"]
+        names = [s.get("name") or s.get("uses") for s in steps]
+        probe = names.index("Probe the private npm packages")
+        step = steps[probe]
+        root_install = steps[names.index("Install root node dependencies")]
+        self.assertEqual(step["if"], "fromJSON(steps.profile.outputs.ci).stack == 'node'")
+        self.assertEqual(
+            step["env"],
+            {
+                "LOCKFILES": "${{ steps.layout.outputs.lockfiles }}",
+                "NODE_AUTH_TOKEN": root_install["env"]["NODE_AUTH_TOKEN"],
+            },
+        )
+        self.assertNotIn("${{", step["run"])
+        setup_node = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/setup-node@"))
+        self.assertLess(names.index("Read the node package layout"), probe)
+        self.assertLess(setup_node, probe)
+        for later in ("Install root node dependencies", "Run the profile's CI commands"):
+            with self.subTest(step=later):
+                self.assertLess(probe, names.index(later))
+
+    def test_wac_ci_probe_step_passes_each_lockfile_and_ignores_the_callers_python_path(self):
+        import json
+        import os
+        import subprocess
+        import yaml
+
+        root = Path(__file__).resolve().parents[2]
+        doc = yaml.safe_load((root / ".github" / "workflows" / "wac-ci.yml").read_text())
+        step = next(s for s in doc["jobs"]["checks"]["steps"] if s.get("name") == "Probe the private npm packages")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            log = tmp / "npm.log"
+            npm = bin_dir / "npm"
+            npm.write_text('#!/bin/sh\nprintf "%s|%s\\n" "$(basename "$PWD")" "$2" >> "$NPM_LOG"\necho "${2##*@}"\n')
+            npm.chmod(0o755)
+            planted = tmp / "planted"
+            planted.mkdir()
+            (planted / "json.py").write_text("raise SystemExit('the caller python path was imported')\n")
+            repo = tmp / "repo"
+            for directory, version in (("app", "0.24.0"), ("my docs", "0.21.0")):
+                (repo / directory).mkdir(parents=True)
+                (repo / directory / ".npmrc").write_text("@willfell:registry=https://npm.pkg.github.com\n")
+                (repo / directory / "package-lock.json").write_text(json.dumps(
+                    {"lockfileVersion": 3, "packages": {"node_modules/@willfell/wac-ui": {"version": version}}}
+                ))
+            env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "NPM_LOG": str(log),
+                   "WACD_SCRIPTS": str(root / "scripts"), "PYTHONPATH": str(planted), "NODE_AUTH_TOKEN": "t"}
+            for label, lockfiles, expected in (
+                ("two lockfiles", "app/package-lock.json\nmy docs/package-lock.json",
+                 ["app|@willfell/wac-ui@0.24.0", "my docs|@willfell/wac-ui@0.21.0"]),
+                ("none", "", []),
+            ):
+                with self.subTest(case=label):
+                    log.unlink(missing_ok=True)
+                    result = subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], cwd=repo,
+                                            env={**env, "LOCKFILES": lockfiles}, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(log.read_text().splitlines() if log.exists() else [], expected)
 
     def test_wac_cd_rollback_version_must_be_strict_semver(self):
         import os
@@ -425,7 +568,11 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(refusal["if"], "${{ steps.version.outputs.replay_refused != '' }}")
         self.assertEqual(refusal["env"], {"REASON": "${{ steps.version.outputs.replay_refused }}"})
         self.assertIsInstance(refusal["timeout-minutes"], int)
-        self.assertEqual(names[-1], refusal["name"], "nothing runs between the planning step and the refusal")
+        self.assertNotIn("continue-on-error", refusal, "a refusal fails plan, never a green run")
+        self.assertNotIn("continue-on-error", doc["jobs"]["plan"], "a refusal fails plan, never a green run")
+        self.assertEqual(names[names.index("Plan the version") + 2:], ["Nothing to release: only documentation changed",
+                                                                        "Publish only: the app has not been released yet"],
+                         "after the refusal only the documentation-only and publish-only reports follow")
 
         def git(repo, *args):
             return subprocess.run(
@@ -434,13 +581,18 @@ class ReusableWorkflowTests(unittest.TestCase):
                 cwd=repo, check=True, capture_output=True, text=True,
             ).stdout.strip()
 
-        def run(case_head, rollback="", extra_commit=False, origin=True, untagged_old=False):
+        def remote_refs(bare):
+            return git(bare, "for-each-ref", "--format=%(refname) %(objectname)")
+
+        def run(case_head, rollback="", extra_commit=False, origin=True, untagged_old=False, version_source="commits"):
             with tempfile.TemporaryDirectory() as tmp:
                 tmp = Path(tmp)
-                repo, scripts = tmp / "repo", tmp / "scripts"
+                repo, scripts, bare = tmp / "repo", tmp / "scripts", tmp / "origin.git"
                 repo.mkdir()
                 scripts.mkdir()
                 shutil.copy(root / "scripts" / "wacd-version.py", scripts / "wacd-version.py")
+                shutil.copy(root / "scripts" / "wacd-tag.py", scripts / "wacd-tag.py")
+                git(tmp, "init", "-q", "--bare", str(bare))
                 git(repo, "-c", "init.defaultBranch=main", "init", "-q")
                 git(repo, "commit", "--allow-empty", "-q", "-m", "feat: first")
                 first = git(repo, "rev-parse", "HEAD")
@@ -449,8 +601,10 @@ class ReusableWorkflowTests(unittest.TestCase):
                 old = git(repo, "rev-parse", "HEAD")
                 git(repo, "commit", "--allow-empty", "-q", "-m", "feat: second")
                 git(repo, "tag", "v0.2.0")
-                if origin:
-                    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+                git(repo, "remote", "add", "origin", str(bare))
+                git(repo, "push", "-q", "origin", "main", "refs/tags/*")
+                if not origin:
+                    git(repo, "update-ref", "-d", "refs/remotes/origin/main")
                 if case_head == "first":
                     git(repo, "checkout", "-q", first)
                 if untagged_old:
@@ -462,12 +616,12 @@ class ReusableWorkflowTests(unittest.TestCase):
                     "import sys\n"
                     f"print('revision={first}' if sys.argv[1] == 'chart-revision' else 'state=present')\n"
                 )
-                (scripts / "wacd-tag.py").write_text("print('claim=pushed')\n")
                 out, summary = tmp / "out", tmp / "summary"
                 env = {**os.environ, "WACD_SCRIPTS": str(scripts), "RUNNER_TEMP": str(tmp),
                        "GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_SHA": head,
-                       "ROLLBACK_VERSION": rollback, "VERSION_SOURCE": "commits", "CALLER_VERSION": "",
+                       "ROLLBACK_VERSION": rollback, "VERSION_SOURCE": version_source, "CALLER_VERSION": "",
                        "DEPLOY": "true", "APP": "app", "TAG_PREFIX": "v"}
+                before = remote_refs(bare)
                 result = subprocess.run(["bash", "-c", step["run"]], env=env, cwd=repo,
                                         capture_output=True, text=True)
                 outputs = dict(line.split("=", 1) for line in out.read_text().splitlines()) if out.exists() else {}
@@ -478,6 +632,10 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertFalse(summary.exists(), "the refusal step writes the summary")
                     result = subprocess.run(["bash", "-c", refusal["run"]], env={**env, "REASON": reason},
                                             capture_output=True, text=True)
+                pushed = sorted(set(remote_refs(bare).splitlines()) - set(before.splitlines()))
+                if result.returncode != 0:
+                    self.assertEqual(pushed, [], "a refused or failed plan pushed a ref to the remote")
+                self.pushed = [line.split()[0] for line in pushed]
                 return result, outputs, summary.read_text() if summary.exists() else ""
 
         sentence = ("This run is for v0.1.0, but v0.2.0 is already published. "
@@ -497,11 +655,19 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(outputs, {})
         self.assertIn("origin/main is not in the checkout", summary)
-        self.assertIn("origin/main is not in the checkout", result.stderr)
+        self.assertEqual((result.stdout + result.stderr).count("origin/main is not in the checkout"), 1,
+                         "the planning step's failure is said once, as its annotation")
+        self.assertIn("::error::wac-cd: origin/main is not in the checkout", result.stdout)
+
+        result, outputs, summary = run("main", version_source="bogus")
+        self.assertEqual(result.returncode, 2, "a usage error keeps wacd-version.py's own exit code")
+        self.assertEqual(outputs, {})
+        self.assertEqual((result.stdout + result.stderr).count("invalid choice: 'bogus'"), 1)
 
         result, outputs, _ = run("main", extra_commit=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((outputs["mode"], outputs["version"]), ("release", "0.2.1"))
+        self.assertEqual(self.pushed, ["refs/tags/v0.2.1"], "the harness sees a tag the step pushes")
 
         result, outputs, summary = run("main", untagged_old=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -524,6 +690,398 @@ class ReusableWorkflowTests(unittest.TestCase):
                 if "cancelled()" in condition:
                     self.assertIn("!failure()", condition)
 
+    def docs_plan(self, after, released=("0.2.0",), docs_paths='["docs/**","mkdocs.yml","*.md"]', event="push",
+                  tagged=True, gateway=None, deploy="true", ambient=None, claim=None, tag_read_fails=False):
+        """Run plan's `Plan the version` on a push in a temp repository with real tags, the real scripts and a bare
+        origin, against stand-in GitHub Releases for the versions in released ("unreadable": every read is a 502).
+
+        main starts with C, tagged v0.2.0 unless tagged is False, holding src/app.ts, src/notes.md and
+        docs/guide.md; each item of after is one more commit: docs (docs/ and README.md), docs-rename (a page renamed
+        within docs/), code (src/app.ts), claim (a code commit tagged v0.2.1, as a release that claimed its tag and
+        never finished leaves it), side-claim (a commit on another branch tagged v0.9.0, never merged into main),
+        other-prefix (a code commit tagged ui-v0.1.0), rename (src/notes.md into docs/), github (a workflow file) or
+        github-doc (a Markdown file under .github/). The step's last commit is HEAD, as a push leaves it.
+
+        gateway is the stand-in gateway's answer to every request, (code, body), or "refused" for a port nothing
+        listens on. With it, the step runs wacd-release.py with only the runner's parts replaced: the gateway's
+        address, the OIDC mint (each mint is logged) and the CA file; every other script is the real one.
+        With a gateway, claim replaces wacd-tag.py with one that answers `claim=<claim>` and pushes nothing,
+        and tag_read_fails makes `wacd-version.py --mode tagged` fail as a git failure does.
+
+        ambient is extra environment the runner itself exports, as a runner image or pod could.
+        """
+        import os
+        import shutil
+        import subprocess
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        root = Path(__file__).resolve().parents[2]
+        steps = self.wac_cd()["jobs"]["plan"]["steps"]
+        by_name = {s.get("name"): s for s in steps}
+        step, report = by_name["Plan the version"], by_name["Nothing to release: only documentation changed"]
+        publish_only = by_name["Publish only: the app has not been released yet"]
+
+        def git(repo, *args):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                                   "-c", "tag.gpgsign=false", *args], cwd=repo, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+
+        reads = []
+
+        class Releases(BaseHTTPRequestHandler):
+            def do_GET(self):
+                reads.append((self.path, self.headers.get("Authorization")))
+                tag = self.path.rsplit("/", 1)[-1]
+                code = 502 if "unreadable" in released else 200 if tag[1:] in released else 404
+                self.send_response(code)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Releases)
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        repo, bare = tmp / "repo", tmp / "origin.git"
+        repo.mkdir()
+        git(tmp, "init", "-q", "--bare", str(bare))
+        git(repo, "-c", "init.defaultBranch=main", "init", "-q")
+        for path, text in (("src/app.ts", "one\n"), ("src/notes.md", "notes\n"), ("docs/guide.md", "guide\n"),
+                           (".github/workflows/ci.yml", "on: pull_request\n")):
+            (repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (repo / path).write_text(text)
+        git(repo, "add", ".")
+        git(repo, "commit", "-q", "-m", "feat: first")
+        if tagged:
+            git(repo, "tag", "v0.2.0")
+        for n, kind in enumerate(after):
+            if kind == "side-claim":
+                git(repo, "checkout", "-q", "-b", "side")
+                (repo / "src" / "app.ts").write_text(f"side {n}\n")
+                git(repo, "commit", "-q", "-am", f"fix: side {n}")
+                git(repo, "tag", "v0.9.0")
+                git(repo, "checkout", "-q", "main")
+                continue
+            if kind == "docs":
+                (repo / "docs" / "guide.md").write_text(f"guide {n}\n")
+                (repo / "README.md").write_text(f"readme {n}\n")
+            elif kind in ("code", "claim", "other-prefix"):
+                (repo / "src" / "app.ts").write_text(f"code {n}\n")
+            elif kind == "rename":
+                git(repo, "mv", "src/notes.md", "docs/notes.md")
+            elif kind == "docs-rename":
+                git(repo, "mv", "docs/guide.md", "docs/intro.md")
+            elif kind == "github":
+                (repo / ".github" / "workflows" / "ci.yml").write_text(f"on: [pull_request] # {n}\n")
+            elif kind == "github-doc":
+                (repo / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text(f"template {n}\n")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", f"{'docs' if kind == 'docs' else 'fix'}: {kind} {n}")
+            if kind == "claim":
+                git(repo, "tag", "v0.2.1")
+            if kind == "other-prefix":
+                git(repo, "tag", "ui-v0.1.0")
+        git(repo, "remote", "add", "origin", str(bare))
+        git(repo, "push", "-q", "origin", "main", "refs/tags/*")
+        head = git(repo, "rev-parse", "HEAD")
+        before = set(git(bare, "for-each-ref", "--format=%(refname)").splitlines())
+        out, summary = tmp / "out", tmp / "summary"
+        env = {**{k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "PYTHON"))},
+               "PYTHONSAFEPATH": "1", "WACD_SCRIPTS": str(root / "scripts"), "RUNNER_TEMP": str(tmp),
+               "GITHUB_OUTPUT": str(out), "GITHUB_STEP_SUMMARY": str(summary), "GITHUB_SHA": head,
+               "GITHUB_API_URL": f"http://127.0.0.1:{server.server_address[1]}", "GITHUB_REPOSITORY": "wacwini/app"}
+        asked, mints = [], tmp / "mints"
+        if gateway is not None:
+            class Gateway(BaseHTTPRequestHandler):
+                def do_POST(self):
+                    length = int(self.headers.get("Content-Length", "0"))
+                    asked.append((json.loads(self.rfile.read(length)), self.headers.get("Authorization")))
+                    body = json.dumps(gateway[1]).encode()
+                    self.send_response(gateway[0])
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *args):
+                    pass
+
+            if gateway == "refused":
+                import socket
+
+                with socket.socket() as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    url = f"http://127.0.0.1:{probe.getsockname()[1]}/v1/release"
+            else:
+                stand_in = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
+                threading.Thread(target=stand_in.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+                self.addCleanup(stand_in.server_close)
+                self.addCleanup(stand_in.shutdown)
+                url = f"http://127.0.0.1:{stand_in.server_address[1]}/v1/release"
+            scripts = tmp / "scripts"
+            scripts.mkdir()
+            for real in (root / "scripts").iterdir():
+                if real.name != "wacd-release.py":
+                    (scripts / real.name).symlink_to(real)
+            (scripts / "wacd-release.py").write_text(
+                "import importlib.util, os, sys\n"
+                "spec = importlib.util.spec_from_file_location('wacd_release_real', os.environ['WACD_REAL_RELEASE'])\n"
+                "real = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(real)\n"
+                "real.ci.URL = os.environ['WACD_GATEWAY_URL']\n"
+                "def mint(timeout=real.ci.OIDC_TIMEOUT):\n"
+                "    with open(os.environ['WACD_MINT_LOG'], 'a') as log:\n"
+                "        log.write(f'{timeout}\\n')\n"
+                "    return 'minted-token'\n"
+                "real.ci.oidc_token = mint\n"
+                "real.trust_context = lambda: None\n"
+                "if __name__ == '__main__':\n"
+                "    sys.exit(real.main(sys.argv))\n"
+                "globals().update({k: v for k, v in vars(real).items() if not k.startswith('__')})\n"
+            )
+            if claim is not None:
+                (scripts / "wacd-tag.py").unlink()
+                (scripts / "wacd-tag.py").write_text(
+                    "print('Tag claim stand-in: main moved on')\n"
+                    f"print('claim={claim}')\n"
+                )
+            if tag_read_fails:
+                (scripts / "wacd-version.py").unlink()
+                (scripts / "wacd-version.py").write_text(
+                    "import os, runpy, sys\n"
+                    "if '--mode' in sys.argv and sys.argv[sys.argv.index('--mode') + 1] == 'tagged':\n"
+                    "    sys.exit(print('wacd version: git tag failed: not a git repository', file=sys.stderr) or 1)\n"
+                    "sys.argv[0] = os.environ['WACD_REAL_VERSION']\n"
+                    "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+                )
+            env.update({"WACD_SCRIPTS": str(scripts), "WACD_REAL_RELEASE": str(root / "scripts" / "wacd-release.py"),
+                        "WACD_REAL_VERSION": str(root / "scripts" / "wacd-version.py"),
+                        "WACD_GATEWAY_URL": url, "WACD_MINT_LOG": str(mints)})
+        step_env = {"ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "", "DEPLOY": deploy,
+                    "APP": "app", "TAG_PREFIX": "v", "SETTINGS_REVISION": "", "SETTINGS_MODE": "",
+                    "SETTINGS_VERSION": "", "SETTINGS_TAG": "", "SETTINGS_COMMIT": "", "SETTINGS_SUMMARY": "",
+                    "SETTINGS_UNFINISHED": "", "EVENT_NAME": event, "DOCS_PATHS": docs_paths,
+                    "GITHUB_TOKEN": "job-token"}
+        self.assertEqual(set(step_env), set(step["env"]))
+        result = subprocess.run(["bash", "-c", step["run"]], env={**env, **(ambient or {}), **step_env}, cwd=repo,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
+        pushed = sorted(set(git(bare, "for-each-ref", "--format=%(refname)").splitlines()) - before)
+        plan = {"outputs": outputs, "pushed": pushed, "summary": summary.read_text(), "head": head, "reads": reads,
+                "log": result.stdout + result.stderr, "asked": asked,
+                "mints": mints.read_text().splitlines() if mints.exists() else []}
+        self.assertEqual(report["if"], "${{ steps.version.outputs.docs_since != '' }}")
+        self.assertEqual(report["env"], {"SINCE": "${{ steps.version.outputs.docs_since }}"})
+        self.assertEqual(publish_only["if"], "${{ steps.version.outputs.publish_only != '' }}")
+        self.assertEqual(publish_only["env"], {"SENTENCE": "${{ steps.version.outputs.publish_only }}"})
+        if outputs.get("docs_since"):
+            plan["report"] = subprocess.run(["bash", "-c", report["run"]], env={**env, "SINCE": outputs["docs_since"]},
+                                            capture_output=True, text=True)
+        if outputs.get("publish_only"):
+            plan["publish_only"] = subprocess.run(["bash", "-c", publish_only["run"]],
+                                                  env={**env, "SENTENCE": outputs["publish_only"]},
+                                                  capture_output=True, text=True)
+        return plan
+
+    def assertReleases(self, plan, version):
+        self.assertEqual({k: plan["outputs"][k] for k in ("mode", "version", "tag")},
+                         {"mode": "release", "version": version, "tag": f"v{version}"}, plan["log"])
+        self.assertEqual(plan["pushed"], [f"refs/tags/v{version}"])
+        self.assertNotIn("docs_since", plan["outputs"])
+        self.assertNotIn("nothing to release", plan["summary"])
+
+    def test_wac_cd_a_documentation_only_push_after_a_released_version_releases_nothing(self):
+        for after in (("docs",), ("docs", "docs"), ("docs-rename",), ("docs",) * 3):
+            with self.subTest(after=after):
+                plan = self.docs_plan(after)
+                self.assertEqual(plan["outputs"], {"mode": "none", "version": "", "tag": "",
+                                                   "expected_sha": plan["head"], "docs_since": "v0.2.0"}, plan["log"])
+                self.assertEqual(plan["pushed"], [], "no tag is claimed")
+                self.assertIn("\nnothing to release: only documentation changed since v0.2.0.\n", plan["summary"])
+                self.assertIn("| none | - | - |", plan["summary"])
+                self.assertEqual(plan["report"].returncode, 0)
+                self.assertIn("::notice::wac-cd: nothing to release: only documentation changed since v0.2.0.",
+                              plan["report"].stdout)
+                self.assertEqual(plan["reads"], [("/repos/wacwini/app/releases/tags/v0.2.0", "Bearer job-token")])
+
+    def test_wac_cd_a_code_change_since_the_released_version_releases(self):
+        for after, version in ((("code",), "0.2.1"), (("docs", "code"), "0.2.1"), (("rename",), "0.2.1"),
+                               (("github",), "0.2.1"), (("docs", "github"), "0.2.1")):
+            with self.subTest(after=after):
+                self.assertReleases(self.docs_plan(after), version)
+        with self.subTest(after="a .github/ file a pattern matches"):
+            self.assertReleases(self.docs_plan(("github-doc",), docs_paths='["docs/**","**/*.md"]'), "0.2.1")
+
+    def test_wac_cd_documentation_after_an_unfinished_code_release_releases_it(self):
+        """v0.2.1 claimed its tag and never got a Release: the base is v0.2.0, so its code is still unreleased."""
+        plan = self.docs_plan(("claim", "docs"))
+        self.assertReleases(plan, "0.2.2")
+        self.assertEqual([path for path, _ in plan["reads"]],
+                         ["/repos/wacwini/app/releases/tags/v0.2.1", "/repos/wacwini/app/releases/tags/v0.2.0"])
+
+    def test_wac_cd_documentation_with_no_release_to_measure_from_releases_as_before(self):
+        for label, kwargs in (
+            ("no Release yet", {"released": ()}),
+            ("Releases unreadable", {"released": ("unreadable",)}),
+            ("no documentation paths", {"docs_paths": "[]"}),
+            ("no patterns read", {"docs_paths": ""}),
+            ("a refused pattern", {"docs_paths": '["src/**"]'}),
+            ("not a push", {"event": "workflow_dispatch"}),
+        ):
+            with self.subTest(case=label):
+                self.assertReleases(self.docs_plan(("docs",), **kwargs), "0.2.1")
+
+    DIGEST_A = "sha256:" + "a" * 64
+
+    def status(self, version, digest, **extra):
+        """A 200 status in the shape wac.lab cideploy/backend.py's _chart_view returns."""
+        return 200, {"application": "app", "chart": "deploy/app", "version": version, "chart_digest": digest,
+                     "automated": bool(digest), "source_sha": "b" * 40,
+                     "sync": {"status": "OutOfSync", "revision": ""}, "health": {"status": "Missing"},
+                     "operation_phase": "", "deployments": [], **extra}
+
+    FIRST = ("app has not been released yet (the gateway's target is at its bootstrap revision 0.1.0), so this "
+             "merge publishes 0.1.0 without releasing it; the next merge releases.")
+
+    def assertAskedOnce(self, plan):
+        self.assertEqual(len(plan["mints"]), 1, "one status read, never asked again")
+        self.assertLessEqual(float(plan["mints"][0]), 20, "the mint is bounded by the read's time left")
+        self.assertIn(plan["asked"], ([], [({"operation": "status"}, "Bearer minted-token")]))
+
+    def test_wac_cd_a_first_merge_to_a_never_released_target_publishes_without_releasing(self):
+        """No version tag and a target at its bootstrap revision: claimed and published as deploy: false does."""
+        for label, after in (("no tag at all", ("code",)), ("only another prefix's tag", ("other-prefix",))):
+            with self.subTest(case=label):
+                plan = self.docs_plan(after, released=(), tagged=False, gateway=self.status("0.1.0", ""))
+                self.assertEqual(plan["outputs"], {"mode": "publish", "version": "0.1.0", "tag": "v0.1.0",
+                                                   "expected_sha": plan["head"], "publish_only": self.FIRST},
+                                 plan["log"])
+                self.assertEqual(plan["pushed"], ["refs/tags/v0.1.0"], "the version is claimed")
+                self.assertEqual(plan["asked"], [({"operation": "status"}, "Bearer minted-token")])
+                self.assertAskedOnce(plan)
+                self.assertIn("| publish | 0.1.0 | v0.1.0 |", plan["summary"])
+                self.assertIn("\n" + self.FIRST + "\n", plan["summary"])
+                self.assertEqual(plan["publish_only"].returncode, 0)
+                self.assertEqual(plan["publish_only"].stdout, "::notice::wac-cd: " + self.FIRST + "\n")
+                self.assertEqual(plan["reads"], [], "no Release is read for an app with no tag")
+
+    def test_wac_cd_a_first_merge_to_a_released_target_releases(self):
+        for label, answer in (
+            ("a digest the ledger names", self.status("0.1.0", self.DIGEST_A)),
+            ("a digest as the version", self.status(self.DIGEST_A, "")),
+            ("a digest the ledger lost", self.status("", "")),
+            ("no chart_digest", (200, {"version": "0.1.0"})),
+        ):
+            with self.subTest(case=label):
+                plan = self.docs_plan(("code",), released=(), tagged=False, gateway=answer)
+                self.assertReleases(plan, "0.1.0")
+                self.assertNotIn("publish_only", plan["outputs"])
+                self.assertNotIn("has not been released yet", plan["summary"])
+                self.assertEqual(len(plan["asked"]), 1)
+                self.assertAskedOnce(plan)
+
+    def test_wac_cd_a_first_merge_whose_status_read_fails_releases(self):
+        """Unknown is not never-released: deploy's own pre-check then reports, as before."""
+        for label, answer in (("unavailable", (503, {})), ("refused with no reason", (403, {})),
+                              ("refused with a code", (403, {"reason": "fleet_copy_missing"})),
+                              ("not JSON", (200, "not an object")), ("nothing listening", "refused")):
+            with self.subTest(case=label):
+                plan = self.docs_plan(("code",), released=(), tagged=False, gateway=answer)
+                self.assertReleases(plan, "0.1.0")
+                self.assertNotIn("publish_only", plan["outputs"])
+                self.assertAskedOnce(plan)
+                self.assertIn("wac-cd: a release, since the gateway's status could not be read", plan["log"])
+                self.assertNotIn("The gateway refused", plan["summary"])
+
+    def test_wac_cd_a_merge_with_a_version_tag_releases_without_asking_the_gateway(self):
+        """A tag means a release was claimed, so the gateway is never asked, even when its target never moved."""
+        for label, kwargs, version in (
+            ("a released tag on main", {"after": ("code",)}, "0.2.1"),
+            ("a claimed tag whose chart never published", {"after": ("claim", "code"), "released": (),
+                                                           "tagged": False}, "0.2.2"),
+            ("a tag never merged into main", {"after": ("side-claim", "code"), "released": (), "tagged": False},
+             "0.1.0"),
+            ("not a push", {"after": ("code",), "released": (), "tagged": False, "event": "workflow_dispatch"},
+             "0.1.0"),
+        ):
+            with self.subTest(case=label):
+                plan = self.docs_plan(gateway=self.status("0.1.0", ""), **kwargs)
+                self.assertReleases(plan, version)
+                self.assertNotIn("publish_only", plan["outputs"])
+                self.assertEqual((plan["asked"], plan["mints"]), ([], []))
+
+    def test_wac_cd_deploy_false_still_publishes_without_asking_the_gateway(self):
+        for tagged, version in ((False, "0.1.0"), (True, "0.2.1")):
+            with self.subTest(tagged=tagged):
+                plan = self.docs_plan(("code",), tagged=tagged, deploy="false", gateway=self.status("0.1.0", ""))
+                self.assertEqual({k: plan["outputs"][k] for k in ("mode", "version", "tag")},
+                                 {"mode": "publish", "version": version, "tag": f"v{version}"}, plan["log"])
+                self.assertEqual(plan["pushed"], [f"refs/tags/v{version}"])
+                self.assertNotIn("publish_only", plan["outputs"])
+                self.assertNotIn("has not been released yet", plan["summary"])
+                self.assertEqual((plan["asked"], plan["mints"]), ([], []))
+
+    def test_wac_cd_a_runners_own_environment_never_decides_a_push(self):
+        """`bootstrap` and `docs_since`, exported by a runner image or pod, cannot turn a release into a publish
+        or fake a documentation-only base: the step sets every variable it reads before it reads it."""
+        hostile = {"bootstrap": "0.1.0", "docs_since": "v0.2.0"}
+        for exported in ({"bootstrap": "0.1.0"}, {"docs_since": "v0.2.0"}, hostile):
+            for label, kwargs, version in (
+                ("a tagged, released app", {"after": ("code",)}, "0.2.1"),
+                ("a tagged app whose gateway is asked nothing",
+                 {"after": ("code",), "gateway": self.status("0.1.0", "")}, "0.2.1"),
+                ("an untagged app whose target was released",
+                 {"after": ("code",), "released": (), "tagged": False, "gateway": self.status("0.1.0", self.DIGEST_A)},
+                 "0.1.0"),
+            ):
+                with self.subTest(case=label, exported=sorted(exported)):
+                    plan = self.docs_plan(ambient=exported, **kwargs)
+                    self.assertReleases(plan, version)
+                    self.assertNotIn("publish_only", plan["outputs"])
+                    self.assertNotIn("has not been released yet", plan["summary"])
+        plan = self.docs_plan(("code",), deploy="false", ambient=hostile)
+        self.assertEqual(plan["outputs"]["mode"], "publish")
+        self.assertNotIn("publish_only", plan["outputs"], "a deploy: false publish gains no first-merge sentence")
+        self.assertNotIn("docs_since", plan["outputs"])
+
+    def test_wac_cd_a_tag_read_that_fails_releases_without_asking_the_gateway(self):
+        plan = self.docs_plan(("code",), released=(), tagged=False, gateway=self.status("0.1.0", ""),
+                              tag_read_fails=True)
+        self.assertReleases(plan, "0.1.0")
+        self.assertNotIn("publish_only", plan["outputs"])
+        self.assertEqual((plan["asked"], plan["mints"]), ([], []), "an unknown tag read never reaches the gateway")
+
+    def test_wac_cd_a_superseded_claim_after_a_publish_only_decision_publishes_nothing(self):
+        plan = self.docs_plan(("code",), released=(), tagged=False, gateway=self.status("0.1.0", ""),
+                              claim="superseded")
+        self.assertEqual(plan["outputs"], {"mode": "none", "version": "", "tag": "", "expected_sha": plan["head"]},
+                         plan["log"])
+        self.assertNotIn("publish_only", plan)
+        self.assertEqual(plan["pushed"], [])
+        self.assertIn("Superseded: Tag claim stand-in: main moved on. Nothing was built or published", plan["summary"])
+        self.assertNotIn("has not been released yet", plan["summary"])
+        self.assertAskedOnce(plan)
+
+    def test_wac_cd_a_publish_only_run_builds_and_publishes_and_never_deploys(self):
+        jobs = self.wac_cd()["jobs"]
+        steps = jobs["plan"]["steps"]
+        names = [s.get("name") for s in steps]
+        step = steps[names.index("Publish only: the app has not been released yet")]
+        self.assertEqual(names.index("Publish only: the app has not been released yet"),
+                         names.index("Nothing to release: only documentation changed") + 1)
+        self.assertEqual(step["if"], "${{ steps.version.outputs.publish_only != '' }}")
+        self.assertEqual(step["timeout-minutes"], 1)
+        self.assertNotIn("continue-on-error", step)
+        ran = {name for name in ("shadow", "build", "retag", "publish", "deploy", "github-release")
+               if self.runs(jobs[name], "publish", "files")}
+        self.assertEqual(ran, {"shadow", "build", "publish"}, "no deploy and no GitHub Release")
+
     def test_wac_cd_shadow_observes_and_never_holds_a_release(self):
         """A hemi outage must not fail or delay a release: the shadow job is off the release path."""
         import yaml
@@ -545,7 +1103,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             needs = other.get("needs") or []
             with self.subTest(job=name):
                 self.assertNotIn("shadow", [needs] if isinstance(needs, str) else needs)
-        app = next(st for st in job["steps"] if st.get("name") == "Check out the app (actions/checkout v4)")
+        app = next(st for st in job["steps"] if str(st.get("name", "")).startswith("Check out the app ("))
         self.assertTrue(app["uses"].startswith("actions/checkout@"))
         self.assertNotIn("repository", app.get("with") or {})
         self.assertIs((app.get("with") or {}).get("persist-credentials"), False)
@@ -678,18 +1236,23 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(id_token_problems(doc, name, doc["jobs"][name]), [])
 
     def test_the_id_token_rule_names_each_way_in(self):
-        pinned = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-        good = {"name": "Check out (actions/checkout v4)", "uses": pinned}
+        pinned = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        good = {"name": "Check out (actions/checkout v7.0.1)", "uses": pinned}
         cases = (
             ("tag-pinned action", {"name": "x (actions/checkout v4)", "uses": "actions/checkout@v4"}, "allowlist"),
             ("setup-python", {"name": "x", "uses": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"},
              "allowlist"),
+            ("setup-python pinned on the allowlist",
+             {"name": "x (actions/setup-python v7.1.0)",
+              "uses": "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"}, "allowlist"),
             ("unnamed pin", {"uses": pinned}, "step name"),
             ("install-tools", {"run": 'bash "$WACD_SCRIPTS"/install-tools.sh helm'}, "install-tools.sh"),
             ("pip", {"run": "pip install requests"}, "pip"),
             ("pip3", {"run": "python3 -m pip3 install x"}, "pip"),
             ("npm", {"run": "npm ci"}, "npm"),
             ("npx", {"run": "npx something"}, "npx"),
+            ("yarn", {"run": "yarn build"}, "yarn"),
+            ("node", {"run": "node scripts/x.js"}, "node"),
             ("uvx", {"run": "uvx mkdocs build"}, "uvx"),
             ("curl to sh", {"run": "curl -fsSL https://example.invalid/i | sh"}, "curl"),
             ("curl to sudo bash", {"run": "curl -fsSL https://example.invalid/i | sudo bash -s"}, "curl"),
@@ -709,6 +1272,376 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertFalse(holds_id_token(inherited, {"permissions": {"contents": "read"}}))
         self.assertTrue(holds_id_token({}, {"permissions": "write-all"}))
 
+    def test_jobs_run_only_commit_pinned_allowlisted_actions(self):
+        """Every job of every reusable workflow, and every job anywhere that holds id-token: write."""
+        import yaml
+
+        root = Path(__file__).resolve().parents[1] / "workflows"
+        reusable, writers, id_token = [], [], []
+        for path in sorted(root.glob("*.yml")):
+            doc = yaml.safe_load(path.read_text())
+            is_reusable = module._is_reusable(doc)
+            if is_reusable:
+                reusable.append(path.name)
+            for job_name, job in doc["jobs"].items():
+                if holds_write(doc, job):
+                    writers.append((path.name, job_name))
+                if holds_id_token(doc, job):
+                    id_token.append((path.name, job_name))
+                if not is_reusable and not holds_id_token(doc, job):
+                    continue
+                with self.subTest(workflow=path.name, job=job_name):
+                    self.assertEqual(pinned_action_problems(job_name, job), [])
+        for name in ("wac-cd.yml", "wac-ci.yml", "actionlint.yml", "techdocs.yml", "agents-md.yml",
+                     "nextjs-site-check.yml", "nextjs-site-deploy.yml"):
+            self.assertIn(name, reusable)
+        for expected in (("wac-cd.yml", "publish"), ("wac-cd.yml", "github-release"), ("wac-cd.yml", "plan"),
+                         ("wac-ci.yml", "contract"), ("nextjs-site-deploy.yml", "image-cache"),
+                         ("nextjs-site-deploy.yml", "deploy")):
+            self.assertIn(expected, writers)
+        self.assertIn(("nextjs-site-deploy.yml", "image-cache"), id_token)
+        self.assertIn(("nextjs-site-deploy.yml", "deploy"), id_token)
+        self.assertNotIn(("nextjs-site-deploy.yml", "build"), id_token)
+
+    def test_reusable_workflows_are_found_whichever_form_on_takes(self):
+        jobs = {"gate": {"runs-on": "${{ inputs.runner || vars.CI_RUNNER_SMALL }}", "steps": [{"run": "true"}]}}
+        for label, on, reusable in (
+            ("a mapping", {"workflow_call": {"inputs": {"runner": {"type": "string", "default": ""}}}}, True),
+            ("a mapping with no configuration", {"workflow_call": None}, True),
+            ("a string", "workflow_call", True),
+            ("a list", ["push", "workflow_call"], True),
+            ("unquoted on", None, True),
+            ("another event as a string", "push", False),
+            ("another event in a list", ["push", "pull_request"], False),
+        ):
+            doc = {"name": "wf", "jobs": jobs}
+            if label == "unquoted on":
+                doc[True] = "workflow_call"
+            else:
+                doc["on"] = on
+            with self.subTest(on=label):
+                self.assertIs(module._is_reusable(doc), reusable)
+        problems = module._check_runner_is_a_caller_choice(Path("wf.yml"), {"name": "wf", "on": "workflow_call", "jobs": jobs})
+        self.assertTrue(any("declares no `runner` input" in p for p in problems), problems)
+
+    def test_the_pinned_action_rule_names_each_way_in(self):
+        self.assertEqual(len({uses.split("@")[0] for uses in PINNED_ACTIONS}), len(PINNED_ACTIONS),
+                         "one commit per action")
+        for uses, tag in PINNED_ACTIONS.items():
+            with self.subTest(uses=uses):
+                self.assertRegex(uses, r"^[a-z0-9-]+/[a-z0-9-]+@[0-9a-f]{40}$")
+                self.assertRegex(tag, r"^v\d+\.\d+\.\d+$")
+        node = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+        good = {"name": "Set up Node (actions/setup-node v7.1.0)", "uses": node}
+        cases = (
+            ("tag-pinned", {"name": "x (actions/setup-node v4)", "uses": "actions/setup-node@v4"}, "allowlist"),
+            ("a commit off the allowlist",
+             {"name": "x (actions/setup-node v4.4.0)", "uses": "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"},
+             "allowlist"),
+            ("unnamed", {"uses": node}, "step name"),
+            ("named with another tag", {"name": "x (actions/setup-node v4)", "uses": node}, "step name"),
+        )
+        for label, step, expected in cases:
+            with self.subTest(case=label):
+                problems = pinned_action_problems("job", {"steps": [good, {"run": "true"}, step]})
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(expected, problems[0])
+        self.assertEqual(pinned_action_problems("job", {"steps": [good, {"run": "true"}]}), [])
+        sha = "a" * 40
+        for label, called, expected in (
+            ("a local workflow", "./.github/workflows/actionlint.yml", None),
+            ("another repository's workflow at a commit", f"someone/else/.github/workflows/x.yml@{sha}", None),
+            ("another repository's workflow at a branch", "someone/else/.github/workflows/x.yml@main", "pinned by commit"),
+            ("another repository's workflow at a tag", "someone/else/.github/workflows/x.yml@v1", "pinned by commit"),
+            ("a short SHA", "someone/else/.github/workflows/x.yml@aaaaaaa", "pinned by commit"),
+            ("a local path outside the workflows", "./lab-tools", "pinned by commit"),
+        ):
+            with self.subTest(call=label):
+                problems = pinned_action_problems("job", {"uses": called})
+                if expected is None:
+                    self.assertEqual(problems, [])
+                else:
+                    self.assertEqual(len(problems), 1, problems)
+                    self.assertIn(expected, problems[0])
+        for label, doc, job, expected in (
+            ("contents write", {}, {"permissions": {"contents": "write"}}, True),
+            ("packages write", {}, {"permissions": {"contents": "read", "packages": "write"}}, True),
+            ("id-token write", {}, {"permissions": {"id-token": "write"}}, True),
+            ("write-all", {}, {"permissions": "write-all"}, True),
+            ("read only", {}, {"permissions": {"contents": "read", "packages": "read"}}, False),
+            ("the workflow's", {"permissions": {"contents": "write"}}, {"steps": []}, True),
+            ("the job's over the workflow's", {"permissions": {"contents": "write"}},
+             {"permissions": {"contents": "read"}}, False),
+        ):
+            with self.subTest(permissions=label):
+                self.assertIs(holds_write(doc, job), expected)
+
+    def nextjs_deploy(self):
+        import yaml
+
+        return yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "nextjs-site-deploy.yml").read_text())
+
+    def test_nextjs_site_deploy_holds_a_token_only_where_no_site_code_runs(self):
+        doc = self.nextjs_deploy()
+        jobs = doc["jobs"]
+        self.assertEqual(sorted(jobs), ["build", "deploy", "image-cache"])
+        self.assertEqual(doc["permissions"], {"contents": "read"})
+        self.assertNotIn("needs", jobs["image-cache"])
+        self.assertEqual(jobs["build"]["needs"], "image-cache")
+        self.assertEqual(jobs["deploy"]["needs"], "build")
+        self.assertEqual(jobs["build"]["permissions"], {"contents": "read"})
+        self.assertFalse(holds_id_token(doc, jobs["build"]))
+        text = json.dumps(jobs["build"])
+        for reach in ("secrets.", "aws-actions/", "aws s3", "aws cloudfront", "role_arn"):
+            self.assertNotIn(reach, text, f"build, which runs the site's code, reaches {reach}")
+        for name in ("image-cache", "deploy"):
+            with self.subTest(job=name):
+                self.assertEqual(jobs[name]["permissions"], {"contents": "read", "id-token": "write"})
+                self.assertEqual(site_token_job_problems(doc, name, jobs[name]), [])
+                checkouts = [step for step in jobs[name]["steps"] if "actions/checkout" in str(step.get("uses"))]
+                self.assertEqual([step["with"]["repository"] for step in checkouts], ["willfell/wac.lab.actions"])
+
+    def test_the_site_token_rule_names_each_way_in(self):
+        pinned = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        shared = {"name": "Check out the shared scripts (actions/checkout v7.0.1)", "uses": pinned,
+                  "with": {"repository": "willfell/wac.lab.actions", "ref": SHA, "path": ".lab-actions",
+                           "persist-credentials": False}}
+        credentials = {"name": "x (aws-actions/configure-aws-credentials v6.3.0)",
+                       "uses": "aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd"}
+        safe = {"PYTHONSAFEPATH": "1"}
+        node = {"name": "x (actions/setup-node v7.1.0)", "uses": "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"}
+        cases = (
+            ("the caller's checkout", safe, {"name": "Check out (actions/checkout v7.0.1)", "uses": pinned}, "calling"),
+            ("another repository's checkout", safe,
+             {**shared, "with": {"repository": "someone/site", "ref": SHA}}, "calling"),
+            ("this repository at a branch", safe, {**shared, "with": {**shared["with"], "ref": "main"}}, "calling"),
+            ("setup-node", safe, node, "allowlist"),
+            ("yarn", safe, {"run": "yarn images:optimize"}, "yarn"),
+            ("node", safe, {"run": "node out/x.js"}, "node"),
+            ("a global npm install", safe, {"run": "sudo npm install -g corepack"}, "npm"),
+            ("python3", safe, {"run": "python3 -I -c 'print(1)'"}, "python3"),
+            ("no PYTHONSAFEPATH", {}, {"run": "true"}, "PYTHONSAFEPATH"),
+        )
+        for label, env, step, expected in cases:
+            with self.subTest(case=label):
+                problems = site_token_job_problems({}, "job", {"env": env, "steps": [shared, credentials, step]})
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(expected, problems[0])
+        self.assertEqual(site_token_job_problems({}, "job", {"env": safe, "steps": [shared, credentials]}), [])
+
+    def test_nextjs_site_deploy_hands_the_build_two_artifacts_and_deploy_only_data(self):
+        jobs = self.nextjs_deploy()["jobs"]
+
+        def uses(job, action):
+            return [step for step in jobs[job]["steps"] if str(step.get("uses", "")).startswith(action + "@")]
+
+        cache_up, = uses("image-cache", "actions/upload-artifact")
+        self.assertEqual(cache_up["if"], "steps.cache.outputs.cached == 'true'")
+        self.assertEqual(jobs["image-cache"]["outputs"], {"cached": "${{ steps.cache.outputs.cached }}"})
+        cache_down, = uses("build", "actions/download-artifact")
+        self.assertEqual(cache_down["if"], "needs.image-cache.outputs.cached == 'true'")
+        self.assertIs(cache_down.get("continue-on-error"), True, "a cache that cannot be downloaded is no cache")
+        self.assertEqual(cache_down["with"], {"name": "nextjs-image-cache", "path": "${{ inputs.app_dir }}/public/images"})
+        site_up, = uses("build", "actions/upload-artifact")
+        site_down, = uses("deploy", "actions/download-artifact")
+        self.assertEqual(site_down["with"], {"name": "nextjs-site-out", "path": "${{ runner.temp }}/site-out"})
+        for step, name, path in ((cache_up, "nextjs-image-cache", "${{ runner.temp }}/image-cache"),
+                                 (site_up, "nextjs-site-out", "${{ inputs.app_dir }}/out")):
+            with self.subTest(artifact=name):
+                self.assertEqual(step["with"], {"name": name, "path": path, "retention-days": 1,
+                                                "include-hidden-files": True, "if-no-files-found": "error"})
+        build = [step.get("name") or step.get("run") for step in jobs["build"]["steps"]]
+        self.assertLess(build.index("${{ inputs.install_command }}"), build.index(cache_down["name"]))
+        self.assertLess(build.index(cache_down["name"]), build.index("yarn images:validate"))
+        self.assertLess(build.index("Verify the export directory exists"), build.index(site_up["name"]))
+
+        steps = jobs["deploy"]["steps"]
+        names = [step.get("name") for step in steps]
+        check = names.index("Refuse anything in the export but plain files and directories")
+        credentials = next(i for i, step in enumerate(steps) if "configure-aws-credentials" in str(step.get("uses")))
+        aws = [i for i, step in enumerate(steps) if re.search(r"^\s*aws (s3|cloudfront) ", str(step.get("run", "")), re.M)]
+        self.assertEqual(len(aws), 3)
+        self.assertLess(names.index(site_down["name"]), check)
+        self.assertLess(check, credentials)
+        self.assertLess(credentials, min(aws))
+        for step in steps:
+            self.assertNotIn("working-directory", step)
+            for line in str(step.get("run", "")).splitlines():
+                if "SITE_OUT" in line:
+                    with self.subTest(line=line):
+                        self.assertRegex(line.strip(), r'^(bash "\$LAB_ACTIONS_SCRIPTS/check-site-export\.sh" "\$SITE_OUT"'
+                                                        r'|if \[ ! -d "\$SITE_OUT/images" \]; then$'
+                                                        r'|aws s3 sync "\$SITE_OUT/images" |args=\("\$SITE_OUT" )')
+        for index in aws[:2]:
+            self.assertIn("--no-follow-symlinks", steps[index]["run"])
+
+    def test_nextjs_site_deploy_refuses_an_export_that_is_not_plain_files(self):
+        import os
+        import shutil
+        import subprocess
+
+        step = next(step for step in self.nextjs_deploy()["jobs"]["deploy"]["steps"]
+                    if step.get("name") == "Refuse anything in the export but plain files and directories")
+        self.assertEqual(step["env"], {"SITE_OUT": "${{ runner.temp }}/site-out"})
+        scripts = Path(__file__).resolve().parents[2] / "scripts"
+        tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, tmp)
+        outside = tmp / "outside"
+        outside.mkdir()
+        (outside / "credentials").write_text("secret\n")
+
+        def tree(name, plant=None):
+            root = tmp / name
+            for path, body in (("index.html", "<html>"), ("_next/static/a.js", "x"), ("images/a.webp", "w"),
+                               ("images/.image-manifest.json", "{}"), ("a dir/a page.html", "p")):
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+                (root / path).write_text(body)
+            if plant:
+                plant(root)
+            return root
+
+        def run(root):
+            env = {"PATH": os.environ["PATH"], "LAB_ACTIONS_SCRIPTS": str(scripts), "SITE_OUT": str(root)}
+            return subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+
+        result = run(tree("clean"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        refusal = "deploy syncs only plain files and directories, so nothing was synced"
+        cases = (
+            ("a link inside the export", lambda r: (r / "about.html").symlink_to("index.html"),
+             "about.html is a symbolic link to index.html.", False),
+            ("a link to a directory outside", lambda r: (r / "leak").symlink_to(outside),
+             f"leak is a symbolic link to {outside}, which resolves outside the export.", True),
+            ("a nested link to a file outside", lambda r: (r / "images" / "b.avif").symlink_to(outside / "credentials"),
+             f"images/b.avif is a symbolic link to {outside / 'credentials'}, which resolves outside the export.", True),
+            ("a relative link that climbs out", lambda r: (r / "images" / "up").symlink_to("../../outside"),
+             "images/up is a symbolic link to ../../outside, which resolves outside the export.", True),
+            ("a dangling link", lambda r: (r / "gone").symlink_to("missing.html"),
+             "gone is a symbolic link to missing.html.", False),
+            ("a named pipe", lambda r: os.mkfifo(r / "pipe"), "pipe is neither a regular file nor a directory.", False),
+            ("a name that would start a workflow command",
+             lambda r: (r / "a\n::stop-commands::resume\r%").symlink_to("index.html\n::warning::planted"),
+             "a%0A::stop-commands::resume%0D%25 is a symbolic link to index.html%0A::warning::planted.", False),
+            ("a pipe whose name would start a workflow command",
+             lambda r: os.mkfifo(r / "p\n::error::planted"), "p%0A::error::planted is neither a regular file nor a "
+                                                           "directory.", False),
+        )
+        for label, plant, said, escapes in cases:
+            with self.subTest(case=label):
+                result = run(tree(label.replace(" ", "-"), plant))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                for line in result.stdout.splitlines():
+                    self.assertTrue(line.startswith("::error::nextjs-site-deploy: "), line)
+                self.assertIn(f"::error::nextjs-site-deploy: {said}", result.stdout)
+                self.assertEqual("outside the export" in result.stdout, escapes)
+                self.assertIn(f"::error::nextjs-site-deploy: the site export holds 1 entry that is not a plain file "
+                              f"or directory; {refusal}.", result.stdout)
+        linked = tmp / "linked-export"
+        linked.symlink_to(tree("real-export"))
+        result = run(linked)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("is not a directory of its own", result.stdout)
+
+    def test_nextjs_image_cache_treats_an_empty_or_missing_cache_as_none(self):
+        import os
+        import shutil
+        import subprocess
+
+        steps = {step.get("name"): step for step in self.nextjs_deploy()["jobs"]["image-cache"]["steps"]}
+        download = steps["Download cached optimized images from S3"]
+        count = steps["Count the cached images"]
+        self.assertIs(download.get("continue-on-error"), True)
+        self.assertEqual(count["id"], "cache")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "aws").write_text('#!/bin/bash\necho "$*" >> "$AWS_LOG"\n'
+                                     'if [ "$AWS_MODE" = files ]; then mkdir -p "$4"; : > "$4/.image-manifest.json"; '
+                                     ': > "$4/a.webp"; fi\n'
+                                     '[ "$AWS_MODE" != missing ]\n')
+        (bin_dir / "aws").chmod(0o755)
+        for mode, cached in (("missing", "false"), ("empty", "false"), ("files", "true")):
+            with self.subTest(cache=mode):
+                runner = tmp / mode
+                runner.mkdir()
+                env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": str(runner), "S3_BUCKET": "site-bucket",
+                       "GITHUB_OUTPUT": str(runner / "out"), "AWS_LOG": str(runner / "aws.log"), "AWS_MODE": mode}
+                result = subprocess.run(["bash", "-e", "-c", download["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue((runner / "aws.log").read_text().startswith(
+                    f"s3 sync s3://site-bucket/images {runner}/image-cache --exclude * --include *.webp"))
+                result = subprocess.run(["bash", "-e", "-c", count["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((runner / "out").read_text(), f"cached={cached}\n")
+
+    def test_nextjs_site_deploy_syncs_images_only_when_the_export_has_them(self):
+        """An artifact drops empty directories, so a site with no images reaches deploy with no images/ at all."""
+        import os
+        import shutil
+        import subprocess
+
+        step = next(step for step in self.nextjs_deploy()["jobs"]["deploy"]["steps"]
+                    if step.get("name") == "Sync images to S3 with immutable cache headers")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "aws").write_text('#!/bin/bash\necho "$*" >> "$AWS_LOG"\n[ -d "$3" ]\n')
+        (bin_dir / "aws").chmod(0o755)
+        for label, images, synced in (("no images directory", False, False), ("images", True, True)):
+            with self.subTest(export=label):
+                site_out = tmp / label.replace(" ", "-")
+                site_out.mkdir()
+                if images:
+                    (site_out / "images").mkdir()
+                    (site_out / "images" / "a.webp").write_text("w")
+                log = tmp / (label.replace(" ", "-") + ".log")
+                env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "SITE_OUT": str(site_out), "S3_BUCKET": "site-bucket",
+                       "AWS_LOG": str(log)}
+                result = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(log.exists(), synced)
+                if synced:
+                    self.assertTrue(log.read_text().startswith(f"s3 sync {site_out}/images s3://site-bucket/images "))
+
+    def test_nextjs_token_jobs_leave_the_choice_of_aws_to_the_installer(self):
+        """A site's build on a reused runner could leave an aws on PATH; the token jobs never run it themselves."""
+        import os
+        import shutil
+        import subprocess
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        planted, scripts = tmp / "planted", tmp / "scripts"
+        planted.mkdir()
+        scripts.mkdir()
+        (planted / "aws").write_text('#!/bin/sh\ntouch "$MARK.planted"\n')
+        (planted / "aws").chmod(0o755)
+        (scripts / "install-awscli.sh").write_text('touch "$MARK.installer"\n')
+        jobs = self.nextjs_deploy()["jobs"]
+        for name in ("image-cache", "deploy"):
+            with self.subTest(job=name):
+                steps = jobs[name]["steps"]
+                provide = next(i for i, step in enumerate(steps) if step.get("name") == "Provide the aws CLI")
+                credentials = next(i for i, step in enumerate(steps)
+                                   if "configure-aws-credentials" in str(step.get("uses")))
+                self.assertLess(provide, credentials)
+                mark = tmp / name
+                env = {"PATH": f"{planted}:{os.environ['PATH']}", "LAB_ACTIONS_SCRIPTS": str(scripts), "MARK": str(mark)}
+                result = subprocess.run(["bash", "-e", "-c", steps[provide]["run"]], env=env, capture_output=True,
+                                        text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(Path(f"{mark}.planted").exists(), "the aws on PATH ran before the installer judged it")
+                self.assertTrue(Path(f"{mark}.installer").exists())
+
+    def test_nextjs_site_deploy_build_keeps_no_token_on_disk(self):
+        """build runs the site's code and never pushes, so its checkout persists no credentials."""
+        steps = self.nextjs_deploy()["jobs"]["build"]["steps"]
+        checkouts = [step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")]
+        self.assertEqual(len(checkouts), 1)
+        self.assertIs(checkouts[0].get("with", {}).get("persist-credentials"), False)
+
     def token_step_env(self, head):
         """The env each run step of a token job gets in the planted-repository run, keyed by job and step."""
         sha = "a" * 40
@@ -718,7 +1651,8 @@ class ReusableWorkflowTests(unittest.TestCase):
         guard = {"SHARED_WORKFLOW_SHA": sha}
         code = {"ROLLBACK_VERSION": "", "VERSION_SOURCE": "commits", "CALLER_VERSION": "", "DEPLOY": "true",
                 "APP": "app", "TAG_PREFIX": "v", "SETTINGS_REVISION": "", "SETTINGS_MODE": "", "SETTINGS_VERSION": "",
-                "SETTINGS_TAG": "", "SETTINGS_COMMIT": "", "SETTINGS_SUMMARY": ""}
+                "SETTINGS_TAG": "", "SETTINGS_COMMIT": "", "SETTINGS_SUMMARY": "", "SETTINGS_UNFINISHED": "",
+                "EVENT_NAME": "push", "DOCS_PATHS": '["docs/**","mkdocs.yml","*.md"]', "GITHUB_TOKEN": "job-token"}
         settings = {**code, "SETTINGS_REVISION": "7", "SETTINGS_MODE": "settings", "SETTINGS_VERSION": "1.4.3",
                     "SETTINGS_TAG": "v1.4.3", "SETTINGS_COMMIT": head, "SETTINGS_SUMMARY": "settings revision 7"}
         refusal = ({"REASON": "a refusal"}, 1)
@@ -735,9 +1669,12 @@ class ReusableWorkflowTests(unittest.TestCase):
                 "PROFILE_IMAGES": json.dumps([{"name": "web", "dockerfile": "Dockerfile", "context": "."}]),
                 "GITHUB_TOKEN": "job-token"}, 0)],
             ("plan", "Refuse a settings release while the app is rolling out"): [refusal],
+            ("plan", "Refuse a settings release behind an unfinished code release"): [refusal],
             ("plan", "Refuse a settings release behind a workflow change"): [refusal],
             ("plan", "Plan the version"): [(code, 0), ({**code, "ROLLBACK_VERSION": "1.4.2"}, 0), (settings, 0)],
             ("plan", "Refuse to replay an old version"): [refusal],
+            ("plan", "Nothing to release: only documentation changed"): [({"SINCE": "v1.4.2"}, 0)],
+            ("plan", "Publish only: the app has not been released yet"): [({"SENTENCE": "app has not been released yet"}, 0)],
             ("shadow", "Start the clock"): [({}, 0)],
             ("shadow", "Require the runner's python3 3.12 or later"): [(runner, 0)],
             ("shadow", "Require the defining workflow commit"): [(guard, 0)],
@@ -762,13 +1699,44 @@ class ReusableWorkflowTests(unittest.TestCase):
             ("contract", "Ask hemi for the settings"): [({"JOB_RUNNER_NAME": "ci-small-abc12"}, 0)],
         }
 
+    def test_every_inline_python_in_a_job_holding_id_token_runs_isolated(self):
+        """`-I` on every `-c`, as S1 states it, even where the planted-repository run cannot tell.
+
+        The version probes import only sys, and site runs before the empty path entry is added, so
+        removing -I from one of them changes nothing that run sees; -I also drops user site-packages
+        and every PYTHON* variable, which a later change to the probe could start to depend on.
+        """
+        import yaml
+
+        for text, flagged in (("python3 -c 'x'", True), ('"$python" -c \'x\'', True), ("python3 -u -c 'x'", True),
+                              ("python3 -I -c 'x'", False), ('"$python" -I -c \'x\'', False),
+                              ("python3 -I -u -c 'x'", False), ("python3 -I script.py -c x", False)):
+            with self.subTest(sample=text):
+                self.assertEqual(bool(unisolated_inline_python(text)), flagged)
+        found = 0
+        for path in sorted((Path(__file__).resolve().parents[1] / "workflows").glob("*.yml")):
+            doc = yaml.safe_load(path.read_text())
+            for name, job in (doc.get("jobs") or {}).items():
+                if not holds_id_token(doc, job):
+                    continue
+                for step in job.get("steps", []):
+                    run = str(step.get("run", ""))
+                    found += len(INLINE_PYTHON.findall(run))
+                    with self.subTest(workflow=path.name, job=name, step=step.get("name")):
+                        self.assertEqual(unisolated_inline_python(run), [])
+        self.assertGreaterEqual(found, 9, "the probes and the plan's check are all inline -c")
+
     def test_jobs_holding_id_token_import_nothing_from_the_calling_repository(self):
         """Every run step of a token job, run in a checkout that plants json.py, ssl.py and sitecustomize.py.
 
         Each planted module writes a marker when it is imported. The scripts are
         stand-ins that import the same standard modules, every python3 the steps
         start is the real interpreter (logged by a PATH wrapper), and git, the
-        version check and the inline Python run for real.
+        version check and the inline Python run for real. Each protection must
+        hold on its own: every step runs once with the job's env and once with
+        PYTHONSAFEPATH taken out of it, so a `python3 -c` without -I is caught,
+        and each token job's env alone must keep a bare `python3 -c` from
+        importing the plant, so a job without PYTHONSAFEPATH is caught.
         """
         import os
         import shutil
@@ -801,11 +1769,13 @@ class ReusableWorkflowTests(unittest.TestCase):
             "wacd-contract.py fetch": "source=hemi\nrevision=7\nfleet_commit=" + "f" * 40 + "\nreason=r",
             "wacd-contract.py pr": "source=hemi\nrevision=7",
             "wacd-profile.py": "app=app\ntag_prefix=v",
-            "wacd-release.py running": (f"running=1.4.2\ncommit={head}\nimages={json.dumps(running)}\n"
-                                        "copy_revision=6\nfleet_commit=" + "f" * 40),
+            "wacd-release.py running": f"running=1.4.2\ncommit={head}\nimages={json.dumps(running)}\ncopy_revision=6",
             "wacd-release.py earlier-release": "reuse=",
+            "wacd-release.py unfinished-release": "left=",
             "wacd-release.py": "Verified",
-            "wacd-version.py --mode settings": "mode=settings\nversion=1.4.3\ntag=v1.4.3\nclaimed=\nabove=",
+            "wacd-version.py --mode settings": "mode=settings\nversion=1.4.3\ntag=v1.4.3\nclaimed=\nabove=\ncodes=",
+            "wacd-version.py --mode tagged": "tagged=false",
+            "wacd-release.py bootstrap": "bootstrap=0.1.0",
             "wacd-version.py": "mode=release\nversion=1.4.3\ntag=v1.4.3",
             "wacd-chart.py chart-revision": f"revision={head}",
             "wacd-chart.py chart-images": "images=" + json.dumps(running),
@@ -813,6 +1783,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             "wacd-chart.py": "state=absent",
             "wacd-tag.py": "claim=pushed",
             "wacd-shadow.py": "",
+            "wacd-docs.py": "docs_only=false\nreason=r",
         }
         stub = (
             "import json, os, socket, ssl, sys\n"
@@ -822,7 +1793,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             "print(answers[max((key for key in answers if line.startswith(key)), key=len)])\n"
         )
         for name in ("wacd-contract.py", "wacd-profile.py", "wacd-release.py", "wacd-version.py", "wacd-chart.py",
-                     "wacd-tag.py", "wacd-shadow.py"):
+                     "wacd-tag.py", "wacd-shadow.py", "wacd-docs.py"):
             (scripts / name).write_text(stub)
         (scripts / "install-helm.sh").write_text("exit 0\n")
         python_log, stub_log = tmp / "python.log", tmp / "stub.log"
@@ -860,11 +1831,13 @@ class ReusableWorkflowTests(unittest.TestCase):
                 key = (job_name, step["name"])
                 self.assertIn(key, scenarios, f"{workflow} {job_name} step {step['name']!r} has no planted-repository run")
                 covered.add(key)
-                for step_env, expected in scenarios[key]:
-                    with self.subTest(job=job_name, step=step["name"], env=step_env):
+                for (step_env, expected), protection in itertools.product(scenarios[key], ("job env", "-I alone")):
+                    with self.subTest(job=job_name, step=step["name"], env=step_env, protection=protection):
                         self.assertEqual(set(step_env), set(step.get("env") or {}))
                         python_log.write_text("")
-                        result = run(step["run"], {**base, **{k: str(v) for k, v in job_env.items()}, **step_env})
+                        env = {k: str(v) for k, v in job_env.items()
+                               if protection == "job env" or k != "PYTHONSAFEPATH"}
+                        result = run(step["run"], {**base, **env, **step_env})
                         self.assertEqual(marks(), [], f"{step['name']} imported a module the checkout planted")
                         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                         if "python3" in step["run"]:
@@ -872,9 +1845,11 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(covered, set(scenarios), "a planted-repository run for a step that no longer exists")
 
         probe = "python3 -c 'import json, ssl'"
-        plan_env = {k: str(v) for k, v in (self.wac_cd()["jobs"]["plan"].get("env") or {}).items()}
-        self.assertEqual(run(probe, {**base, **plan_env}).returncode, 0)
-        self.assertEqual(marks(), [], "the job's own env keeps a step that forgets -I from importing the checkout")
+        for workflow, job_name, job in token_jobs:
+            with self.subTest(job=job_name, protection="job env alone"):
+                job_env = {k: str(v) for k, v in (job.get("env") or {}).items()}
+                self.assertEqual(run(probe, {**base, **job_env}).returncode, 0)
+                self.assertEqual(marks(), [], "the job's own env keeps a step that forgets -I from importing the checkout")
         self.assertEqual(run(probe, base).returncode, 0)
         self.assertEqual(marks(), ["json.py.ran", "ssl.py.ran"], "without it the plant is imported: the probe can see it")
 
@@ -925,17 +1900,28 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertIn(f"{job_name} needs python3 3.12 or later on the runner; found no python3 on ci-light-abc12 (Linux, ARM64).", result.stdout)
         self.assertTrue(sys.version_info >= (3, 12), "the real-interpreter cases below need 3.12 or later")
         runner_env = {"JOB_RUNNER_NAME": "ci-light-abc12", "JOB_RUNNER_OS": "Linux", "JOB_RUNNER_ARCH": "ARM64"}
-        for broken in (None, "ssl", "http.client", "uuid", "json"):
+        finder = ("import sys; sys.meta_path.insert(0, type('Broken', (), {{'find_spec': staticmethod("
+                  "lambda name, *rest: ({action}) if name == 'uuid' else None)}})())\n")
+        cases = [(None, None, "")]
+        cases += [(name, f"import sys; sys.modules[{name!r}] = None\n", f"cannot import {name} (ModuleNotFoundError)")
+                  for name in ("ssl", "http.client", "uuid", "json")]
+        cases += [
+            ("uuid interrupted", finder.format(action="(_ for _ in ()).throw(KeyboardInterrupt())"),
+             "cannot import uuid (KeyboardInterrupt)"),
+            ("uuid killed", finder.format(action="__import__('os').kill(__import__('os').getpid(), 9)"),
+             "stopped with exit status 137 while importing its standard modules"),
+        ]
+        for broken, pth, said in cases:
             with self.subTest(broken_module=broken), tempfile.TemporaryDirectory() as tmp:
                 venv = Path(tmp) / "venv"
                 subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True)
                 bin_dir = venv / "bin"
-                if broken is not None:
+                if pth is not None:
                     site = subprocess.run(
                         [str(bin_dir / "python3"), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
                         check=True, capture_output=True, text=True,
                     ).stdout.strip()
-                    (Path(site) / "stripped.pth").write_text(f"import sys; sys.modules[{broken!r}] = None\n")
+                    (Path(site) / "stripped.pth").write_text(pth)
                 env = {"PATH": str(bin_dir), **runner_env}
                 result = subprocess.run(["/bin/bash", "-c", step["run"]], env=env, capture_output=True, text=True)
                 if broken is None:
@@ -945,7 +1931,7 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(
                     result.stdout,
                     f"::error::{workflow}: {job_name} needs python3 3.12 or later on the runner; found "
-                    f"Python {platform.python_version()} at {bin_dir}/python3, which cannot import {broken} "
+                    f"Python {platform.python_version()} at {bin_dir}/python3, which {said} "
                     "on ci-light-abc12 (Linux, ARM64).\n",
                 )
 
@@ -955,7 +1941,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         scripts = Path(__file__).resolve().parents[2] / "scripts"
         imported = set()
         for name in ("wacd-contract", "wacd-release", "ci-release", "wacd-chart", "wacd-shadow", "wacd-profile",
-                     "wacd-tag", "wacd-version"):
+                     "wacd-tag", "wacd-version", "wacd-docs"):
             for node in ast.walk(ast.parse((scripts / f"{name}.py").read_text())):
                 if isinstance(node, ast.Import):
                     imported.update(alias.name for alias in node.names)
@@ -1075,6 +2061,160 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertNotIn("values_file", text)
                 self.assertNotIn(".wacd-contract", text)
 
+    def run_build_step(self, build_secrets):
+        """Run the build step's script against stand-in docker and crane, with the real wacd-chart.py parsers.
+
+        image-state answers absent until docker has built the image, then present.
+        docker logs its argv and env, and reads every --secret src= file it is
+        given; every python3 the step starts logs its argv. Returns what each saw.
+        """
+        import os
+        import subprocess
+
+        root = Path(__file__).resolve().parents[2]
+        step = next(s for s in self.wac_cd()["jobs"]["build"]["steps"] if s.get("name") == "Build and push the images")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp)
+        bin_dir, scripts, runner_temp, app = tmp / "bin", tmp / "scripts", tmp / "runner-temp", tmp / "app"
+        for directory in (bin_dir, scripts, runner_temp, app):
+            directory.mkdir()
+        (scripts / "wacd-chart.py").write_text(
+            "import os, runpy, sys\n"
+            "if sys.argv[1] == 'image-state':\n"
+            "    name = sys.argv[sys.argv.index('--name') + 1]\n"
+            "    built = os.path.exists(os.path.join(os.environ['STUB_DIR'], 'built-' + name))\n"
+            "    print('state=present' if built else 'state=absent')\n"
+            "else:\n"
+            f"    sys.argv[0] = {str(root / 'scripts' / 'wacd-chart.py')!r}\n"
+            "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+        )
+        (bin_dir / "python3").write_text(
+            f'#!/bin/sh\nprintf "%s\\n" "$*" >> "$STUB_DIR/python3.log"\nexec {sys.executable} "$@"\n'
+        )
+        (bin_dir / "docker").write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, stat, sys\n"
+            "args = sys.argv[1:]\n"
+            "record = {'argv': args, 'env': dict(os.environ), 'files': {}}\n"
+            "for index, arg in enumerate(args[:-1]):\n"
+            "    if arg == '--secret':\n"
+            "        spec = dict(part.split('=', 1) for part in args[index + 1].split(','))\n"
+            "        if 'src' in spec:\n"
+            "            record['files'][spec['id']] = [open(spec['src']).read(), stat.S_IMODE(os.stat(spec['src']).st_mode)]\n"
+            "if args[0] == 'build':\n"
+            "    print('docker build ran')\n"
+            "    name = args[args.index('-t') + 1].split(':')[0]\n"
+            "    open(os.path.join(os.environ['STUB_DIR'], 'built-' + name), 'w').close()\n"
+            "elif args[0] == 'save':\n"
+            "    open(args[args.index('-o') + 1], 'w').close()\n"
+            "open(os.path.join(os.environ['STUB_DIR'], 'docker.log'), 'a').write(json.dumps(record) + '\\n')\n"
+        )
+        (bin_dir / "crane").write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$STUB_DIR/crane.log"\n'
+            f'if [ "$1" = digest ]; then echo sha256:{"e" * 64}; fi\n'
+        )
+        for stub in ("python3", "docker", "crane"):
+            (bin_dir / stub).chmod(0o755)
+        output = tmp / "github-output"
+        sha = "a" * 40
+        images = [{"name": "web", "dockerfile": "Dockerfile", "context": ".", "sha_build_arg": "GIT_SHA"},
+                  {"name": "api", "dockerfile": "api/Dockerfile", "context": "api"}]
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(tmp), "LANG": "C.UTF-8", "STUB_DIR": str(tmp),
+               "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output), "GITHUB_SHA": sha,
+               "WACD_SCRIPTS": str(scripts), "PROFILE_IMAGES": json.dumps(images), "VERSION": "1.4.3",
+               "BUILD_ARGS": "A=1", "NODE_AUTH_TOKEN": "npm-token", "BUILD_SECRETS": build_secrets}
+        result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]], cwd=app,
+                                env=env, capture_output=True, text=True)
+
+        def lines(name):
+            path = tmp / name
+            return path.read_text().splitlines() if path.exists() else []
+
+        return {
+            "result": result,
+            "docker": [json.loads(line) for line in lines("docker.log")],
+            "python3": lines("python3.log"),
+            "crane": lines("crane.log"),
+            "output": output.read_text() if output.exists() else "",
+            "runner_temp": runner_temp,
+            "sha": sha,
+        }
+
+    def expected_builds(self, sha, *mounts):
+        return [
+            ["build", "-f", "Dockerfile", "--label", f"org.opencontainers.image.revision={sha}",
+             "--build-arg", f"GIT_SHA={sha}", "--build-arg", "A=1",
+             "--secret", "id=node_auth_token,env=NODE_AUTH_TOKEN", *mounts, "-t", "web:1.4.3", "."],
+            ["build", "-f", "api/Dockerfile", "--label", f"org.opencontainers.image.revision={sha}",
+             "--build-arg", "A=1", "--secret", "id=node_auth_token,env=NODE_AUTH_TOKEN", *mounts,
+             "-t", "api:1.4.3", "api"],
+        ]
+
+    def test_wac_cd_build_without_build_secrets_runs_docker_exactly_as_before(self):
+        run = self.run_build_step("")
+        self.assertEqual(run["result"].returncode, 0, run["result"].stdout + run["result"].stderr)
+        builds = [call["argv"] for call in run["docker"] if call["argv"][0] == "build"]
+        self.assertEqual(builds, self.expected_builds(run["sha"]))
+        self.assertNotIn("::add-mask::", run["result"].stdout)
+        self.assertFalse([line for line in run["python3"] if "build-secrets" in line])
+        self.assertFalse(list(run["runner_temp"].glob("build-secrets*")))
+
+    def test_wac_cd_build_mounts_each_build_secret_and_shows_its_value_nowhere(self):
+        values = {"NEXT_SERVER_ACTIONS_ENCRYPTION_KEY": "planted-key-7f3a=+/%41 x", "SENTRY_AUTH_TOKEN": "planted-token-9d1c"}
+        run = self.run_build_step("".join(f"{key}={value}\n" for key, value in values.items()))
+        result = run["result"]
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        builds = [call for call in run["docker"] if call["argv"][0] == "build"]
+        self.assertEqual(len(builds), 2)
+        first = builds[0]["argv"]
+        secrets_dir = Path(first[first.index("id=node_auth_token,env=NODE_AUTH_TOKEN") + 2].split(",src=")[1]).parent
+        self.assertEqual(secrets_dir.parent, run["runner_temp"])
+        mounts = []
+        for key in sorted(values):
+            mounts += ["--secret", f"id={key.lower()},src={secrets_dir / key.lower()}"]
+        self.assertEqual([build["argv"] for build in builds], self.expected_builds(run["sha"], *mounts))
+        for build in builds:
+            self.assertEqual(build["files"], {key.lower(): [value, 0o600] for key, value in values.items()})
+        self.assertFalse(secrets_dir.exists(), "the secret files outlive the step")
+        masks = [line for line in result.stdout.splitlines() if line.startswith("::add-mask::")]
+        self.assertEqual(masks, ["::add-mask::" + value.replace("%", "%25") for value in values.values()])
+        self.assertLess(result.stdout.index(masks[-1]), result.stdout.index("docker build ran"))
+        unmasked = "\n".join(line for line in (result.stdout + result.stderr).splitlines() if line not in masks)
+        for value in values.values():
+            with self.subTest(value=value):
+                self.assertNotIn(value, unmasked)
+                self.assertNotIn(value, run["output"])
+                self.assertNotIn(value, "\n".join(run["python3"] + run["crane"]))
+                for call in run["docker"]:
+                    self.assertNotIn(value, json.dumps(call["argv"]))
+                    self.assertFalse("BUILD_SECRETS" in call["env"], "docker inherits BUILD_SECRETS")
+                    self.assertFalse(value in json.dumps(call["env"]), "docker's environment holds the value")
+                for path in run["runner_temp"].rglob("*"):
+                    if path.is_file():
+                        self.assertNotIn(value, path.read_text())
+
+    def test_wac_cd_build_refuses_a_bad_build_secret_before_docker_runs(self):
+        run = self.run_build_step("A=planted-ok\nNODE_AUTH_TOKEN=planted-npm-6b2e\n")
+        result = run["result"]
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("build_secrets line 2 names NODE_AUTH_TOKEN", result.stderr)
+        self.assertEqual(run["docker"], [])
+        for value in ("planted-ok", "planted-npm-6b2e"):
+            self.assertNotIn(value, result.stdout + result.stderr)
+        self.assertFalse(list(run["runner_temp"].glob("build-secrets*")))
+
+    def test_wac_cd_build_secrets_is_a_secret_that_reaches_only_the_build_step_env(self):
+        """GitHub masks a value only when it comes from secrets:, never an input, and a run: expression is printed."""
+        doc = self.wac_cd()
+        call = doc[True]["workflow_call"]
+        self.assertNotIn("build_secrets", call["inputs"])
+        self.assertIs(call["secrets"]["build_secrets"]["required"], False)
+        step = next(s for s in doc["jobs"]["build"]["steps"] if s.get("name") == "Build and push the images")
+        self.assertEqual(step["env"]["BUILD_SECRETS"], "${{ secrets.build_secrets }}")
+        self.assertNotIn("${{", step["run"])
+        text = (Path(__file__).resolve().parents[1] / "workflows" / "wac-cd.yml").read_text()
+        self.assertEqual(text.count("secrets.build_secrets"), 1)
+
     def test_wac_cd_only_shadow_may_read_the_repositorys_values_path(self):
         """In hemi mode values_file names a repository path; reading it would fall back to the files."""
         jobs = self.wac_cd()["jobs"]
@@ -1104,8 +2244,30 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(plan["timeout-minutes"], math.ceil(contract.PLAN_WAIT_CAP / 60) + 5,
                                 "a capped wait still ends inside the job, with its summary line")
 
+    def test_wac_cd_plan_ends_inside_its_job_bound_even_when_every_step_uses_its_own(self):
+        """35 + 1 + 38 = 74: the gateway wait's cap, a minute for its last request, and every other step's bound.
+
+        The gateway wait has no kill switch of its own: it ends PLAN_WAIT_CAP seconds after it starts,
+        plus one last request (a token mint and a connection), allowed a minute. Every other step stops at
+        its own timeout-minutes, so the job's bound is their strict sum and a step's kill switch, never the
+        job's, is what stops a stalled step. docs/reference/wac-cd.md states this sum.
+        """
+        import math
+
+        plan = self.wac_cd()["jobs"]["plan"]
+        spec = importlib.util.spec_from_file_location(
+            "wacd_contract_sum", Path(__file__).resolve().parents[2] / "scripts" / "wacd-contract.py"
+        )
+        contract = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(contract)
+        wait = math.ceil(contract.PLAN_WAIT_CAP / 60) + 1
+        others = sum(step["timeout-minutes"] for step in plan["steps"] if step.get("id") != "contract")
+        self.assertEqual((wait, others, plan["timeout-minutes"]), (36, 38, 74),
+                         "the sum the docstring and docs/reference/wac-cd.md state")
+        self.assertEqual(wait + others, plan["timeout-minutes"], f"{wait} + {others} is plan's bound")
+
     def test_wac_cd_plan_bounds_every_step_but_the_gateway_wait(self):
-        """With 40 minutes for the job, a stalled checkout or git push must not use them all."""
+        """With 74 minutes for the job, a stalled checkout or git push must not use them all."""
         steps = self.wac_cd()["jobs"]["plan"]["steps"]
         for step in steps:
             name = step.get("name") or step.get("uses")
@@ -1114,7 +2276,23 @@ class ReusableWorkflowTests(unittest.TestCase):
                     self.assertNotIn("timeout-minutes", step, "the wait is bounded by --wait-timeout")
                     continue
                 self.assertIsInstance(step.get("timeout-minutes"), int)
-                self.assertLessEqual(step["timeout-minutes"], 6)
+                self.assertLessEqual(step["timeout-minutes"], 10 if name == "Plan the version" else 6,
+                                     "Plan the version also holds the documentation-only and first-release reads")
+
+    def test_wac_cd_plan_the_version_holds_both_of_its_gateway_and_github_reads(self):
+        """Ten minutes: the six it had before v1.36.0, the documentation-only read's 150 s and the status read's 60."""
+        import math
+
+        step = next(s for s in self.wac_cd()["jobs"]["plan"]["steps"] if s.get("name") == "Plan the version")
+        spec = importlib.util.spec_from_file_location(
+            "wacd_docs_bound", Path(__file__).resolve().parents[2] / "scripts" / "wacd-docs.py"
+        )
+        docs = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(docs)
+        read = int(re.search(r'wacd-release\.py bootstrap --deadline "\$\(\( \$\(date \+%s\) \+ (\d+) \)\)"',
+                             step["run"]).group(1))
+        self.assertEqual((docs.RELEASE_SCOPE_SECONDS, read), (150, 60))
+        self.assertEqual(step["timeout-minutes"], 6 + math.ceil((docs.RELEASE_SCOPE_SECONDS + read) / 60))
 
     def test_wac_cd_plan_checks_the_trigger_before_asking_the_gateway(self):
         """A malformed dispatch must not wait out a gateway outage before saying so."""
@@ -1122,6 +2300,9 @@ class ReusableWorkflowTests(unittest.TestCase):
         names = [s.get("name") or s.get("uses") for s in steps]
         contract_index = next(i for i, s in enumerate(steps) if s.get("id") == "contract")
         self.assertLess(names.index("Check the trigger"), contract_index)
+        checkouts = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout@")]
+        self.assertEqual(len(checkouts), 2, "the app's checkout and the shared scripts'")
+        self.assertLess(names.index("Check the trigger"), min(checkouts), "nor wait out a stalled checkout first")
 
     def test_wac_cd_dispatch_takes_exactly_one_of_a_rollback_and_a_settings_revision(self):
         import os
@@ -1156,12 +2337,19 @@ class ReusableWorkflowTests(unittest.TestCase):
         settings = steps[names.index("Plan the settings release")]
         refusal = steps[names.index("Refuse a settings release behind a workflow change")]
         rollout = steps[names.index("Refuse a settings release while the app is rolling out")]
+        unfinished = steps[names.index("Refuse a settings release behind an unfinished code release")]
         self.assertEqual(settings["id"], "settings")
         self.assertEqual(settings["if"], "inputs.settings_revision != ''")
         self.assertEqual(refusal["if"], "${{ steps.settings.outputs.workflow_refused != '' }}")
         self.assertEqual(refusal["env"], {"REASON": "${{ steps.settings.outputs.workflow_refused }}"})
         self.assertEqual(rollout["if"], "${{ steps.settings.outputs.rollout_refused != '' }}")
         self.assertEqual(rollout["env"], {"REASON": "${{ steps.settings.outputs.rollout_refused }}"})
+        self.assertEqual(unfinished["if"], "${{ steps.settings.outputs.unfinished_refused != '' }}")
+        self.assertEqual(unfinished["env"], {"REASON": "${{ steps.settings.outputs.unfinished_refused }}"})
+        for refusal_step in (rollout, unfinished, refusal):
+            with self.subTest(refusal=refusal_step["name"]):
+                self.assertIsInstance(refusal_step["timeout-minutes"], int)
+                self.assertNotIn("continue-on-error", refusal_step, "a refusal fails plan, never a green run")
         self.assertEqual(
             names.index("Read the wacd profile") + 1, names.index("Plan the settings release"),
             "the settings plan reads the copy's profile",
@@ -1171,6 +2359,10 @@ class ReusableWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(
             names.index("Refuse a settings release while the app is rolling out") + 1,
+            names.index("Refuse a settings release behind an unfinished code release"),
+        )
+        self.assertEqual(
+            names.index("Refuse a settings release behind an unfinished code release") + 1,
             names.index("Refuse a settings release behind a workflow change"),
         )
         self.assertEqual(
@@ -1179,19 +2371,29 @@ class ReusableWorkflowTests(unittest.TestCase):
         )
         version = steps[names.index("Plan the version")]
         for key, output in (("SETTINGS_MODE", "mode"), ("SETTINGS_VERSION", "version"), ("SETTINGS_TAG", "tag"),
-                            ("SETTINGS_COMMIT", "commit"), ("SETTINGS_SUMMARY", "summary")):
+                            ("SETTINGS_COMMIT", "commit"), ("SETTINGS_SUMMARY", "summary"),
+                            ("SETTINGS_UNFINISHED", "unfinished_left")):
             self.assertEqual(version["env"][key], f"${{{{ steps.settings.outputs.{output} }}}}")
         self.assertEqual(plan["outputs"]["source_images"], "${{ steps.settings.outputs.images }}")
         self.assertEqual(settings["env"]["GITHUB_TOKEN"], "${{ github.token }}", "the GitHub Release read")
         self.assertIn("deadline=$(( $(date +%s) + 120 ))", settings["run"])
-        self.assertEqual(settings["run"].count('--deadline "$deadline"'), 2, "both network reads share the deadline")
+        self.assertEqual(settings["run"].count('--deadline "$deadline"'), 3, "every network read shares the deadline")
         self.assertNotIn("wacd-chart.py", settings["run"], "every registry read happens inside the bounded reads")
         self.assertEqual(plan["permissions"], {"contents": "write", "id-token": "write"}, "no permission was added")
 
     def settings_plan(self, *, running="1.4.2", copy_revision="7", revision="7", source="hemi", charts=None,
                       workflow_change=False, rollback=False, extra_tags=(), claim="pushed", profile_images=None,
-                      running_copy="6", status_exit=0, earlier="reuse=", running_fleet="f" * 40, status_err=None):
-        """Run plan's settings steps against a temp repo, real wacd-version.py and stub gateway and registry reads."""
+                      running_copy="6", status_exit=0, earlier="reuse=", status_err=None,
+                      published=("1.3.9", "1.4.2"), unfinished_err=None, code_claims=(), released=(),
+                      docs_change=False):
+        """Run plan's settings steps against a temp repo, real wacd-version.py and stub gateway and registry reads.
+
+        unfinished-release is the real script over a stand-in registry holding the charts in published, where
+        "unreadable" makes every chart read fail, and stand-in GitHub Releases for the versions in released, where
+        "unreadable" makes every Release read fail. code_claims tags each on a new commit after main's head, as
+        a code release's run claims its version. docs_change makes main's head after v1.4.2 a commit that
+        changes only docs/, as a caller whose cd.yml ignores docs paths leaves it: no run, no tag.
+        """
         import os
         import shutil
         import subprocess
@@ -1202,6 +2404,7 @@ class ReusableWorkflowTests(unittest.TestCase):
         settings_step = by_name["Plan the settings release"]
         refusal_step = by_name["Refuse a settings release behind a workflow change"]
         rollout_step = by_name["Refuse a settings release while the app is rolling out"]
+        unfinished_step = by_name["Refuse a settings release behind an unfinished code release"]
         version_step = by_name["Plan the version"]
 
         def git(repo, *args):
@@ -1230,17 +2433,24 @@ class ReusableWorkflowTests(unittest.TestCase):
         if workflow_change:
             (repo / ".github" / "workflows" / "cd.yml").write_text("on: [push, workflow_dispatch]\n")
             git(repo, "commit", "-q", "-am", "ci: take the revision input")
+        elif docs_change:
+            (repo / "docs").mkdir()
+            (repo / "docs" / "guide.md").write_text("# Guide\n")
+            git(repo, "add", "docs")
+            git(repo, "commit", "-q", "-m", "docs: later")
         else:
             git(repo, "commit", "--allow-empty", "-q", "-m", "docs: later")
+        for tag in code_claims:
+            git(repo, "commit", "--allow-empty", "-q", "-m", f"fix: claims {tag}")
+            git(repo, "tag", tag)
         for tag, where in extra_tags:
-            git(repo, "tag", tag, {"code": code, "old": old}[where])
+            git(repo, "tag", tag, {"code": code, "old": old, "head": git(repo, "rev-parse", "HEAD")}[where])
         head = git(repo, "rev-parse", "HEAD")
         git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
         source_commit = old if rollback else code
         images = {"web": {"repository": "localhost:30500/web", "tag": running,
                           "digest": "sha256:" + ("d" if rollback else "e") * 64}}
-        charts = {**(charts or {}), running: {"revision": source_commit, "images": images, "copy": running_copy,
-                                              "fleet": running_fleet}}
+        charts = {**(charts or {}), running: {"revision": source_commit, "images": images, "copy": running_copy}}
         log = tmp / "log"
         log.write_text("")
         (scripts / "wacd-release.py").write_text(
@@ -1251,6 +2461,28 @@ class ReusableWorkflowTests(unittest.TestCase):
             "    sys.exit(print(os.environ['STUB_STATUS_ERR'], end='', file=sys.stderr) or 3)\n"
             "if code == 3:\n"
             "    sys.exit(print('wacd release: app was rolling out 1.4.2 for the whole 120 seconds', file=sys.stderr) or 3)\n"
+            "if sys.argv[1] == 'unfinished-release' and 'STUB_UNFINISHED_ERR' in os.environ:\n"
+            "    sys.exit(print(os.environ['STUB_UNFINISHED_ERR'], end='', file=sys.stderr) or 5)\n"
+            "if sys.argv[1] == 'unfinished-release':\n"
+            "    import importlib.util\n"
+            "    spec = importlib.util.spec_from_file_location('real', os.environ['STUB_REAL_RELEASE'])\n"
+            "    real = importlib.util.module_from_spec(spec)\n"
+            "    spec.loader.exec_module(real)\n"
+            "    published = json.loads(os.environ['STUB_PUBLISHED'])\n"
+            "    def chart_config(registry, app, version, timeout=30):\n"
+            "        assert registry == 'registry.network.svc.cluster.local:5000', registry\n"
+            "        if 'unreadable' in published:\n"
+            "            raise real.chart.ChartError('cannot reach the registry at http://' + registry)\n"
+            "        return {'name': app, 'version': version} if version in published else None\n"
+            "    real.chart.chart_config = chart_config\n"
+            "    released = json.loads(os.environ['STUB_RELEASED'])\n"
+            "    def release_exists(tag):\n"
+            "        assert os.environ['GITHUB_TOKEN'] == 'job-token'\n"
+            "        if 'unreadable' in released:\n"
+            "            raise real.ReleaseError('GitHub answered HTTP 502 for the Release of ' + tag)\n"
+            "        return tag[1:] in released\n"
+            "    real.release_exists = release_exists\n"
+            "    sys.exit(real.main(['wacd-release.py', *sys.argv[1:]]))\n"
             "if code:\n"
             "    sys.exit(print('wacd release: the gateway reports an unknown version', file=sys.stderr) or 1)\n"
             "if sys.argv[1] == 'earlier-release':\n"
@@ -1268,7 +2500,6 @@ class ReusableWorkflowTests(unittest.TestCase):
             "print('commit=' + chart['revision'])\n"
             "print('images=' + json.dumps(chart['images'], separators=(',', ':'), sort_keys=True))\n"
             "print('copy_revision=' + chart['copy'])\n"
-            "print('fleet_commit=' + chart['fleet'])\n"
         )
         (scripts / "wacd-chart.py").write_text(
             "import json, os, sys\n"
@@ -1301,9 +2532,13 @@ class ReusableWorkflowTests(unittest.TestCase):
                "SOURCE": source, "COPY_REVISION": copy_revision, "APP": "app", "TAG_PREFIX": "v",
                "PROFILE_IMAGES": json.dumps(profile), "STUB_LOG": str(log), "STUB_RUNNING": running,
                "STUB_CHARTS": json.dumps(charts), "STUB_CLAIM": claim, "STUB_STATUS_EXIT": str(status_exit),
-               "STUB_EARLIER": earlier, "GITHUB_TOKEN": "job-token", "FLEET_COMMIT": "f" * 40}
+               "STUB_EARLIER": earlier, "GITHUB_TOKEN": "job-token", "FLEET_COMMIT": "f" * 40,
+               "STUB_REAL_RELEASE": str(root / "scripts" / "wacd-release.py"), "STUB_PUBLISHED": json.dumps(published),
+               "STUB_RELEASED": json.dumps(released)}
         if status_err is not None:
             env["STUB_STATUS_ERR"] = status_err
+        if unfinished_err is not None:
+            env["STUB_UNFINISHED_ERR"] = unfinished_err
         self.assertEqual(set(settings_step["env"]), {"SETTINGS_REVISION", "SOURCE", "COPY_REVISION", "APP",
                                                      "TAG_PREFIX", "PROFILE_IMAGES", "GITHUB_TOKEN"})
 
@@ -1324,6 +2559,12 @@ class ReusableWorkflowTests(unittest.TestCase):
                 capture_output=True, text=True,
             )
             return plan
+        if settings_outputs.get("unfinished_refused"):
+            plan["refusal"] = subprocess.run(
+                ["bash", "-c", unfinished_step["run"]], env={**env, "REASON": settings_outputs["unfinished_refused"]},
+                capture_output=True, text=True,
+            )
+            return plan
         if settings_outputs.get("workflow_refused"):
             plan["refusal"] = subprocess.run(
                 ["bash", "-c", refusal_step["run"]], env={**env, "REASON": settings_outputs["workflow_refused"]},
@@ -1335,7 +2576,8 @@ class ReusableWorkflowTests(unittest.TestCase):
                        "DEPLOY": "true",
                        "SETTINGS_MODE": settings_outputs.get("mode", ""), "SETTINGS_VERSION": settings_outputs.get("version", ""),
                        "SETTINGS_TAG": settings_outputs.get("tag", ""), "SETTINGS_COMMIT": settings_outputs.get("commit", ""),
-                       "SETTINGS_SUMMARY": settings_outputs.get("summary", "")}
+                       "SETTINGS_SUMMARY": settings_outputs.get("summary", ""),
+                       "SETTINGS_UNFINISHED": settings_outputs.get("unfinished_left", "")}
         plan["version"] = subprocess.run(["bash", "-c", version_step["run"]], env=version_env, cwd=repo,
                                          capture_output=True, text=True)
         plan["version_outputs"] = outputs()
@@ -1408,6 +2650,182 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertIn(sentence, plan["summary"].read_text())
         self.assertNotIn("wacd-tag.py", plan["log"].read_text())
 
+    UNFINISHED = ("v1.4.3 was claimed by a code release that never published; re-run that release, or release a "
+                  "new commit, before releasing settings.")
+
+    def unfinished_call(self, plan):
+        return next(line for line in plan["log"].read_text().splitlines() if "unfinished-release" in line)
+
+    LEFT = "v1.4.3 was left unfinished and can now ship only as a new commit."
+
+    def unfinished_sentence(self, tag):
+        return self.UNFINISHED.replace("v1.4.3", tag, 1)
+
+    def test_wac_cd_settings_release_behind_an_unfinished_code_release_is_refused_by_its_own_step(self):
+        """1.4.2 runs (or 1.3.9, with nothing above it proved running) and a code release above it never published."""
+        never_deployed = ("1.3.9", "1.4.2", "1.4.3")
+        for label, kw, tag in (
+            ("c2: its run claimed v1.4.3 on main's head and failed in build", {"extra_tags": (("v1.4.3", "head"),)},
+             "v1.4.3"),
+            ("c2 on older code, but nothing above it published",
+             {"extra_tags": (("v1.4.3", "head"),), "running": "1.3.9", "rollback": True, "published": ("1.3.9",)},
+             "v1.4.3"),
+            ("v1.4.3 published and never deployed (a failed deploy, or deploy: false), then v1.4.4 failed in build",
+             {"code_claims": ("v1.4.3", "v1.4.4"), "published": never_deployed}, "v1.4.4"),
+            ("a settings release v1.4.3 failed at deploy, then v1.4.4 failed in build",
+             {"extra_tags": (("v1.4.3", "code"),), "code_claims": ("v1.4.4",), "published": never_deployed}, "v1.4.4"),
+            ("1.3.9 runs below 1.4.2, which has no Release, and v1.4.3 failed in build",
+             {"extra_tags": (("v1.4.3", "head"),), "running": "1.3.9", "rollback": True}, "v1.4.3"),
+        ):
+            with self.subTest(case=label):
+                plan = self.settings_plan(**kw)
+                self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+                self.assertEqual(set(plan["settings_outputs"]), {"unfinished_refused"}, "no mode, version or tag is left")
+                refusal = plan["refusal"]
+                sentence = self.unfinished_sentence(tag)
+                self.assertEqual(refusal.returncode, 1)
+                self.assertIn(sentence, refusal.stderr)
+                self.assertIn(f"::error::wac-cd: {sentence}", refusal.stdout)
+                self.assertIn(sentence, plan["summary"].read_text())
+                calls = plan["log"].read_text()
+                self.assertNotIn("wacd-tag.py", calls, "nothing tagged")
+                self.assertNotIn("earlier-release", calls, "refused before the version is chosen")
+                self.assertRegex(self.unfinished_call(plan),
+                                 r"^wacd-release\.py unfinished-release --app app --prefix v --running \S+ "
+                                 r"--versions \S+ --codes \S+ --deadline \d+$")
+        self.assertFalse(self.runs(self.wac_cd()["jobs"]["retag"], ""), "with no mode, nothing is retagged")
+
+    def test_wac_cd_settings_release_after_a_rollback_proceeds_past_an_unfinished_code_release(self):
+        """1.4.2 was released (it has a GitHub Release) and rolled back to 1.3.9; a code release above never published."""
+        for label, kw, tag, version in (
+            ("c2: v1.4.3 failed in build", {"extra_tags": (("v1.4.3", "head"),)}, "v1.4.3", "1.4.4"),
+            ("v1.4.3 published and never deployed, then v1.4.4 failed in build",
+             {"code_claims": ("v1.4.3", "v1.4.4"), "published": ("1.3.9", "1.4.2", "1.4.3")}, "v1.4.4", "1.4.5"),
+        ):
+            with self.subTest(case=label):
+                plan = self.settings_plan(running="1.3.9", rollback=True, released=("1.4.2",), **kw)
+                self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+                self.assertNotIn("unfinished_refused", plan["settings_outputs"])
+                left = self.LEFT.replace("v1.4.3", tag, 1)
+                self.assertEqual(plan["settings_outputs"]["unfinished_left"], left)
+                self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+                old = plan["old"]
+                self.assertEqual({k: plan["version_outputs"][k] for k in ("mode", "version", "tag", "expected_sha")},
+                                 {"mode": "settings", "version": version, "tag": f"v{version}", "expected_sha": old},
+                                 "above the unfinished claim, on the rolled-back code")
+                calls = plan["log"].read_text()
+                self.assertIn(f"wacd-tag.py claim-tag --tag v{version} --commit {old}", calls)
+                self.assertIn(" --claimed  --deadline", calls, "rule B still judges every version above")
+                summary = plan["summary"].read_text()
+                self.assertEqual(summary.count(left), 1)
+                self.assertEqual(summary.count("left unfinished"), 1, "exactly one line")
+                self.assertIn(f"settings revision 7 on 1.3.9's code ({old[:12]}), released as {version}", summary)
+
+    def test_wac_cd_unreadable_releases_conclude_neither_a_rollback_nor_a_refusal(self):
+        plan = self.settings_plan(running="1.3.9", rollback=True, extra_tags=(("v1.4.3", "head"),),
+                                  released=("unreadable",))
+        self.assertEqual(plan["settings"].returncode, 1, plan["settings"].stdout)
+        self.assertIn("::error::wac-cd: wacd release: the GitHub Releases of app could not be read, so this settings "
+                      "release cannot tell a rollback from an unfinished release; run it again.",
+                      plan["settings"].stdout)
+        self.assertEqual(plan["settings_outputs"], {})
+        self.assertNotIn("wacd-tag.py", plan["log"].read_text())
+
+    def test_wac_cd_re_proving_the_live_version_is_never_refused_as_unfinished(self):
+        """1.4.3 runs revision 7; c2 claimed v1.4.4 and failed in build; a re-run of revision 7 claims no new tag."""
+        plan = self.settings_plan(running="1.4.3", running_copy="7",
+                                  extra_tags=(("v1.4.3", "code"), ("v1.4.4", "head")))
+        self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+        self.assertEqual((plan["version_outputs"]["mode"], plan["version_outputs"]["version"]), ("settings", "1.4.3"))
+        self.assertNotIn("unfinished-release", plan["log"].read_text())
+        self.assertNotIn("left unfinished", plan["summary"].read_text())
+
+    def test_wac_cd_settings_release_above_published_versions_is_not_refused_as_unfinished(self):
+        for label, kw, expected in (
+            ("no version above the running one", {}, "1.4.3"),
+            ("a rollback target's newer release", {"running": "1.3.9", "rollback": True}, "1.4.3"),
+            ("a newer code release that published", {"extra_tags": (("v1.4.3", "head"),),
+                                                       "published": ("1.4.2", "1.4.3")}, "1.4.4"),
+            ("a settings claim on the running code with no chart", {"extra_tags": (("v1.4.3", "code"),),
+                                                                     "earlier": "reuse=1.4.3"}, "1.4.3"),
+        ):
+            with self.subTest(case=label):
+                plan = self.settings_plan(**kw)
+                self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+                self.assertNotIn("unfinished_refused", plan["settings_outputs"])
+                self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+                self.assertEqual((plan["version_outputs"]["mode"], plan["version_outputs"]["version"]),
+                                 ("settings", expected))
+                self.unfinished_call(plan)
+                self.assertEqual(plan["settings_outputs"]["unfinished_left"], "")
+                self.assertNotIn("left unfinished", plan["summary"].read_text())
+
+    def test_wac_cd_settings_release_on_a_docs_only_head_ships_as_the_next_patch_on_the_released_code(self):
+        """C (v1.4.2) is tagged and released; D, main's head, changes only docs, so no run started and D has no tag.
+
+        A settings dispatch runs on head D: it reads only tags above the running version, never main's head, so
+        it is the next patch above v1.4.2 tagged on C, and none of the three refusal steps fires.
+        """
+        import subprocess
+
+        plan = self.settings_plan(docs_change=True, released=("1.4.2",))
+        self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
+        code, head = plan["code"], plan["head"]
+        self.assertNotEqual(head, code)
+        repo = plan["log"].parent / "repo"
+        changed = subprocess.run(["git", "diff", "--name-only", code, head], cwd=repo, check=True,
+                                 capture_output=True, text=True).stdout.split()
+        self.assertEqual(changed, ["docs/guide.md"])
+        self.assertEqual(subprocess.run(["git", "tag", "--points-at", head], cwd=repo, check=True,
+                                        capture_output=True, text=True).stdout, "", "D carries no tag")
+        self.assertNotIn("refusal", plan)
+        for refused in ("rollout_refused", "unfinished_refused", "workflow_refused"):
+            self.assertNotIn(refused, plan["settings_outputs"])
+        self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
+        self.assertEqual({k: plan["version_outputs"][k] for k in ("mode", "version", "tag", "expected_sha")},
+                         {"mode": "settings", "version": "1.4.3", "tag": "v1.4.3", "expected_sha": code})
+        self.assertEqual(self.unfinished_call(plan).split(" --deadline")[0],
+                         "wacd-release.py unfinished-release --app app --prefix v --running 1.4.2 --versions  --codes ")
+        calls = plan["log"].read_text()
+        self.assertIn(f"wacd-tag.py claim-tag --tag v1.4.3 --commit {code}", calls)
+        self.assertEqual(plan["settings_outputs"]["unfinished_left"], "")
+        self.assertIn(f"settings revision 7 on 1.4.2's code ({code[:12]}), released as 1.4.3", plan["summary"].read_text())
+
+    def test_wac_cd_an_unreadable_registry_is_a_fault_never_an_unfinished_release(self):
+        plan = self.settings_plan(extra_tags=(("v1.4.3", "head"),), published=("unreadable",))
+        self.assertEqual(plan["settings"].returncode, 1, plan["settings"].stdout)
+        self.assertIn("::error::wac-cd: wacd release: cannot reach the registry", plan["settings"].stdout)
+        self.assertEqual(plan["settings_outputs"], {})
+        self.assertNotIn("wacd-tag.py", plan["log"].read_text())
+
+    def test_wac_cd_an_unfinished_release_refusal_with_no_sentence_fails_the_planning_step(self):
+        for err in ("", "wacd release: \n"):
+            with self.subTest(stderr=err):
+                plan = self.settings_plan(unfinished_err=err)
+                self.assertEqual(plan["settings"].returncode, 1, plan["settings"].stdout + plan["settings"].stderr)
+                self.assertIn("::error::wac-cd: The settings release was refused behind an unfinished code release, "
+                              "and the refusal gave no reason.", plan["settings"].stdout)
+                self.assertEqual(plan["settings_outputs"], {})
+
+    def test_wac_cd_only_a_settings_run_reaches_the_unfinished_release_check(self):
+        """Push, rollback and deploy: false runs skip Plan the settings release, the only step that reads it."""
+        plan = self.wac_cd()["jobs"]["plan"]
+        def holders(needle):
+            return [s.get("name") for job in self.wac_cd()["jobs"].values() for s in job["steps"]
+                    if needle in json.dumps(s)]
+
+        self.assertEqual(holders("unfinished-release"), ["Plan the settings release"])
+        self.assertEqual(holders("unfinished_refused"), ["Plan the settings release",
+                                                         "Refuse a settings release behind an unfinished code release"])
+        steps = {s.get("name"): s for s in plan["steps"]}
+        self.assertEqual(steps["Plan the settings release"]["if"], "inputs.settings_revision != ''")
+        self.assertIn("steps.settings.outputs.", steps["Refuse a settings release behind an unfinished code release"]["if"])
+        trigger = steps["Check the trigger"]["run"]
+        self.assertIn("rollback_version or settings_revision, not both", trigger)
+        self.assertIn("settings_revision cannot be combined with deploy: false", trigger)
+        self.assertIn("settings_revision is accepted only on workflow_dispatch", trigger)
+
     def test_wac_cd_settings_rerun_never_spends_a_second_version_on_one_revision(self):
         live = self.settings_plan(running="1.4.3", running_copy="7", extra_tags=(("v1.4.3", "code"),))
         self.assertEqual(live["settings"].returncode, 0, live["settings"].stdout + live["settings"].stderr)
@@ -1427,9 +2845,8 @@ class ReusableWorkflowTests(unittest.TestCase):
                                        r"--running 1\.4\.2 --versions 1\.4\.3 --claimed 1\.4\.3 --deadline \d+$")
 
     def test_wac_cd_settings_rerun_of_the_live_revision_after_another_apps_save_re_proves_it(self):
-        """The copy's fleet commit is wac.fleet's head, which moves with every app's save, so it decides nothing."""
-        plan = self.settings_plan(running="1.4.3", running_copy="7", extra_tags=(("v1.4.3", "code"),),
-                                  running_fleet="a" * 40)
+        """The copy's fleet commit is wac.fleet's head, which moves with every app's save, so it is not read."""
+        plan = self.settings_plan(running="1.4.3", running_copy="7", extra_tags=(("v1.4.3", "code"),))
         self.assertEqual(plan["settings"].returncode, 0, plan["settings"].stdout + plan["settings"].stderr)
         self.assertEqual(plan["version"].returncode, 0, plan["version"].stdout + plan["version"].stderr)
         self.assertEqual((plan["version_outputs"]["mode"], plan["version_outputs"]["version"]), ("settings", "1.4.3"),
@@ -1701,7 +3118,9 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertNotIn("wacd-release.py release", step.get("run", ""), "only one step patches the cluster")
         plan = [s.get("name") for s in jobs["plan"]["steps"]]
         for name in ("Refuse a settings release behind a workflow change",
-                     "Refuse a settings release while the app is rolling out", "Refuse to replay an old version"):
+                     "Refuse a settings release while the app is rolling out",
+                     "Refuse a settings release behind an unfinished code release", "Refuse to replay an old version",
+                     "Nothing to release: only documentation changed"):
             self.assertIn(name, plan)
 
     def test_wac_cd_the_status_read_comes_out_of_plan_s_budget(self):
@@ -1715,9 +3134,6 @@ class ReusableWorkflowTests(unittest.TestCase):
         )
         contract = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(contract)
-        other_steps = 180
-        self.assertEqual(contract.PLAN_WAIT_CAP + status + other_steps, plan["timeout-minutes"] * 60,
-                         "docs/reference/wac-cd.md states this budget")
         deadline = int(re.search(r"deadline=\$\(\( \$\(date \+%s\) \+ (\d+) \)\)", settings["run"]).group(1))
         self.assertEqual(deadline, status, "one wall-clock deadline bounds every read in the step")
         self.assertLess(status + 60, settings["timeout-minutes"] * 60, "the step's kill switch is never what stops it")
@@ -1754,23 +3170,91 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(sorted(name for name, job in jobs.items() if holds_id_token(doc, job)), ["contract"])
         self.assertEqual(jobs["contract"]["permissions"], {"contents": "read", "id-token": "write"})
         self.assertNotIn("needs", jobs["contract"])
-        self.assertEqual(jobs["contract"]["outputs"], {"source": "${{ steps.contract.outputs.source }}"})
+        self.assertEqual(jobs["contract"]["outputs"], {"source": "${{ steps.contract.outputs.source }}",
+                                                       "docs_paths": "${{ steps.contract.outputs.docs_paths }}"})
         others = [name for name in jobs if name != "contract"]
-        self.assertEqual(sorted(others), ["agents-md", "checks", "lint", "render", "techdocs"])
+        self.assertEqual(sorted(others), ["agents-md", "checks", "lint", "render", "scope", "techdocs"])
         for name in ("lint", "techdocs", "agents-md"):
             with self.subTest(job=name):
                 self.assertNotIn("needs", jobs[name])
                 self.assertNotIn("if", jobs[name])
                 self.assertNotIn("needs.contract", json.dumps(jobs[name]))
+        conditions = {"checks": "${{ !cancelled() && needs.scope.outputs.heavy != 'false' }}",
+                      "render": "${{ !cancelled() }}"}
         for name in ("checks", "render"):
             job = jobs[name]
             with self.subTest(job=name):
                 needs = job.get("needs")
                 self.assertIn("contract", [needs] if isinstance(needs, str) else needs or [])
-                self.assertEqual(job.get("if"), "${{ !cancelled() }}")
+                self.assertEqual(job.get("if"), conditions[name])
                 first = job["steps"][0]
                 self.assertEqual(first["name"], "Require the contract job's success")
                 self.assertEqual(first["env"], {"CONTRACT_RESULT": "${{ needs.contract.result }}"})
+
+    def test_wac_ci_skips_checks_only_when_scope_said_documentation_only(self):
+        """`scope` decides for `checks` alone; an unknown, failed or skipped scope runs the checks.
+
+        GitHub reads a missing output as '', so only the literal 'false' skips: a scope job that failed,
+        was skipped or never wrote its output leaves the checks running.
+        """
+        jobs = self.wac_ci()["jobs"]
+        self.assertEqual(sorted(jobs["checks"]["needs"]), ["contract", "scope"])
+        condition = re.fullmatch(r"\$\{\{ (.*) \}\}", jobs["checks"]["if"]).group(1)
+        self.assertEqual(condition, "!cancelled() && needs.scope.outputs.heavy != 'false'")
+        for name in ("render", "lint", "techdocs", "agents-md", "contract"):
+            with self.subTest(job=name):
+                self.assertNotIn("scope", json.dumps(jobs[name]), "only checks waits for scope")
+        scope = jobs["scope"]
+        self.assertEqual(scope["needs"], "contract", "the patterns are the contract job's output")
+        self.assertEqual(scope["if"], "${{ !cancelled() }}", "a failed contract job still gets a scope decision")
+        self.assertEqual(scope["outputs"], {"heavy": "${{ steps.scope.outputs.heavy }}"})
+
+    def test_wac_ci_scope_holds_no_job_token_and_runs_no_caller_code(self):
+        doc = self.wac_ci()
+        scope = doc["jobs"]["scope"]
+        self.assertEqual(scope["permissions"], {"contents": "read"})
+        self.assertFalse(holds_id_token(doc, scope))
+        self.assertEqual(scope["runs-on"], "${{ inputs.runner || vars.CI_RUNNER_SMALL }}")
+        self.assertEqual(scope["env"], {"PYTHONSAFEPATH": "1"})
+        self.assertNotIn("name", scope, "the job's check is named wacd-ci / scope")
+        self.assertEqual(pinned_action_problems("scope", scope, ID_TOKEN_ACTIONS), [])
+        for index, step in enumerate(scope["steps"]):
+            with self.subTest(step=step.get("name", index)):
+                self.assertIsInstance(step.get("timeout-minutes"), int)
+                if "uses" in step:
+                    self.assertEqual(step["with"], {"repository": "willfell/wac.lab.actions", "ref": SHA,
+                                                    "path": ".wacd", "persist-credentials": False},
+                                     "only this repository is checked out")
+                run = str(step.get("run", ""))
+                self.assertEqual([m for m in re.findall(r"\bpython3?\b(?: -\w+)*", run) if " -I" not in m], [])
+        decide = next(s for s in scope["steps"] if s.get("id") == "scope")
+        self.assertEqual(decide["name"], "Decide whether the checks need to run")
+        self.assertEqual(decide["env"], {"DOCS_PATHS": "${{ needs.contract.outputs.docs_paths }}",
+                                         "CONTRACT_RESULT": "${{ needs.contract.result }}",
+                                         "GITHUB_TOKEN": "${{ github.token }}"})
+
+    def test_wac_ci_scope_step_runs_the_checks_whenever_its_script_cannot_decide(self):
+        import os
+        import subprocess
+
+        step = next(s for s in self.wac_ci()["jobs"]["scope"]["steps"] if s.get("id") == "scope")
+        root = Path(__file__).resolve().parents[2]
+        for label, scripts, extra in (
+            ("no scripts", None, {}),
+            ("a push", root / "scripts", {"GITHUB_EVENT_NAME": "push"}),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                out, summary = tmp / "out", tmp / "summary"
+                env = {"PATH": os.environ["PATH"], "PYTHONSAFEPATH": "1", "RUNNER_TEMP": str(tmp),
+                       "WACD_SCRIPTS": str(scripts or tmp / "missing"), "GITHUB_OUTPUT": str(out),
+                       "GITHUB_STEP_SUMMARY": str(summary), "DOCS_PATHS": '["docs/**"]',
+                       "CONTRACT_RESULT": "success", "GITHUB_TOKEN": "job-token", **extra}
+                result = subprocess.run(["bash", "-c", step["run"]], env=env, cwd=tmp, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
+                self.assertEqual(outputs["heavy"], "true")
+                self.assertIn("The checks ran because: ", summary.read_text())
 
     def test_wac_ci_contract_job_runs_on_the_callers_runner(self):
         def runs_on(expression, inputs, variables):
@@ -1889,10 +3373,35 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(clear["run"], "rm -rf .wacd-contract")
                 self.assertEqual(download["if"], "needs.contract.outputs.source == 'hemi'")
                 self.assertEqual(download["with"], {"name": "wac-ci-contract", "path": ".wacd-contract"})
-                app = names.index("actions/checkout@v4")
+                app = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout@")
+                           and "repository" not in s["with"])
                 self.assertLess(app, names.index(clear["name"]))
                 self.assertLess(names.index(clear["name"]), names.index(download["name"]))
                 self.assertLess(names.index(download["name"]), names.index("Read the wacd profile"))
+
+    def test_a_settings_copy_that_cannot_be_downloaded_says_to_re_run_all_jobs(self):
+        """The copy is kept one day; re-running only the failed jobs a day later finds it gone."""
+        import os
+        import subprocess
+
+        for workflow, doc, job_name in (("wac-cd", self.wac_cd(), "publish"), ("wac-ci", self.wac_ci(), "checks"),
+                                        ("wac-ci", self.wac_ci(), "render")):
+            steps = doc["jobs"][job_name]["steps"]
+            index = next(i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/download-artifact@"))
+            download, explain = steps[index], steps[index + 1]
+            with self.subTest(workflow=workflow, job=job_name):
+                self.assertNotIn("continue-on-error", download, "the failed download still fails the job")
+                self.assertEqual(explain["if"], f"failure() && steps.{download['id']}.outcome == 'failure'")
+                with tempfile.TemporaryDirectory() as tmp:
+                    summary = Path(tmp) / "summary"
+                    result = subprocess.run(["bash", "-c", explain["run"]], capture_output=True, text=True,
+                                            env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary)})
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    sentence = ("The settings copy this run's earlier job uploaded could not be downloaded. It is kept "
+                                "for one day, so a re-run more than a day after the run started must re-run all jobs, "
+                                "not only the failed ones.")
+                    self.assertEqual(result.stdout, f"::error::{workflow}: {sentence}\n")
+                    self.assertIn(sentence, summary.read_text())
 
     def test_wac_ci_reads_the_profile_from_the_copy_only_when_the_source_is_hemi(self):
         import os
