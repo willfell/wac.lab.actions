@@ -233,6 +233,9 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - name: Start the clock
+        shell: bash
+        run: echo "WACD_SHADOW_STARTED=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -252,7 +255,6 @@ jobs:
           rm -rf "$RUNNER_TEMP/wacd"
           mv .wacd "$RUNNER_TEMP/wacd"
           echo "WACD_SCRIPTS=$RUNNER_TEMP/wacd/scripts" >> "$GITHUB_ENV"
-          echo "WACD_SHADOW_STARTED=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

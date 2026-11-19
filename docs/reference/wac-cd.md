@@ -179,7 +179,7 @@ within a fixed 300 seconds.
 the one way wac-cd installs Helm (`install-tools.sh` still installs `crane` for
 `build`). It downloads exactly
 `https://get.helm.sh/helm-v3.16.3-linux-<arch>.tar.gz` for amd64 or arm64 with
-`curl --proto '=https' --tlsv1.2`, checks it with `sha256sum -c` against the two
+`curl --proto '=https' --proto-redir '=https' --tlsv1.2`, checks it with `sha256sum -c` against the two
 digests committed in the script beside the version, extracts only
 `linux-<arch>/helm` into `$RUNNER_TEMP/bin` and appends that directory to
 `GITHUB_PATH`. A failed or partial download is deleted, and every attempt must
@@ -256,20 +256,21 @@ The job is bounded at two minutes, because the run holds its concurrency group
 until every job ends and the next queued release waits for it. The summary has
 to be written inside that bound, and a socket timeout cannot promise that: it
 applies to each operation, not to a DNS lookup, and not to a reply that trickles
-in. So the exchange has one deadline. The step that writes `GITHUB_ENV` also
-records `WACD_SHADOW_STARTED`, the time in epoch seconds, and the script ends the
-exchange 85 seconds after it (after the script's own start if the stamp is
-absent, not a number, in the future or older than the job). In seconds:
+in. So the exchange has one deadline. The job's first step records
+`WACD_SHADOW_STARTED`, the time in epoch seconds, before any checkout (which
+sleeps 10 to 20 seconds before a retry), and the script ends the exchange 95
+seconds after it (after the script's own start if the stamp is absent, not a
+number, in the future or older than the job). In seconds:
 
 | Part | Seconds |
 | --- | --- |
-| steps before the stamp (job start and two checkouts), assumed at most | 20 |
-| deadline after the stamp, shared by `setup-python`, the install step and the script | 85 |
+| "Set up job" before the stamp, assumed at most | 10 |
+| deadline after the stamp, shared by both checkouts, `setup-python`, the install step and the script | 95 |
 | reserve for writing the summary | 15 |
 | total | 120 |
 
 The install step (`--max-time 25 --attempts 1`, `timeout-minutes: 1` as a kill
-switch) only uses up part of the 85. Helm gets what is left minus 10 seconds
+switch) only uses up part of the 95. Helm gets what is left minus 10 seconds
 kept for the exchange, each call limited to its own 5 or 10 seconds, and is
 skipped as unread when under 5 seconds are left. The token mints and the
 exchange with hemi run in a worker thread that is joined against what is left;

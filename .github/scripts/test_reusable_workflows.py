@@ -370,7 +370,7 @@ class ReusableWorkflowTests(unittest.TestCase):
             needs = other.get("needs") or []
             with self.subTest(job=name):
                 self.assertNotIn("shadow", [needs] if isinstance(needs, str) else needs)
-        app = job["steps"][0]
+        app = job["steps"][1]
         self.assertTrue(app["uses"].startswith("actions/checkout@"))
         self.assertNotIn("repository", app.get("with") or {})
         self.assertIs((app.get("with") or {}).get("persist-credentials"), False)
@@ -402,17 +402,16 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(shadow_py.HELM_VERSION, "v3.16.3", "the script accepts exactly the version installed")
         self.assertEqual(install.get("timeout-minutes"), 1, "the smallest bound GitHub accepts")
         self.assertIs(install.get("continue-on-error"), True, "a failed download must not skip the comparison")
-        stamp = [st for st in steps if "GITHUB_ENV" in st.get("run", "")]
-        self.assertEqual(len(stamp), 1)
-        self.assertIn(
-            f'echo "{shadow_py.STAMP_ENV}=$(date +%s)" >> "$GITHUB_ENV"', stamp[0]["run"],
-            "the deadline is counted from this stamp",
+        stamp = [i for i, st in enumerate(steps) if shadow_py.STAMP_ENV in st.get("run", "")]
+        self.assertEqual(stamp, [0], "the clock starts in the first step, before any checkout can retry")
+        self.assertEqual(
+            steps[0]["run"], f'echo "{shadow_py.STAMP_ENV}=$(date +%s)" >> "$GITHUB_ENV"',
+            "the first step only records the time",
         )
-        self.assertLess(steps.index(stamp[0]), compare[0])
         self.assertEqual(
             shadow_py.BEFORE_STAMP + shadow_py.DEADLINE_SECONDS + shadow_py.SUMMARY_RESERVE,
             job["timeout-minutes"] * 60,
-            "steps before the stamp, the deadline and the reserve for writing the summary add up to the job's bound "
+            "job set-up before the stamp, the deadline and the reserve for writing the summary add up to the job's bound "
             "(budget in docs/reference/wac-cd.md)",
         )
         self.assertGreaterEqual(shadow_py.SUMMARY_RESERVE, 15)

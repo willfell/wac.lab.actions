@@ -84,8 +84,9 @@ for pair in "amd64 x86_64" "arm64 aarch64" "arm64 arm64"; do
   run "ok-$machine" ok "$arch" "$machine"
   test "$status" -eq 0
   grep -q "^https://get.helm.sh/helm-v3.16.3-linux-$arch.tar.gz .*--max-time 120 " "$workdir/requests"
-  grep -q -- "--proto =https" "$workdir/requests"
-  grep -q -- "--tlsv1.2" "$workdir/requests"
+  grep -q -- " --proto =https " "$workdir/requests"
+  grep -q -- " --proto-redir =https " "$workdir/requests"
+  grep -q -- " --tlsv1.2 " "$workdir/requests"
   test "$(requests)" = 1
   test -x "$workdir/ok-$machine/bin/helm"
   test "$("$workdir/ok-$machine/bin/helm")" = "$([ "$arch" = amd64 ] && echo genuine || echo genuine-arm)"

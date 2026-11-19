@@ -36,13 +36,13 @@ Time budget. The job is bounded at 120 seconds and the summary must be written
 inside it. A per-operation socket timeout bounds neither DNS, nor a reply that
 trickles in, so the whole exchange has one deadline, in seconds:
 
-    steps before the stamp (assumed at most)   20   WACD_SHADOW_STARTED is written
-    deadline after the stamp                   85   by the step that writes GITHUB_ENV
-    reserve for the summary                    15
-    total                                     120
+    "Set up job" before the stamp (assumed at most)   10   WACD_SHADOW_STARTED is written
+    deadline after the stamp                          95   by the job's first step
+    reserve for the summary                           15
+    total                                            120
 
-setup-python, the install step and the script all spend the same 85, so a slow
-install only leaves less for the rest. Helm gets what is left minus POST_RESERVE
+The checkouts, setup-python, the install step and the script all spend the same
+95, so a slow checkout retry or install only leaves less for the rest. Helm gets what is left minus POST_RESERVE
 and is skipped as unread when that is under HELM_VERSION_TIMEOUT; the token
 mints and the exchange with hemi run in a worker thread that main joins against
 what is left, and when the deadline passes the summary says hemi did not
@@ -79,7 +79,7 @@ TOKEN_HOST_SUFFIX = ".actions.githubusercontent.com"
 TIMEOUT = 5
 JOB_SECONDS = 120
 SUMMARY_RESERVE = 15
-BEFORE_STAMP = 20
+BEFORE_STAMP = 10
 DEADLINE_SECONDS = JOB_SECONDS - SUMMARY_RESERVE - BEFORE_STAMP
 POST_RESERVE = 10
 STAMP_ENV = "WACD_SHADOW_STARTED"
