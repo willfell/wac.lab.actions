@@ -613,6 +613,92 @@ class ServedTests(unittest.TestCase):
             health.close()
 
 
+class Recorder:
+    """A loopback server that records every request it gets, whatever the method."""
+
+    def __init__(self, status=200, body=None, location=None):
+        self.requests = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def handle_any(self):
+                size = int(self.headers.get("Content-Length") or 0)
+                outer.requests.append({
+                    "method": self.command,
+                    "path": self.path,
+                    "authorization": self.headers.get_all("Authorization") or [],
+                    "content_length": self.headers.get_all("Content-Length") or [],
+                    "content_type": self.headers.get_all("Content-Type") or [],
+                    "body": self.rfile.read(size),
+                })
+                raw = json.dumps(body if body is not None else {}).encode()
+                self.send_response(status)
+                if location:
+                    self.send_header("Location", location)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            do_GET = do_POST = do_CONNECT = handle_any
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.address = f"127.0.0.1:{self.server.server_address[1]}"
+        self.url = f"http://{self.address}/v1/release"
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class PostTests(unittest.TestCase):
+    """post() is the real opener wac-cd sends every gateway request through."""
+
+    def serve(self, *args, **kwargs):
+        server = Recorder(*args, **kwargs)
+        self.addCleanup(server.close)
+        return server
+
+    def post(self, url, environ=None):
+        with patch.object(wacd.ci, "URL", url), patch.object(wacd.ci, "oidc_token", lambda: TOKEN), \
+                patch.dict(os.environ, environ or {}):
+            return wacd.post(wacd.STATUS_BODY(), None, 5)
+
+    def test_a_redirect_is_never_followed_and_the_token_never_resent(self):
+        target = self.serve()
+        gateway = self.serve(302, {}, location=f"http://{target.address}/stolen")
+        status, _, _ = self.post(gateway.url)
+        self.assertEqual(status, 302)
+        self.assertEqual(len(gateway.requests), 1)
+        self.assertEqual(target.requests, [], "the Location target was contacted")
+
+    def test_the_environment_proxy_sees_nothing(self):
+        proxy = self.serve()
+        gateway = self.serve(200, {"version": VERSION})
+        proxy_url = f"http://{proxy.address}"
+        status, value, _ = self.post(gateway.url, {
+            "HTTP_PROXY": proxy_url, "HTTPS_PROXY": proxy_url, "http_proxy": proxy_url,
+            "https_proxy": proxy_url, "NO_PROXY": "", "no_proxy": "",
+        })
+        self.assertEqual((status, value), (200, {"version": VERSION}))
+        self.assertEqual(proxy.requests, [])
+        self.assertEqual(len(gateway.requests), 1)
+
+    def test_one_post_with_one_length_a_json_type_and_the_bearer(self):
+        gateway = self.serve(200, {})
+        self.post(gateway.url)
+        [request] = gateway.requests
+        self.assertEqual(request["method"], "POST")
+        self.assertEqual(request["path"], "/v1/release")
+        self.assertEqual(request["authorization"], ["Bearer " + TOKEN])
+        self.assertEqual(request["content_type"], ["application/json"])
+        self.assertEqual(request["content_length"], [str(len(request["body"]))])
+        self.assertEqual(json.loads(request["body"]), wacd.STATUS_BODY())
+
+
 class RefusalTests(unittest.TestCase):
     """A coded 403 from the gateway reaches the job summary as a sentence, never as its body."""
 
