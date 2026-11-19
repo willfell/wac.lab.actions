@@ -2,11 +2,13 @@
 
 import contextlib
 import copy
+import errno
 import importlib.util
 import io
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1132,6 +1134,36 @@ class PostTests(unittest.TestCase):
         self.assertEqual(request["content_type"], ["application/json"])
         self.assertEqual(request["content_length"], [str(len(request["body"]))])
         self.assertEqual(json.loads(request["body"]), wacd.STATUS_BODY())
+
+
+class UnansweredReleaseTests(unittest.TestCase):
+    """Only plan's contract call rides out a gateway that answers nothing; deploy's release fails at once."""
+
+    def test_a_release_nothing_answers_fails_at_once_with_one_token(self):
+        closed = Gateway((200, {}))
+        closed.close()
+
+        def no_route(*args, **kwargs):
+            raise OSError(errno.EHOSTUNREACH, "No route to host")
+
+        for label, url, connect in (("refused", closed.url, None), ("no route to host", "http://127.0.0.1:9/v1/release",
+                                                                     no_route)):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                minted = []
+                stack, clock = fake_clock()
+                out, err = io.StringIO(), io.StringIO()
+                with stack, patch.object(wacd.ci, "URL", url), \
+                        patch.object(wacd.ci, "oidc_token", lambda: minted.append(TOKEN) or TOKEN), \
+                        patch.object(wacd, "trust_context", lambda: None), \
+                        contextlib.ExitStack() as connecting, \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    if connect is not None:
+                        connecting.enter_context(patch.object(socket, "create_connection", connect))
+                    code = wacd.main(["wacd-release.py", *CliTests.release_argv(self, str(Path(tmp) / "r.json"))])
+                self.assertEqual(code, 1)
+                self.assertEqual(err.getvalue(), "wacd release: release transport failed; check TLS trust and "
+                                                 "service readiness\n")
+                self.assertEqual((len(minted), clock.sleeps), (1, []), "nothing is retried on the release path")
 
 
 class RefusalTests(unittest.TestCase):

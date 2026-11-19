@@ -121,6 +121,17 @@ does not verify, so every run of every repository, cut over or not, fails at
 `plan` with the sentence for an uncoded denial below. `plan` does not guess
 that such a gateway means "no copy": it fails closed.
 
+**Register a new app with Lab before its first `wac-cd` run.** The gateway
+answers `contract` only for a repository it holds as a release target with a
+chart, so from `v1.35.0` on the order is: Lab's registration first, then the
+app's first pull request (the one that adds `.github/wacd.json`, `cd.yml` and
+`ci.yml`). With the registration in place the gateway answers "no copy", and
+`plan` carries on from the files, `deploy: false` included. Before it, every
+run of the app fails at `plan` with the uncoded-denial sentence, which ends
+`if this app is new, register it with lab first.` Under `v1.34.0` a
+`deploy: false` run never asked the gateway, so the app's first chart could be
+published before the registration; that order no longer works.
+
 | The gateway answers | Settings come from | The chart also carries |
 | --- | --- | --- |
 | a copy whose `flags.source` is `hemi` | the copy: its profile is derived by `wacd-profile.py --contract`, its `runtime` is the values | `wacwini.com/revision`, `wacwini.com/fleet-commit` |
@@ -224,18 +235,23 @@ five minutes, as they did before: they stop a stalled step, not a slow run. The 
 doubles up to 30, so a long outage costs about two requests a minute. Each
 request may wait the whole time left for its answer, as `deploy`'s requests
 do, because the gateway checks the caller against `main` with several GitHub
-calls before it reads wac.fleet and can be slow. A TLS failure (wrong trust
-or address) fails at once, as for a `release`, and so does a request still
-unanswered at the deadline; both read `could not be reached`.
+calls before it reads wac.fleet and can be slow. A certificate that fails
+verification fails at once, and so does any transport failure not listed
+below (a TLS protocol error from a wrong address, say) and a request still
+unanswered at the deadline; all read `could not be reached`.
 
 **A gateway restart is ridden out.** The gateway's Deployment is `Recreate`,
 so a rollout leaves about 35 seconds with no endpoint, and from `v1.35.0`
-every release's first step calls it. In the `contract` call only, a
-connection refused or reset before any response is retried with a fresh
-token and the same back-off for at most 90 seconds from the first refusal in
-a row, and never past the wait above; after that it reads `could not be
-reached`. `deploy`'s own calls are unchanged: there a refused connection
-still fails at once.
+every release's first step calls it; the gateway also sheds load by closing a
+socket before the TLS handshake. In the `contract` call only, a connection
+nothing answered on is retried with a fresh token and the same back-off for
+at most 90 seconds from the first such failure in a row, and never past the
+wait above; after that it reads `could not be reached`. That is a connection
+refused or reset, one closed during the TLS handshake (`ssl.SSLEOFError`) or
+before the status line, a connect timeout, and no route to the host or
+network (`EHOSTUNREACH`, `ENETUNREACH`); `wacd-release.py`'s
+`no_connection()` names them. `deploy`'s own calls are unchanged: there each
+of these still fails at once.
 
 Every other `plan` step has its own `timeout-minutes` (one to six minutes), so
 only the gateway wait can use the job's 40 minutes: a stalled checkout,
@@ -249,7 +265,11 @@ While `plan` waits out an outage it holds the repository's `cd` concurrency
 group for up to the capped wait, about 35 to 40 minutes, and since a group
 keeps one pending run, a newer push then replaces an older pending one. That
 is the wait `deploy` already had before
-`v1.35.0`, moved earlier, not a new delay. A 403 is not retried. A
+`v1.35.0`, moved earlier, not a new delay. A coded 403 is not retried. An
+uncoded 403 is asked twice more, 10 seconds apart and each time with a fresh
+token, before it fails: the gateway also answers that way when it could not
+check a token (its fetch of GitHub's signing keys failed, or its replay store
+was busy), which a moment later it can. A
 denial is told apart from a 503 by its status, never by its body, and the body
 is never printed: a 403 without a
 `reason` means the gateway did not verify the caller, and a 403 with one of the
@@ -280,8 +300,9 @@ A code not in that list gets
 (without the parenthesis when the code is not a plain lowercase word), so a
 code added to the gateway later cannot break a release summary. A denial
 without a code reads
-`The gateway did not accept this run as a release of a registered app.` From `plan` it adds
-`A gateway that does not yet serve the contract operation (wacwini/wac.lab#570 not deployed) answers this way too.`
+`The gateway did not accept this run as a release of a registered app.` From
+`plan`, after its three attempts, it reads
+`The gateway refused this run's token on each of 3 attempts (HTTP 403 with no reason), so nothing was built; a gateway that does not yet serve the contract operation (wacwini/wac.lab#570 not deployed) looks like this too; if this app is new, register it with lab first.`
 The run summary's
 `wac-cd settings` section names the source, the revision and the fleet commit,
 with one sentence saying which rule applied or why the run stopped. The
@@ -315,8 +336,11 @@ exists on another commit fails the plan.
 | `none` | a `release` or `publish` run whose tag push was refused after `main` moved on: superseded | nothing |
 
 `deploy: false` is publish-only, used for cutover step 1: the old route still
-deploys while `wac-cd` publishes the first deploy chart so Lab can register the
-app at that version. `rollback_version` with `deploy: false` fails.
+deploys while `wac-cd` publishes the first deploy chart. From `v1.35.0` Lab's
+registration of the app comes first, because `plan` asks the gateway for the
+settings in every mode, `deploy: false` included, and the gateway answers only
+for a registered app (**Register a new app with Lab before its first `wac-cd`
+run** above). `rollback_version` with `deploy: false` fails.
 
 **A tag means "claimed"; a GitHub Release means "ran".** In `release` and
 `publish` modes, `plan` pushes the git tag (`wacd-tag.py claim-tag`) as soon as

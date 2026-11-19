@@ -98,7 +98,7 @@ jobs:
           JOB_RUNNER_OS: ${{ runner.os }}
           JOB_RUNNER_ARCH: ${{ runner.arch }}
         run: |
-          modules=(argparse base64 binascii hashlib http.client importlib.util json os pathlib re shutil signal socket ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
+          modules=(argparse base64 binascii errno hashlib http.client importlib.util json os pathlib re shutil signal socket ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then
@@ -546,7 +546,7 @@ jobs:
           JOB_RUNNER_OS: ${{ runner.os }}
           JOB_RUNNER_ARCH: ${{ runner.arch }}
         run: |
-          modules=(argparse base64 binascii hashlib http.client importlib.util json os pathlib re shutil signal socket ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
+          modules=(argparse base64 binascii errno hashlib http.client importlib.util json os pathlib re shutil signal socket ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then
@@ -885,7 +885,7 @@ jobs:
           JOB_RUNNER_OS: ${{ runner.os }}
           JOB_RUNNER_ARCH: ${{ runner.arch }}
         run: |
-          modules=(argparse base64 binascii hashlib http.client importlib.util json os pathlib re shutil signal socket ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
+          modules=(argparse base64 binascii errno hashlib http.client importlib.util json os pathlib re shutil signal socket ssl stat subprocess sys tempfile threading time typing urllib.error urllib.parse urllib.request uuid)
           python="$(command -v python3 || true)"
           found="no python3"
           if [[ -n "$python" ]]; then

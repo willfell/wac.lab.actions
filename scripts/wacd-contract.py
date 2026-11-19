@@ -35,17 +35,22 @@ window in `deploy`, and moving the first gateway call into `plan` must not
 make it fail sooner. Each attempt waits the whole time left for its answer,
 as `deploy`'s requests do: the gateway first checks the caller's revision
 against main with several GitHub calls and can be slow under a slow GitHub,
-and a slow answer is still an answer. A refused or reset connection or a TLS
-failure fails at once, as it does for a `release`, and so does a timeout at
-the deadline. The one exception is a connection refused or reset before any
-response (the gateway's Recreate rollout leaves about 35 s with nothing
-listening): that is retried with a fresh token and the same back-off for at
-most RESTART_WINDOW seconds from the first refusal in a row, and then fails
-as unreachable. The interval between 503s starts at FIRST_POLL_SECONDS and
-doubles up to MAX_POLL_SECONDS, so a long outage costs about two requests a
-minute. A 403 is a denial, told
-apart from a 503 by its status, never its body: a coded one carries one of
-REFUSALS' codes, an unverified caller none. The response body is never
+and a slow answer is still an answer. A connection nothing answered on
+(wacd-release.py's no_connection(): refused, reset, closed during the TLS
+handshake or before the status line, a connect timeout, no route to the host
+or network) is retried with a fresh token and the same back-off for at most
+RESTART_WINDOW seconds from the first in a row, and then fails as
+unreachable: the gateway's Recreate rollout leaves about 35 s with nothing
+listening, and it sheds load by closing a socket before the handshake. A
+certificate that fails verification fails at once, as does any other
+transport failure and a read still unanswered at the deadline. The interval
+between 503s starts at FIRST_POLL_SECONDS and doubles up to
+MAX_POLL_SECONDS, so a long outage costs about two requests a minute. A 403
+is a denial, told apart from a 503 by its status, never its body: a coded one
+carries one of REFUSALS' codes and is final, an uncoded one none, and since
+the gateway also answers a token it could not check that way, it is asked
+UNCODED_ATTEMPTS times in all, UNCODED_PAUSE seconds apart, before it fails
+saying the gateway refused this run's token. The response body is never
 printed; only a sentence is. The request is wacd-release.py's post(), and the
 code-to-sentence map is wacd-release.py's REFUSALS with its two defaults, so a
 refused contract and a refused release read alike. The gateway's address is
@@ -69,11 +74,11 @@ dropping `id-token` from its own ci.yml:
 | 200 `hemi` | absent | present | fails: `<path> was added back` |
 | 200 `hemi` | present | present | hemi's settings, and a line per file still on main |
 | 200 `hemi` | absent | absent | hemi's settings |
-| 200 `files` | absent | present | the files: the restore pull request |
-| 200 `files` | absent | absent | fails: wait for the restore pull request |
+| 200 `files` | absent | present | the files: the restore pull request, or a new app's first one |
+| 200 `files` | absent | absent | fails: wait for the restore pull request (or, for a new app, nothing to check) |
 | 200 `files` | present | any | the files, as before |
 | anything else | present | any | the files, as before; the summary names hemi's status |
-| 401 or 403 | absent | any | fails: hemi refused the token (or the event, outside `pull_request`) |
+| 401 or 403 | absent | any | fails: hemi refused the token (or the event, outside `pull_request`); register a new app first |
 | no answer, a timeout or 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
 | an address that does not resolve | absent | any | fails: the job must run on a Lab runner |
 | no token minted | absent | any | fails: GitHub would not mint a job token |
@@ -81,9 +86,14 @@ dropping `id-token` from its own ci.yml:
 
 "Files on main" is `.github/wacd.json` on main, the profile that holds the
 gates; the paths checked in the merge commit are that file, the values path
-main's profile names and the copy's `delivery.valuesFile`. A 200 that cannot be
-read, names another repository than the token's or does not derive a profile
-is treated as an answer but a 200, and so is a job with no `id-token` grant.
+main's profile names and the copy's `delivery.valuesFile`. A `files` answer is
+read for its source alone: hemi answers a registered app that was never cut
+over with `version`, `identity.repositoryId`, `identity.repository`,
+`identity.app` and `flags.source` and nothing else, so only `flags.source` is
+required, and `identity.repositoryId`, when present, must be the token's. A
+`hemi` answer is read in full. A 200 that cannot be read, names another
+repository than the token's or does not derive a profile is treated as an
+answer but a 200, and so is a job with no `id-token` grant.
 No answer and a 5xx are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
 apart; each attempt, token mint included, is bounded at PR_ATTEMPT_SECONDS by
 a worker thread, so a reply that trickles in counts as silence. On success it prints
@@ -139,6 +149,12 @@ PLAN_WAIT_CAP = 2100
 # endpoint. A refused or reset connection is retried for at most this long
 # from the first refusal in a row, and never past the overall wait.
 RESTART_WINDOW = 90
+# The gateway answers a token it could not check (a failed signing-key fetch,
+# a busy replay store) with the same uncoded 403 as a caller it refuses, so an
+# uncoded 403 is asked this many times in all, UNCODED_PAUSE seconds apart.
+UNCODED_ATTEMPTS = 3
+UNCODED_PAUSE = 10
+REGISTER_FIRST = "if this app is new, register it with lab first."
 FILES_PROFILE = Path(".github") / "wacd.json"
 SOURCES = ("files", "hemi")
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -156,7 +172,8 @@ REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 RUNNER_NAME = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 EVENT_NAME = re.compile(r"[a-z_]{1,40}")
 GRANT_ENV = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
-CUT_OVER = "{app}'s settings live in hemi, so the checks cannot run."
+CUT_OVER_CLAUSE = "{app}'s settings live in hemi, so the checks cannot run"
+CUT_OVER = CUT_OVER_CLAUSE + "."
 UNREACHABLE = (
     "the contract job must run on a Lab runner: {runner} cannot reach hemi's in-cluster address. "
     "Pass a Lab pool as `runner`."
@@ -176,6 +193,11 @@ PR_SENTENCES = {
         "hemi's copy (revision {revision}) says {app} is returning to its files and this pull "
         "request puts them back, so its own files were used."
     ),
+    "new": "hemi holds no settings for {app} yet, so the pull request's own files were used.",
+    "new_nothing": (
+        "hemi holds no settings for {app} yet, and neither main nor this pull request has "
+        ".github/wacd.json, so there is nothing to check."
+    ),
     "returning": (
         "hemi says {app} is returning to its files, and neither main nor this pull request has "
         ".github/wacd.json; wait for hemi's restore pull request and re-run after it merges."
@@ -186,10 +208,10 @@ PR_SENTENCES = {
     "no_mint_files": "GitHub would not mint a job token for hemi; using the repository's files.",
     "unreachable_files": UNREACHABLE,
     "unreadable_files": "hemi's answer could not be read; using the repository's files.",
-    "refused": "hemi refused this pull request's token (HTTP {status}); " + CUT_OVER,
+    "refused": "hemi refused this pull request's token (HTTP {status}); " + CUT_OVER_CLAUSE + "; " + REGISTER_FIRST,
     "refused_event": (
         "hemi refused the job token of this {event} run (HTTP {status}): it admits wac-ci only for "
-        "pull_request runs, and " + CUT_OVER
+        "pull_request runs, and " + CUT_OVER_CLAUSE + "; " + REGISTER_FIRST
     ),
     "silent": "hemi did not answer; re-run when it does.",
     "no_mint": "GitHub would not mint a job token for hemi; re-run the checks.",
@@ -206,8 +228,9 @@ PR_SENTENCES = {
 
 SENTENCES = {
     "unverified": (
-        release.UNVERIFIED + " A gateway that does not yet serve the contract operation "
-        "(wacwini/wac.lab#570 not deployed) answers this way too."
+        f"The gateway refused this run's token on each of {UNCODED_ATTEMPTS} attempts (HTTP 403 with no "
+        "reason), so nothing was built; a gateway that does not yet serve the contract operation "
+        "(wacwini/wac.lab#570 not deployed) looks like this too; " + REGISTER_FIRST
     ),
     "unknown_refusal": release.UNKNOWN_REFUSAL,
     "another_repository": (
@@ -263,8 +286,8 @@ def trust_context():
 def post(trust, timeout):
     """One contract request with a token minted for it: (status, parsed body or None, token).
 
-    A refused or reset connection passes through as release.Unanswered for
-    ask() to retry; any other transport failure is final.
+    A connection nothing answered on passes through as release.Unanswered
+    for ask() to retry; any other transport failure is final.
     """
     try:
         return release.post(CONTRACT_BODY, trust, timeout)
@@ -279,13 +302,17 @@ def post(trust, timeout):
 def ask(trust, wait):
     """The gateway's 200 answer and the token that got it.
 
-    A 503 is retried within wait seconds; a refused or reset connection
-    within RESTART_WINDOW seconds of the first refusal in a row, and never past
-    wait. Each retry mints a fresh token and backs off as a 503 does.
+    A 503 is retried within wait seconds; a connection nothing answered on
+    (release.no_connection) within RESTART_WINDOW seconds of the first in a
+    row, and never past wait. Each retry mints a fresh token and backs off as
+    a 503 does. An uncoded 403 is asked UNCODED_ATTEMPTS times in all,
+    UNCODED_PAUSE seconds apart, within wait; a coded one is final.
     """
     deadline = time.monotonic() + wait
     interval = FIRST_POLL_SECONDS
     refused_since = None
+    uncoded = 0
+    last_uncoded = False
     while time.monotonic() < deadline:
         try:
             status, value, token = post(trust, max(1, deadline - time.monotonic()))
@@ -298,17 +325,25 @@ def ask(trust, wait):
             interval = min(interval * 2, MAX_POLL_SECONDS)
             continue
         refused_since = None
+        last_uncoded = False
         if status == 200:
             return value, token
         if status == 403:
             sentence = release.refusal_sentence(value)
-            # A gateway older than the contract operation answers it with the
-            # same uncoded 403 as an unverified caller, so that sentence says so.
-            raise Refusal(SENTENCES["unverified"] if sentence == release.UNVERIFIED else sentence)
+            if sentence != release.UNVERIFIED:
+                raise Refusal(sentence)
+            uncoded += 1
+            last_uncoded = True
+            if uncoded >= UNCODED_ATTEMPTS:
+                raise Refusal(SENTENCES["unverified"])
+            time.sleep(min(UNCODED_PAUSE, max(0, deadline - time.monotonic())))
+            continue
         if status != 503:
             raise Refusal(SENTENCES["status"].format(status=status))
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
         interval = min(interval * 2, MAX_POLL_SECONDS)
+    if last_uncoded:
+        raise Refusal(SENTENCES["unverified"])
     if refused_since is not None:
         raise Refusal(SENTENCES["unreachable"])
     raise Refusal(SENTENCES["unavailable"].format(wait=wait))
@@ -542,7 +577,14 @@ def ask_hemi():
 
 
 def read_pr_copy(raw, token):
-    """hemi's answer to a pull request's job, checked as fetch checks the gateway's copy, or None."""
+    """hemi's answer to a pull request's job, or None when it cannot be used.
+
+    A `files` answer is read for flags.source alone, and for
+    identity.repositoryId when present, which must be the token's: hemi answers
+    a registered app that was never cut over with no revision and no settings
+    document, and the pull request runs on its own files whatever else the
+    answer holds. A `hemi` answer is checked as fetch checks the gateway's copy.
+    """
     if raw is None or len(raw) > MAX_ANSWER:
         return None
     try:
@@ -552,6 +594,14 @@ def read_pr_copy(raw, token):
     if not isinstance(copy, dict):
         return None
     identity, flags, delivery = copy.get("identity"), copy.get("flags"), copy.get("delivery")
+    if not isinstance(flags, dict) or flags.get("source") not in SOURCES:
+        return None
+    if flags["source"] == "files":
+        if isinstance(identity, dict) and "repositoryId" in identity:
+            owner = token_repository_id(token) if token else None
+            if owner is None or identity["repositoryId"] != owner:
+                return None
+        return copy
     if (
         type(copy.get("version")) is not int
         or copy["version"] != 1
@@ -572,8 +622,7 @@ def read_pr_copy(raw, token):
         return None
     try:
         profile.check_relative(delivery.get("valuesFile"), "contract.delivery.valuesFile")
-        if flags["source"] == "hemi":
-            profile.from_contract(copy, profile.DERIVED_VALUES)
+        profile.from_contract(copy, profile.DERIVED_VALUES)
     except profile.ProfileError:
         return None
     return copy
@@ -592,6 +641,17 @@ def runner_name():
 def event_name():
     name = os.environ.get("GITHUB_EVENT_NAME", "")
     return name if EVENT_NAME.fullmatch(name) else "unnamed"
+
+
+def files_answer(copy):
+    """(app, revision or None) from a `files` answer, which need carry neither."""
+    identity = copy.get("identity") if isinstance(copy.get("identity"), dict) else {}
+    app = identity.get("app")
+    app = app if isinstance(app, str) and profile.APP.fullmatch(app) else repository_name()
+    revision = identity.get("revision")
+    if type(revision) is not int or not 1 <= revision <= chart.MAX_REVISION:
+        return app, None
+    return app, chart.revision_annotation(revision)
 
 
 def pull_request(out, main, head):
@@ -617,16 +677,19 @@ def pull_request(out, main, head):
             raise Refusal(PR_SENTENCES[key].format(status=answer, app=app, event=event))
         raise Refusal(PR_SENTENCES[outcome].format(app=app, runner=runner_name()))
     copy = answer
+    if copy["flags"]["source"] == "files":
+        app, revision = files_answer(copy)
+        if files_on_main:
+            key = "files" if revision else "new"
+            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)]
+        if profile_path in tree_entries(head, [profile_path], "pull request's tree"):
+            key = "restore" if revision else "new"
+            return "files", revision or "", [PR_SENTENCES[key].format(revision=revision, app=app)]
+        raise Refusal(PR_SENTENCES["returning" if revision else "new_nothing"].format(app=app))
     app, revision = copy["identity"]["app"], chart.revision_annotation(copy["identity"]["revision"])
     paths.append(copy["delivery"]["valuesFile"])
     on_main = tree_entries(main, paths, "default branch's tree")
     in_head = tree_entries(head, paths, "pull request's tree")
-    if copy["flags"]["source"] == "files":
-        if files_on_main:
-            return "files", revision, [PR_SENTENCES["files"].format(revision=revision, app=app)]
-        if profile_path in in_head:
-            return "files", revision, [PR_SENTENCES["restore"].format(revision=revision, app=app)]
-        raise Refusal(PR_SENTENCES["returning"].format(app=app))
     ordered = list(dict.fromkeys(paths))
     added = [path for path in ordered if path in in_head and path not in on_main]
     if added:

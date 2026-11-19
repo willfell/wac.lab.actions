@@ -34,8 +34,9 @@ refuses to start.
 | --- | --- |
 | `npm_token` | optional token for private npm packages; empty uses the job's GitHub token |
 
-It runs six jobs. `contract` runs first and decides where the others read
-their settings (below); every other job needs it. `checks` sets up node or go for `ci.stack` and runs
+It runs six jobs. `contract` runs first and decides where `checks` and
+`render` read their settings (below); those two need it, while `lint`,
+`techdocs` and `agents-md` read no settings and start at once. `checks` sets up node or go for `ci.stack` and runs
 `ci.commands` in order, each in its own log group. For `stack: node` it runs
 `npm ci` first, but only when the repo has a root `package.json`; a repo
 without one, such as finance, lists `npm ci --prefix <dir>` in `ci.commands`
@@ -115,12 +116,13 @@ bounded at 15 seconds. When the source is `hemi` it uploads `.wacd-contract/`
 (`contract.json`, `profile.json` and `values.json`, as `wac-cd`'s `plan`
 writes them) as the artifact `wac-ci-contract`, kept for one day.
 
-Every other job needs `contract` and runs under `if: ${{ !cancelled() }}`.
-A plain dependent of a failed job reports `skipped`, which a ruleset counts
-as passing, so `checks` and `render` first run a step that fails unless
-`contract` succeeded. `lint`, `techdocs` and `agents-md` call nested
-workflows, which take no step of ours: they wait for `contract` and then run
-their own gates whatever it concluded, since none of them reads the settings.
+`checks` and `render` need `contract` and run under
+`if: ${{ !cancelled() }}`. A plain dependent of a failed job reports
+`skipped`, which a ruleset counts as passing, so each first runs a step that
+fails unless `contract` succeeded. `lint`, `techdocs` and `agents-md` read no
+settings and do not wait for `contract`: they start with it and run their own
+gates whatever it concludes. The required check `wacd-ci / contract` is what
+blocks a merge while `contract` fails.
 With the source `hemi`, `checks` and `render` remove any `.wacd-contract/`
 the pull request carries, download the copy, and read the profile with
 `wacd-profile.py --contract`: `checks` runs the copy's gates and runtime
@@ -142,18 +144,34 @@ into another pull request's branch is judged by main like any other.
 | 200, source `hemi` | absent | present | fails: `<path> was added back; <app>'s settings live in hemi.` |
 | 200, source `hemi` | present | present | hemi's settings; the summary says `<path> is still on main until hemi's clean-up pull request merges; hemi's settings were used.` |
 | 200, source `hemi` | absent | absent | hemi's settings |
-| 200, source `files` | absent | present | the pull request's own files: it is the restore pull request of a return to files |
-| 200, source `files` | absent | absent | fails: wait for hemi's restore pull request and re-run after it merges |
+| 200, source `files` | absent | present | the pull request's own files: it is the restore pull request of a return to files, or a new app's first pull request (below) |
+| 200, source `files` | absent | absent | fails: wait for hemi's restore pull request and re-run after it merges; for an answer with no revision, `hemi holds no settings for <app> yet, and neither main nor this pull request has .github/wacd.json, so there is nothing to check.` |
 | 200, source `files` | present | any | the pull request's own files, as before |
 | anything but a readable 200 | present | any | the pull request's own files, as before; the summary names only hemi's status, such as `hemi answered 401; using the repository's files.` |
-| 401 or 403 | absent | any | fails: `hemi refused this pull request's token (HTTP <status>); <repository>'s settings live in hemi, so the checks cannot run.` |
+| 401 or 403 | absent | any | fails: `hemi refused this pull request's token (HTTP <status>); <repository>'s settings live in hemi, so the checks cannot run; if this app is new, register it with lab first.` |
 | no answer, a timeout or a 5xx | absent | any | fails: `hemi did not answer; re-run when it does.` |
 | hemi's address does not resolve | absent | any | fails: ``the contract job must run on a Lab runner: <runner> cannot reach hemi's in-cluster address. Pass a Lab pool as `runner`.`` |
 | GitHub mints no job token | absent | any | fails: `GitHub would not mint a job token for hemi; re-run the checks.` |
 | 404, 422 or any other status | absent | any | fails, naming the status |
 
-A 200 that cannot be read, names another repository than the token's, or
-does not derive a profile counts as "anything but a readable 200". So do an
+**A new app's first pull request.** This is the onboarding case, and the
+order is Lab's registration first, then the app's first pull request, the one
+that adds `.github/wacd.json`, its values file and the `wacd-ci` job. For a
+registered repository that has never been cut over, hemi answers 200 with
+exactly
+`{"version": 1, "identity": {"repositoryId": "<id>", "repository": "<owner/name>", "app": "<app>"}, "flags": {"source": "files"}}`:
+no revision and no settings. Main has neither file and the pull request adds
+them, so it runs on its own files and passes, with the summary line
+`hemi holds no settings for <app> yet, so the pull request's own files were used.`
+Before the registration hemi answers 403 (`not registered`), and the pull
+request fails with the 401-or-403 sentence above, which says to register
+first.
+
+A `files` answer is read for its source alone: `contract` requires only
+`flags.source`, and `identity.repositoryId`, when it is present, must be the
+job token's. A `hemi` answer must carry the full copy. A 200 that cannot be
+read, names another repository than the token's, or does not derive a profile
+counts as "anything but a readable 200". So do an
 address that does not resolve, a token GitHub would not mint, and a job with
 no `id-token` grant to mint with; for a repository on its files the summary
 then says which. An address that does not resolve means a runner outside the

@@ -9,10 +9,12 @@ gateway, so every request travels over real HTTP with a fresh token.
 import base64
 import contextlib
 import copy
+import errno
 import importlib.util
 import io
 import json
 import os
+import socket
 import ssl
 import subprocess
 import sys
@@ -369,11 +371,23 @@ class AnswerTests(FetchCase):
                 code = self.fetch((403, {"error": "release request denied", "reason": reason}))
                 self.assertRefused(code, contract.SENTENCES["unknown_refusal"])
 
-    def test_an_unverified_caller_gets_the_generic_sentence_naming_an_old_gateway(self):
-        code = self.fetch((403, {"error": "release request denied"}))
+    def test_an_uncoded_denial_is_asked_twice_more_with_a_fresh_token_before_it_fails(self):
+        """The gateway answers a token it could not check (signing keys, replay store) with the uncoded 403."""
+        uncoded = (403, {"error": "release request denied", "detail": BODY_MARKER})
+        code = self.fetch(uncoded)
         self.assertRefused(code, contract.SENTENCES["unverified"])
-        self.assertIn("does not yet serve the contract operation", self.stderr)
-        self.assertIn("wacwini/wac.lab#570", self.summary_text)
+        self.assertEqual(len(self.gateway.seen), 3)
+        self.assertEqual(len({auth for auth, _ in self.gateway.seen}), 3, "each attempt mints its own token")
+        self.assertEqual(self.clock.sleeps, [10, 10])
+        self.assertIn("The gateway refused this run's token on each of 3 attempts", self.summary_text)
+        self.assertIn("a gateway that does not yet serve the contract operation (wacwini/wac.lab#570 not deployed) "
+                      "looks like this too", self.summary_text)
+        self.assertTrue(self.stderr.rstrip().endswith("; if this app is new, register it with lab first."))
+        self.summary.unlink()
+        code = self.fetch(uncoded, uncoded, answer(None))
+        self.assertEqual(code, 0, self.stderr)
+        self.assertEqual(self.outputs()["source"], "files")
+        self.assertEqual((len(self.gateway.seen), self.clock.sleeps), (3, [10, 10]))
 
     def test_a_coded_body_on_another_status_is_not_a_denial(self):
         for status in (400, 404, 500):
@@ -432,6 +446,66 @@ class AnswerTests(FetchCase):
     def test_the_restart_window_is_ninety_seconds(self):
         self.assertEqual(contract.RESTART_WINDOW, 90)
 
+    def unanswered_then(self, count, url=None, error=None):
+        """The first `count` attempts go unanswered: to url, or with error raised from the connect."""
+        real_post = contract.release.post
+        real_connect = socket.create_connection
+        attempts = []
+
+        def refuse_connect(*args, **kwargs):
+            raise error
+
+        def post(body, trust, timeout):
+            attempts.append(timeout)
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(contract.ci, "URL", self.gateway.url))
+                if len(attempts) <= count and url is not None:
+                    stack.enter_context(patch.object(contract.ci, "URL", url))
+                if len(attempts) <= count and error is not None:
+                    stack.enter_context(patch.object(socket, "create_connection", refuse_connect))
+                return real_post(body, trust, timeout)
+
+        self.assertIs(socket.create_connection, real_connect)
+        return patch.object(contract.release, "post", post), attempts
+
+    def test_every_way_nothing_answers_before_a_response_is_ridden_out(self):
+        """The gateway sheds load by closing a socket before the handshake, and its pod can die mid-handshake."""
+        cases = (
+            ("reset", Silent("reset").url("http"), None),
+            ("EOF before the status line", Silent("eof").url("http"), None),
+            ("EOF in the TLS handshake", Silent("eof").url("https"), None),
+            ("connect timeout", None, TimeoutError("timed out")),
+            ("no route to host", None, OSError(errno.EHOSTUNREACH, "No route to host")),
+            ("network unreachable", None, OSError(errno.ENETUNREACH, "Network is unreachable")),
+        )
+        for label, url, error in cases:
+            with self.subTest(case=label):
+                self.summary.unlink(missing_ok=True)
+                self.minted = []
+                spy, attempts = self.unanswered_then(2, url, error)
+                with spy:
+                    code = self.fetch(answer(None), wait=WAIT)
+                self.assertEqual(code, 0, self.stderr)
+                self.assertEqual(self.outputs()["source"], "files")
+                self.assertEqual(len(attempts), 3)
+                self.assertEqual(len(self.minted), 3, "each attempt mints its own token")
+                self.assertEqual(len(self.gateway.seen), 1)
+                self.assertEqual(self.clock.sleeps, [5, 10])
+
+    def test_a_certificate_that_fails_verification_fails_at_once(self):
+        def unverified(*args, **kwargs):
+            raise ssl.SSLCertVerificationError(1, "certificate verify failed: self-signed certificate")
+
+        gateway = Gateway((200, {"copy": None, "fleet_commit": None}))
+        self.addCleanup(gateway.close)
+        self.dead_url = gateway.url.replace("http://", "https://")
+        with patch.object(contract, "trust_context", ssl.create_default_context), \
+                patch.object(ssl.SSLContext, "wrap_socket", unverified):
+            code = self.fetch_with_trust((200, {}))
+        self.assertRefused(code, "could not be reached")
+        self.assertEqual(len(self.minted), 1)
+        self.assertEqual(self.clock.sleeps, [])
+
     def test_a_tls_failure_fails_at_once(self):
         """Wrong trust or address is not a restart: an https request to a plain-http port."""
         gateway = Gateway((200, {"copy": None, "fleet_commit": None}))
@@ -463,6 +537,41 @@ class AnswerTests(FetchCase):
         code = self.fetch((200, {"copy": None, "fleet_commit": None}, 2.5), wait=1)
         self.assertRefused(code, "could not be reached")
         self.assertEqual(len(self.minted), 1)
+
+
+class Silent:
+    """A listener that reads the request, or the TLS ClientHello, and answers nothing.
+
+    "eof" closes the connection cleanly; "reset" closes it with an RST.
+    """
+
+    def __init__(self, how):
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen()
+        self.how = how
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while True:
+            try:
+                connection, _ = self.server.accept()
+            except OSError:
+                return
+            with connection:
+                connection.settimeout(5)
+                try:
+                    received = connection.recv(65536)
+                    while b"\r\n\r\n" in received and len(received.split(b"\r\n\r\n", 1)[1]) < len(
+                            json.dumps(contract.CONTRACT_BODY)):
+                        received += connection.recv(65536)
+                except OSError:
+                    pass
+                if self.how == "reset":
+                    connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+
+    def url(self, scheme):
+        return f"{scheme}://127.0.0.1:{self.server.getsockname()[1]}/v1/release"
 
 
 class CliTests(unittest.TestCase):
@@ -739,6 +848,43 @@ class PullRequestDecisionTests(PullRequestCase):
         self.assertSource(code, "files")
         self.assertNotIn("added back", self.summary_text)
 
+    def test_a_new_apps_first_pull_request_runs_on_the_files_it_adds(self):
+        """Onboarding: lab registers the app first, then its first pull request adds the files and wac-ci.
+
+        For a registered repository never cut over, hemi answers with this body and nothing else.
+        """
+        never_cut_over = {"version": 1, "identity": {"repositoryId": REPOSITORY_ID, "repository": REPOSITORY,
+                                                     "app": "travel"}, "flags": {"source": "files"}}
+        code = self.run_pr((200, never_cut_over), main={}, head=FILES)
+        self.assertSource(code, "files")
+        self.assertEqual(self.outputs()["revision"], "")
+        self.assertIn("hemi holds no settings for travel yet, so the pull request's own files were used.",
+                      self.summary_text)
+        self.assertNotIn("added back", self.summary_text)
+        self.summary.unlink()
+        self.assertSource(self.run_pr((200, never_cut_over), main=FILES, head=FILES), "files")
+        self.summary.unlink()
+        self.assertFails(self.run_pr((200, never_cut_over), main={}, head={}),
+                         "hemi holds no settings for travel yet, and neither main nor this pull request has "
+                         ".github/wacd.json, so there is nothing to check.")
+
+    def test_a_files_answer_needs_only_its_source_and_a_repository_id_that_is_the_tokens(self):
+        for label, body, readable in (
+            ("the source alone", {"flags": {"source": "files"}}, True),
+            ("an id that is the token's", {"identity": {"repositoryId": REPOSITORY_ID}, "flags": {"source": "files"}},
+             True),
+            ("another repository's id", {"identity": {"repositoryId": "111"}, "flags": {"source": "files"}}, False),
+            ("no source", {"identity": {"repositoryId": REPOSITORY_ID}}, False),
+        ):
+            with self.subTest(answer=label):
+                self.summary.unlink(missing_ok=True)
+                code = self.run_pr((200, body), main={}, head=FILES)
+                if readable:
+                    self.assertSource(code, "files")
+                    self.assertIn(f"hemi holds no settings for {REPOSITORY} yet", self.summary_text)
+                else:
+                    self.assertFails(code, contract.PR_SENTENCES["unreadable"].format(app=REPOSITORY))
+
     def test_files_copy_with_no_files_on_main_or_in_the_pull_request_fails(self):
         code = self.run_pr(self.hemi_answer("files"), main={}, head={})
         self.assertFails(code, contract.PR_SENTENCES["returning"].format(app="travel"))
@@ -776,7 +922,8 @@ class PullRequestDecisionTests(PullRequestCase):
                     self.summary.unlink(missing_ok=True)
                     code = self.run_pr((status, {"error": BODY_MARKER}), main={}, head=head)
                     self.assertFails(code, f"hemi refused this pull request's token (HTTP {status}); "
-                                           f"{REPOSITORY}'s settings live in hemi, so the checks cannot run.")
+                                           f"{REPOSITORY}'s settings live in hemi, so the checks cannot run; "
+                                           "if this app is new, register it with lab first.")
                     self.assertEqual(len(self.hemi.seen), 1, "a refusal is not asked again")
 
     def test_no_answer_with_no_files_on_main_fails(self):
@@ -814,7 +961,8 @@ class PullRequestTests(PullRequestCase):
         self.branch("base", FILES)
         for label, response, sentence in (
             ("401", (401, {}), f"hemi refused this pull request's token (HTTP 401); {REPOSITORY}'s settings "
-                               "live in hemi, so the checks cannot run."),
+                               "live in hemi, so the checks cannot run; if this app is new, register it with lab "
+                               "first."),
             ("hemi", (200, fixture_copy("hemi")),
              f"{PROFILE} was added back; travel's settings live in hemi. {VALUES} was added back; travel's "
              "settings live in hemi."),
@@ -871,7 +1019,7 @@ class PullRequestTests(PullRequestCase):
         code = self.run_pr((401, {"error": "unauthorized"}), main={}, head={})
         self.assertFails(code, f"hemi refused the job token of this push run (HTTP 401): it admits wac-ci only "
                                f"for pull_request runs, and {REPOSITORY}'s settings live in hemi, so the checks "
-                               "cannot run.")
+                               "cannot run; if this app is new, register it with lab first.")
         self.assertNotIn("pull request's", self.stderr)
 
     def test_an_answer_that_trickles_in_past_the_attempt_bound_is_silence(self):

@@ -67,6 +67,7 @@ yet, and never edits one that does. Any problem exits 1 with one stable
 """
 
 import argparse
+import errno
 import http.client
 import importlib.util
 import json
@@ -162,7 +163,7 @@ class Unreachable(ReleaseError):
 
 
 class Unanswered(Unreachable):
-    """The connection was refused or reset before any response: nothing is listening.
+    """Nothing answered the connection before any response (no_connection()).
 
     The release path treats it as any Unreachable (same message, fails at
     once). Only wacd-contract.py's plan call tells it apart, to ride out the
@@ -170,11 +171,29 @@ class Unanswered(Unreachable):
     """
 
 
+NO_ROUTE = (errno.EHOSTUNREACH, errno.ENETUNREACH)
+
+
 def no_connection(error):
-    """Whether a transport error is a refused or reset connection, not TLS or a timeout."""
-    if isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError):
+    """Whether a transport error came before any response: nothing answered.
+
+    That is a refused or reset connection, one closed during the TLS handshake
+    (ssl.SSLEOFError) or before the status line (http.client's
+    RemoteDisconnected, a ConnectionResetError), a connect timeout (urllib
+    wraps only the connect in URLError, so a read timeout is not one), and no
+    route to the host or network. A certificate that fails verification is an
+    answer of a kind and is never counted, and nor is anything else.
+    """
+    wrapped = isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError)
+    if wrapped:
         error = error.reason
-    return isinstance(error, (ConnectionRefusedError, ConnectionResetError))
+    if isinstance(error, ssl.SSLCertVerificationError):
+        return False
+    if wrapped and isinstance(error, TimeoutError):
+        return True
+    if isinstance(error, (ConnectionRefusedError, ConnectionResetError, ssl.SSLEOFError)):
+        return True
+    return isinstance(error, OSError) and error.errno in NO_ROUTE
 
 
 class RollingOut(ReleaseError):

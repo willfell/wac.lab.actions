@@ -1656,8 +1656,14 @@ class ReusableWorkflowTests(unittest.TestCase):
 
         return yaml.safe_load((Path(__file__).resolve().parents[1] / "workflows" / "wac-ci.yml").read_text())
 
-    def test_wac_ci_only_the_contract_job_holds_a_job_token_and_every_other_job_waits_for_it(self):
-        """A dependent of a failed job reports skipped, which a ruleset counts as passing."""
+    def test_wac_ci_only_the_contract_job_holds_a_job_token_and_only_the_settings_readers_wait_for_it(self):
+        """A dependent of a failed job reports skipped, which a ruleset counts as passing.
+
+        checks and render read the settings, so they wait for contract and fail
+        unless it succeeded. lint, techdocs and agents-md read none, and the
+        required check wacd-ci / contract is what blocks a merge, so they start
+        at once.
+        """
         doc = self.wac_ci()
         jobs = doc["jobs"]
         self.assertEqual(sorted(name for name, job in jobs.items() if holds_id_token(doc, job)), ["contract"])
@@ -1666,14 +1672,17 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertEqual(jobs["contract"]["outputs"], {"source": "${{ steps.contract.outputs.source }}"})
         others = [name for name in jobs if name != "contract"]
         self.assertEqual(sorted(others), ["agents-md", "checks", "lint", "render", "techdocs"])
-        for name in others:
+        for name in ("lint", "techdocs", "agents-md"):
+            with self.subTest(job=name):
+                self.assertNotIn("needs", jobs[name])
+                self.assertNotIn("if", jobs[name])
+                self.assertNotIn("needs.contract", json.dumps(jobs[name]))
+        for name in ("checks", "render"):
             job = jobs[name]
             with self.subTest(job=name):
                 needs = job.get("needs")
                 self.assertIn("contract", [needs] if isinstance(needs, str) else needs or [])
                 self.assertEqual(job.get("if"), "${{ !cancelled() }}")
-                if "uses" in job:
-                    continue
                 first = job["steps"][0]
                 self.assertEqual(first["name"], "Require the contract job's success")
                 self.assertEqual(first["env"], {"CONTRACT_RESULT": "${{ needs.contract.result }}"})
