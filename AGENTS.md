@@ -33,6 +33,7 @@ shellcheck --severity=warning scripts/*.sh scripts/tests/*.sh
 python3 scripts/tests/schema-api-proxy.test.py  # lab-kubeconform's schema fallback
 bash scripts/tests/validate-kustomize.test.sh  # lab-kubeconform end to end; needs kustomize and kubeconform
 bash scripts/tests/helm-install.test.sh  # install-tools.sh's helm path, against a fake curl
+bash scripts/tests/install-helm.test.sh  # install-helm.sh, wac-cd's pinned Helm install, against a fake curl
 uv run --with pyyaml python scripts/tests/ci-release.test.py  # lab-release's client and the names wac-cd and wac.lab load from it
 python3 scripts/tests/runner-policy.test.py  # actionlint's fleet runner policy
 python3 scripts/tests/lab-route.test.py  # lab-route, against a stub Prometheus
@@ -42,7 +43,7 @@ WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-chart.test.py  # deploy chart pac
 python3 scripts/tests/wacd-release.test.py  # wac-cd's gateway client, against a stub gateway
 uv run --with pyyaml python scripts/tests/wacd-parity.test.py  # kustomize and Helm render parity
 python3 scripts/tests/wacd-tag.test.py  # wac-cd's tag push, against a local bare remote
-python3 scripts/tests/wacd-shadow.test.py  # wac-cd's shadow comparison, against a stub hemi and token endpoint
+WACD_REQUIRE_HELM=1 python3 scripts/tests/wacd-shadow.test.py  # wac-cd's shadow comparison, against a stub hemi and token endpoint; needs helm 3
 bash scripts/tests/agents-md.test.sh  # the agents-md gate, against fixture repos; needs uv and git
 uv run scripts/agents-md.py check  # this file against the fleet contract
 uv run scripts/agents-md.py render  # rewrite this file's tail after a catalog or fleet-rules edit

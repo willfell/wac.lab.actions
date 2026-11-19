@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,13 @@ spec.loader.exec_module(module)
 
 GUARD_RUN = '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
 SHA = "${{ job.workflow_sha }}"
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def guard_step():
@@ -362,13 +370,60 @@ class ReusableWorkflowTests(unittest.TestCase):
             needs = other.get("needs") or []
             with self.subTest(job=name):
                 self.assertNotIn("shadow", [needs] if isinstance(needs, str) else needs)
-        app = job["steps"][0]
+        app = job["steps"][1]
         self.assertTrue(app["uses"].startswith("actions/checkout@"))
         self.assertNotIn("repository", app.get("with") or {})
         self.assertIs((app.get("with") or {}).get("persist-credentials"), False)
         runs = [s["run"] for s in job["steps"] if "wacd-shadow.py" in s.get("run", "")]
         self.assertEqual(runs, ['python3 "$WACD_SCRIPTS"/wacd-shadow.py .github/wacd.json'])
         self.assertTrue((root / "scripts" / "wacd-shadow.py").is_file())
+        steps = job["steps"]
+        shadow_install = 'bash "$WACD_SCRIPTS"/install-helm.sh --max-time 25 --attempts 1'
+        publish_install = 'bash "$WACD_SCRIPTS"/install-helm.sh --max-time 120 --attempts 3'
+        installs = [i for i, st in enumerate(steps) if st.get("run") == shadow_install]
+        compare = [i for i, st in enumerate(steps) if "wacd-shadow.py" in st.get("run", "")]
+        self.assertEqual(len(installs), 1)
+        install = steps[installs[0]]
+        self.assertLess(installs[0], compare[0], "helm is on PATH before the comparison reads it")
+        self.assertNotIn("env", install, "the version and digests live only in install-helm.sh")
+        self.assertEqual(
+            [st for st in jobs["publish"]["steps"] if "install-helm.sh" in st.get("run", "")],
+            [{"name": "Install helm", "shell": "bash", "run": publish_install}],
+            "publish keeps a generous download bound, retries, and no tighter step timeout than before",
+        )
+        for name, other in jobs.items():
+            for st in other["steps"]:
+                if "install-tools.sh" in st.get("run", ""):
+                    with self.subTest(job=name, step=st.get("name")):
+                        self.assertNotIn("helm", st["run"], "wac-cd installs Helm only with install-helm.sh")
+        shadow_py = load_module("wacd_shadow_for_workflow_test", root / "scripts" / "wacd-shadow.py")
+        installer = (root / "scripts" / "install-helm.sh").read_text()
+        self.assertEqual(re.findall(r'^HELM_VERSION="(.+)"$', installer, re.M), ["v3.16.3"])
+        self.assertEqual(shadow_py.HELM_VERSION, "v3.16.3", "the script accepts exactly the version installed")
+        self.assertEqual(install.get("timeout-minutes"), 1, "the smallest bound GitHub accepts")
+        self.assertIs(install.get("continue-on-error"), True, "a failed download must not skip the comparison")
+        stamp = [i for i, st in enumerate(steps) if shadow_py.STAMP_ENV in st.get("run", "")]
+        self.assertEqual(stamp, [0], "the clock starts in the first step, before any checkout can retry")
+        self.assertEqual(
+            steps[0]["run"], f'echo "{shadow_py.STAMP_ENV}=$(date +%s)" >> "$GITHUB_ENV"',
+            "the first step only records the time",
+        )
+        self.assertEqual(
+            shadow_py.BEFORE_STAMP + shadow_py.DEADLINE_SECONDS + shadow_py.SUMMARY_RESERVE,
+            job["timeout-minutes"] * 60,
+            "job set-up before the stamp, the deadline and the reserve for writing the summary add up to the job's bound "
+            "(budget in docs/reference/wac-cd.md)",
+        )
+        self.assertGreaterEqual(shadow_py.SUMMARY_RESERVE, 15)
+        self.assertEqual(
+            sorted((root / "scripts" / "fixtures" / "values-probe").rglob("*")),
+            [
+                root / "scripts" / "fixtures" / "values-probe" / "Chart.yaml",
+                root / "scripts" / "fixtures" / "values-probe" / "templates",
+                root / "scripts" / "fixtures" / "values-probe" / "templates" / "values.json",
+            ],
+            "the probe chart ships no values.yaml: chart defaults would remove a user's explicit null",
+        )
 
     def test_wac_ci_setup_go_takes_the_version_or_the_version_file_from_the_profile(self):
         import yaml

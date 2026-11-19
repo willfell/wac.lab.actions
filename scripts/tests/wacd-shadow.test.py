@@ -1,5 +1,9 @@
 """wacd-shadow compares hemi's copy with the files and never fails or leaks the token.
 
+Helm is the real one where the comparison depends on how it reads YAML, gated
+like wacd-chart.test.py by WACD_REQUIRE_HELM (CI sets it). The failure paths
+use small stand-in executables on a PATH the test controls.
+
 One ThreadingHTTPServer stands in for both the GitHub OIDC token endpoint and
 hemi. In-process scenarios point the script's hemi address and token-endpoint
 check at it with patch.object, the way wacd-release.test.py points ci-release's
@@ -11,10 +15,13 @@ import importlib.util
 import io
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,8 +38,59 @@ REQUEST_BEARER = "runner.request.bearer"
 TOKEN = "minted.job.token"
 PROFILE = {"schema_version": 1, "app": "travel", "values_file": "deploy/values.yaml"}
 VALUES = "image:\n  repository: travel-app\nreplicas: 2\n"
+VALUES_AS_HELM_READS_THEM = {"image": {"repository": "travel-app"}, "replicas": 2}
 SILENT = "hemi did not answer; nothing was compared.\n"
+HELM_UNREAD = "Helm could not read the values; hemi compared its own reading."
+ANSWER_VERSION = 'if [ "$1" = version ]; then echo v3.16.3; exit 0; fi\n'
+
+
+def pinned_helm():
+    helm = shutil.which("helm")
+    if helm is None:
+        return False
+    try:
+        out = subprocess.run(
+            [helm, "version", "--template", "{{.Version}}"],
+            capture_output=True, text=True, timeout=30, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.strip() == shadow.HELM_VERSION
+
+
+NEEDS_HELM = unittest.skipUnless(
+    pinned_helm() or os.environ.get("WACD_REQUIRE_HELM"),
+    f"helm {shadow.HELM_VERSION} is not installed",
+)
+YAML_11_VALUES = """\
+nothing: null
+nested:
+  nothing: null
+list: [null, 1]
+yes_word: yes
+on_word: on
+octal: 010
+base: &base
+  replicas: 2
+derived:
+  <<: *base
+  tier: web
+y: letter
+"""
+YAML_11_AS_HELM_READS_IT = {
+    "nothing": None,
+    "nested": {"nothing": None},
+    "list": [None, 1],
+    "yes_word": True,
+    "on_word": True,
+    "octal": 8,
+    "base": {"replicas": 2},
+    "derived": {"replicas": 2, "tier": "web"},
+    "true": "letter",
+}
 CLOSE = object()
+HANG = object()
+DRIP = object()
 
 
 def contract(revision):
@@ -47,6 +105,7 @@ class Stub:
         self.seen = []
         self.connections = 0
         self.minted = 0
+        self.release = threading.Event()
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -65,6 +124,22 @@ class Stub:
                 if reply is CLOSE:
                     self.close_connection = True
                     self.connection.shutdown(2)
+                    return
+                if reply is HANG:
+                    outer.release.wait(30)
+                    return
+                if reply is DRIP:
+                    self.send_response(200)
+                    self.send_header("Content-Length", "1000000")
+                    self.end_headers()
+                    for _ in range(30):
+                        if outer.release.wait(1):
+                            return
+                        try:
+                            self.wfile.write(b" ")
+                            self.wfile.flush()
+                        except OSError:
+                            return
                     return
                 status, value = reply
                 raw = json.dumps(value).encode()
@@ -96,36 +171,59 @@ class Stub:
         return [s for s in self.seen if s[1] != "/token"]
 
     def close(self):
+        self.release.set()
         self.server.shutdown()
         self.server.server_close()
 
 
-def app_repo(tmp):
-    root = Path(tmp) / "app"
+def app_repo(tmp, values=VALUES, values_file="deploy/values.yaml"):
+    root = Path(tmp).resolve() / "app"
     (root / ".github").mkdir(parents=True)
-    (root / "deploy").mkdir()
-    (root / ".github" / "wacd.json").write_text(json.dumps(PROFILE, indent=2) + "\n")
-    (root / "deploy" / "values.yaml").write_text(VALUES)
+    profile = dict(PROFILE, values_file=values_file)
+    (root / ".github" / "wacd.json").write_text(json.dumps(profile, indent=2) + "\n")
+    if values is not None:
+        target = root / values_file
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(values)
     return root / ".github" / "wacd.json"
 
 
-class ShadowTests(unittest.TestCase):
-    def run_against(self, stub):
-        """Run main() against the stub; return (code, stdout, stderr, summary)."""
+class Harness:
+    def run_against(
+        self, stub, values=VALUES, path=None, helm_timeout=None, helm_version_timeout=None,
+        values_file="deploy/values.yaml", setup=None, extra_env=None, deadline_seconds=None,
+    ):
+        """Run main() against the stub from the app checkout; return (code, stdout, stderr, summary).
+
+        path replaces PATH for the run, so what is installed on the machine does not decide the result.
+        setup(root) runs after the app files are written, to plant links and oversized files.
+        """
         with tempfile.TemporaryDirectory() as tmp:
-            profile = app_repo(tmp)
+            profile = app_repo(tmp, values, values_file)
+            root = profile.parent.parent
+            if setup is not None:
+                setup(root)
             summary = Path(tmp) / "summary.md"
             env = {
                 "ACTIONS_ID_TOKEN_REQUEST_URL": stub.url + "/token?audience=wrong&api-version=2.0",
                 "ACTIONS_ID_TOKEN_REQUEST_TOKEN": REQUEST_BEARER,
                 "GITHUB_STEP_SUMMARY": str(summary),
             }
+            if path is not None:
+                env["PATH"] = str(path)
+            env.update(extra_env or {})
             out, err = io.StringIO(), io.StringIO()
             with (
                 patch.dict(os.environ, env),
                 patch.object(shadow, "URL", stub.url),
                 patch.object(shadow, "TOKEN_SCHEME", "http"),
                 patch.object(shadow, "TOKEN_HOST_SUFFIX", "127.0.0.1"),
+                patch.object(shadow, "DEADLINE_SECONDS", deadline_seconds or shadow.DEADLINE_SECONDS),
+                patch.object(shadow, "HELM_TIMEOUT", helm_timeout or shadow.HELM_TIMEOUT),
+                patch.object(
+                    shadow, "HELM_VERSION_TIMEOUT", helm_version_timeout or shadow.HELM_VERSION_TIMEOUT
+                ),
+                contextlib.chdir(root),
                 contextlib.redirect_stdout(out),
                 contextlib.redirect_stderr(err),
             ):
@@ -134,6 +232,13 @@ class ShadowTests(unittest.TestCase):
         for secret in (REQUEST_BEARER, TOKEN):
             self.assertNotIn(secret, out.getvalue() + err.getvalue() + text)
         return code, out.getvalue(), err.getvalue(), text
+
+    def posted(self, stub):
+        return stub.hemi_requests()[1][4]
+
+
+@NEEDS_HELM
+class ShadowTests(Harness, unittest.TestCase):
 
     def test_an_equal_copy_is_reported_with_its_number(self):
         stub = Stub((200, contract(7)))
@@ -160,7 +265,12 @@ class ShadowTests(unittest.TestCase):
                     "/api/v1/shadow",
                     "",
                     f"Bearer {TOKEN}.2",
-                    {"revision": 7, "profile": PROFILE, "values": VALUES},
+                    {
+                        "revision": 7,
+                        "profile": PROFILE,
+                        "values": VALUES,
+                        "helmValues": VALUES_AS_HELM_READS_THEM,
+                    },
                 ),
             ],
         )
@@ -252,16 +362,390 @@ class ShadowTests(unittest.TestCase):
                     stub.close()
                 self.assertEqual((code, summary), (0, SILENT))
 
+    def test_helm_reading_of_yaml_1_1_forms_is_posted_beside_the_text(self):
+        stub = Stub((200, contract(5)))
+        try:
+            code, _, _, summary = self.run_against(stub, values=YAML_11_VALUES)
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, "hemi's copy matched the files (copy 5).\n"))
+        body = self.posted(stub)
+        self.assertEqual(body["values"], YAML_11_VALUES)
+        self.assertEqual(body["helmValues"], YAML_11_AS_HELM_READS_IT)
+
+    def test_an_empty_or_comment_only_file_posts_an_empty_reading_not_none(self):
+        for label, values in {"empty": "", "comment only": "# nothing set\n"}.items():
+            with self.subTest(label):
+                stub = Stub((200, contract(5)))
+                try:
+                    code, _, _, summary = self.run_against(stub, values=values)
+                finally:
+                    stub.close()
+                self.assertEqual((code, summary), (0, "hemi's copy matched the files (copy 5).\n"))
+                body = self.posted(stub)
+                self.assertIn("helmValues", body)
+                self.assertEqual(body["helmValues"], {})
+
+    def test_values_helm_cannot_parse_are_posted_without_its_reading(self):
+        stub = Stub((200, contract(5)))
+        try:
+            code, _, _, summary = self.run_against(stub, values="a: [unclosed\n")
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, f"hemi's copy matched the files (copy 5).\n{HELM_UNREAD}\n"))
+        self.assertEqual(
+            self.posted(stub),
+            {"revision": 5, "profile": PROFILE, "values": "a: [unclosed\n"},
+        )
+
+
+class HelmStandInTests(Harness, unittest.TestCase):
+    """Helm absent or misbehaving: the files are still posted and the release is untouched."""
+
+    def bin_dir(self, tmp, script=None, answer_version=True):
+        directory = Path(tmp) / "bin"
+        directory.mkdir()
+        if script is not None:
+            helm = directory / "helm"
+            helm.write_text("#!/bin/sh\n" + (ANSWER_VERSION if answer_version else "") + script)
+            helm.chmod(helm.stat().st_mode | stat.S_IXUSR)
+        return directory
+
+    def assert_posts_files_alone(self, stub, result):
+        code, _, _, summary = result
+        self.assertEqual((code, summary), (0, f"hemi's copy matched the files (copy 3).\n{HELM_UNREAD}\n"))
+        self.assertEqual(
+            self.posted(stub), {"revision": 3, "profile": PROFILE, "values": VALUES}
+        )
+
+    def test_no_helm_on_path_posts_the_files_alone(self):
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                result = self.run_against(stub, path=self.bin_dir(tmp))
+        finally:
+            stub.close()
+        self.assert_posts_files_alone(stub, result)
+
+    def test_a_helm_that_is_not_the_pinned_version_is_treated_as_absent(self):
+        cases = {
+            "another version": ('if [ "$1" = version ]; then echo v4.3.1; exit 0; fi\necho \'{"a": 1}\'\n'),
+            "version fails": 'if [ "$1" = version ]; then exit 1; fi\necho \'{"a": 1}\'\n',
+            "version prints nothing": 'if [ "$1" = version ]; then exit 0; fi\necho \'{"a": 1}\'\n',
+        }
+        for label, script in cases.items():
+            with self.subTest(label):
+                stub = Stub((200, contract(3)))
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        result = self.run_against(
+                            stub, path=self.bin_dir(tmp, script, answer_version=False)
+                        )
+                finally:
+                    stub.close()
+                self.assert_posts_files_alone(stub, result)
+
+    def test_a_helm_whose_version_hangs_or_whose_output_is_huge_posts_the_files_alone(self):
+        sleep, head, tr = shutil.which("sleep"), shutil.which("head"), shutil.which("tr")
+        cases = {
+            "version never finishes": (f'if [ "$1" = version ]; then exec {sleep} 30; fi\n', False),
+            "output over the cap": (
+                f"echo '{{\"a\": 1}}'\n{head} -c {shadow.MAX_BODY} /dev/zero | {tr} '\\0' ' '\n",
+                True,
+            ),
+        }
+        for label, (script, answer_version) in cases.items():
+            with self.subTest(label):
+                stub = Stub((200, contract(3)))
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        result = self.run_against(
+                            stub,
+                            path=self.bin_dir(tmp, script, answer_version=answer_version),
+                            helm_version_timeout=1,
+                        )
+                finally:
+                    stub.close()
+                self.assert_posts_files_alone(stub, result)
+
+    def test_helm_is_given_only_a_scratch_copy_of_the_values_whatever_the_repository_names_them(self):
+        for values_file in ("-", "https:/example.invalid/values.yaml", "deploy/values.yaml"):
+            with self.subTest(values_file):
+                stub = Stub((200, contract(3)))
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        record, copy = Path(tmp) / "args", Path(tmp) / "copy"
+                        script = (
+                            f"printf '%s\\n' \"$@\" > '{record}'\n"
+                            f"[ /dev/stdin -ef /dev/null ] && echo devnull >> '{record}'\n"
+                            "p=\n"
+                            f'for a in "$@"; do if [ "$p" = -f ]; then {shutil.which("cp")} "$a" \'{copy}\'; fi; p="$a"; done\n'
+                            "echo '{\"a\": 1}'\n"
+                        )
+                        code, _, _, _ = self.run_against(
+                            stub, path=self.bin_dir(tmp, script), values_file=values_file
+                        )
+                        args = record.read_text().splitlines()
+                        copied = copy.read_text()
+                finally:
+                    stub.close()
+                self.assertEqual(code, 0)
+                self.assertEqual(self.posted(stub)["helmValues"], {"a": 1})
+                given = args[args.index("-f") + 1]
+                self.assertEqual(os.path.basename(given), "values.yaml")
+                self.assertNotIn(",", given)
+                self.assertNotIn(os.sep + "app" + os.sep, given, "no path of the repository's choosing")
+                self.assertEqual(copied, VALUES, "Helm reads exactly the text that was checked and posted")
+                self.assertEqual(args[-1], "devnull", "Helm reads no standard input")
+
+    def test_a_helm_reading_that_would_overfill_the_body_is_left_out(self):
+        script = (
+            f"printf '{{\"a\": \"'\n{shutil.which('head')} -c 150000 /dev/zero | "
+            f"{shutil.which('tr')} '\\0' x\nprintf '\"}}'\n"
+        )
+        values = "#" * 150000
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                code, _, _, summary = self.run_against(
+                    stub, values=values, path=self.bin_dir(tmp, script)
+                )
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, f"hemi's copy matched the files (copy 3).\n{HELM_UNREAD}\n"))
+        self.assertEqual(self.posted(stub), {"revision": 3, "profile": PROFILE, "values": values})
+
+    def test_helm_is_skipped_when_too_little_of_the_deadline_is_left(self):
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ran = Path(tmp) / "ran"
+                script = f"echo ran > '{ran}'\necho '{{\"a\": 1}}'\n"
+                result = self.run_against(
+                    stub,
+                    path=self.bin_dir(tmp, script),
+                    deadline_seconds=shadow.POST_RESERVE + shadow.HELM_VERSION_TIMEOUT - 1,
+                )
+                invoked = ran.exists()
+        finally:
+            stub.close()
+        self.assertFalse(invoked)
+        self.assert_posts_files_alone(stub, result)
+
+    def test_a_helm_that_fails_or_answers_badly_posts_the_files_alone(self):
+        cases = {
+            "exits non-zero": "echo '{}'; exit 1\n",
+            "prints no JSON": "echo not json\n",
+            "prints a JSON list": "echo '[1]'\n",
+            "prints a JSON scalar": "echo '3'\n",
+            "never finishes": f"exec {shutil.which('sleep')} 30\n",
+        }
+        for label, script in cases.items():
+            with self.subTest(label):
+                stub = Stub((200, contract(3)))
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        result = self.run_against(
+                            stub, path=self.bin_dir(tmp, script), helm_timeout=1
+                        )
+                finally:
+                    stub.close()
+                self.assert_posts_files_alone(stub, result)
+
+    def test_helm_runs_without_a_cluster_the_job_token_or_any_helm_state(self):
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                seen, listing = Path(tmp) / "env", Path(tmp) / "listing"
+                ls = shutil.which("ls")
+                script = (
+                    f"{shutil.which('env')} > '{seen}'\n"
+                    'for d in "$HELM_PLUGINS" "$HELM_CACHE_HOME" "$HELM_CONFIG_HOME" "$HELM_DATA_HOME"; do\n'
+                    f"  {ls} -A \"$d\" >> '{listing}' 2>&1\n"
+                    "done\n"
+                    "echo '{\"a\": 1}'\n"
+                )
+                code, _, _, _ = self.run_against(stub, path=self.bin_dir(tmp, script))
+                helm_env = dict(
+                    line.split("=", 1) for line in seen.read_text().splitlines() if "=" in line
+                )
+                empty_dirs = listing.read_text()
+        finally:
+            stub.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.posted(stub)["helmValues"], {"a": 1})
+        self.assertEqual(helm_env["KUBECONFIG"], "/dev/null")
+        self.assertFalse([k for k in helm_env if k.startswith("ACTIONS_") or k == "GITHUB_STEP_SUMMARY"])
+        state = {k: v for k, v in helm_env.items() if k.startswith("HELM_")}
+        self.assertEqual(
+            sorted(state), ["HELM_CACHE_HOME", "HELM_CONFIG_HOME", "HELM_DATA_HOME", "HELM_PLUGINS"]
+        )
+        self.assertEqual(len(set(state.values())), 4)
+        self.assertEqual(empty_dirs.strip(), "", "each Helm directory existed and was empty")
+
+
+class RefusalTests(Harness, unittest.TestCase):
+    """A file the checkout should not be trusted to name is refused before anything is read or sent."""
+
+    def refused(self, line, **kwargs):
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                empty = Path(tmp) / "bin"
+                empty.mkdir()
+                result = self.run_against(stub, path=empty, **kwargs)
+        finally:
+            stub.close()
+        self.assertEqual(result[0], 0)
+        self.assertEqual(result[3], line + "\n")
+        self.assertEqual(stub.seen, [], "no token was minted and nothing was posted")
+
+    def plant(self, *, link=None, directory=None, secret=None):
+        def setup(root):
+            outside = root.parent / "outside"
+            outside.mkdir()
+            (outside / "environ").write_text(secret or "SECRET=1\n")
+            if link:
+                target = root / link
+                target.unlink()
+                target.symlink_to(outside / "environ")
+            if directory:
+                shutil.rmtree(root / directory)
+                (root / directory).symlink_to(outside, target_is_directory=True)
+                (outside / "values.yaml").write_text(VALUES)
+
+        return setup
+
+    def test_a_symlinked_values_file_is_refused(self):
+        self.refused(
+            "the values file is a symbolic link or sits behind one; nothing was compared.",
+            setup=self.plant(link="deploy/values.yaml"),
+        )
+
+    def test_a_values_file_behind_a_symlinked_directory_is_refused(self):
+        self.refused(
+            "the values file is a symbolic link or sits behind one; nothing was compared.",
+            setup=self.plant(directory="deploy"),
+        )
+
+    def test_a_symlinked_profile_is_refused(self):
+        self.refused(
+            ".github/wacd.json is a symbolic link or sits behind one; nothing was compared.",
+            setup=self.plant(link=".github/wacd.json"),
+        )
+
+    def test_a_values_path_that_leaves_the_checkout_is_refused(self):
+        outside = "the values file lies outside the repository checkout; nothing was compared."
+        for values_file in ("../outside.yaml", "deploy/../../outside.yaml", "/etc/hosts"):
+            with self.subTest(values_file):
+                self.refused(outside, values_file=values_file, values=None)
+
+    def test_a_values_path_with_a_comma_is_refused(self):
+        self.refused(
+            "the values file path contains a comma; nothing was compared.",
+            values_file="deploy/x,outside/y.yaml",
+        )
+
+    def test_a_file_over_what_hemi_accepts_is_refused_whole_or_together(self):
+        self.refused(
+            f"the values file is larger than {shadow.MAX_BODY // 1024} KiB; nothing was compared.",
+            values="#" * (shadow.MAX_BODY + 1),
+        )
+        overhead = len(
+            json.dumps({"revision": 2**31 - 1, "profile": PROFILE, "values": ""}).encode()
+        )
+        self.refused(
+            f"the profile and values together are larger than hemi accepts ({shadow.MAX_BODY // 1024} KiB); "
+            "nothing was compared.",
+            values="#" * (shadow.MAX_BODY - overhead + 1),
+        )
+        fits = "#" * (shadow.MAX_BODY - overhead)
+        stub = Stub((200, contract(3)))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                empty = Path(tmp) / "bin"
+                empty.mkdir()
+                code, _, _, summary = self.run_against(stub, values=fits, path=empty)
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, f"hemi's copy matched the files (copy 3).\n{HELM_UNREAD}\n"))
+        self.assertEqual(self.posted(stub)["values"], fits)
+        self.assertLessEqual(len(json.dumps(self.posted(stub)).encode()), shadow.MAX_BODY)
+
+
+class DeadlineTests(Harness, unittest.TestCase):
+    """The summary is written by the deadline however hemi or GitHub misbehave."""
+
+    def run_late(self, stub, seconds=2, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "bin"
+            empty.mkdir()
+            started = time.monotonic()
+            result = self.run_against(stub, path=empty, deadline_seconds=seconds, **kwargs)
+        return result, time.monotonic() - started
+
+    def test_a_reply_that_trickles_in_ends_at_the_deadline_with_the_summary_written(self):
+        stub = Stub(DRIP)
+        try:
+            (code, _, _, summary), elapsed = self.run_late(stub)
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, SILENT))
+        self.assertGreaterEqual(elapsed, 1.5, "it waited for the deadline, not for a socket timeout")
+        self.assertLess(elapsed, shadow.TIMEOUT, "a one-byte-a-second reply never trips a socket timeout")
+
+    def test_a_server_that_never_answers_ends_at_the_deadline_with_the_summary_written(self):
+        stub = Stub(HANG)
+        try:
+            (code, _, _, summary), elapsed = self.run_late(stub)
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, SILENT))
+        self.assertLess(elapsed, shadow.TIMEOUT)
+
+    def test_the_workflow_stamp_sets_the_deadline(self):
+        stub = Stub(HANG)
+        stamp = str(time.time() - (shadow.DEADLINE_SECONDS - 2))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                empty = Path(tmp) / "bin"
+                empty.mkdir()
+                started = time.monotonic()
+                code, _, _, summary = self.run_against(
+                    stub, path=empty, extra_env={shadow.STAMP_ENV: stamp}
+                )
+                elapsed = time.monotonic() - started
+        finally:
+            stub.close()
+        self.assertEqual((code, summary), (0, SILENT))
+        self.assertLess(elapsed, shadow.TIMEOUT)
+
+    def test_the_deadline_comes_from_the_stamp_or_else_from_the_script_start(self):
+        now = 1_000_000.0
+        d = shadow.DEADLINE_SECONDS
+        cases = {
+            "a recent stamp": ({shadow.STAMP_ENV: str(now - 10)}, now - 10 + d),
+            "a stamp just written": ({shadow.STAMP_ENV: str(now)}, now + d),
+            "absent": ({}, now + d),
+            "not a number": ({shadow.STAMP_ENV: "soon"}, now + d),
+            "not finite": ({shadow.STAMP_ENV: "nan"}, now + d),
+            "in the future": ({shadow.STAMP_ENV: str(now + 50)}, now + d),
+            "older than the job can be": ({shadow.STAMP_ENV: str(now - shadow.JOB_SECONDS - 1)}, now + d),
+        }
+        for label, (environ, expected) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(shadow.deadline_from(environ, now), expected)
+
 
 class CommandLineTests(unittest.TestCase):
-    def run_cli(self, profile, token_env):
+    def run_cli(self, profile, token_env, cwd):
         with tempfile.TemporaryDirectory() as tmp:
             summary = Path(tmp) / "summary.md"
             env = {k: v for k, v in os.environ.items() if not k.startswith("ACTIONS_")}
             env.update(token_env, GITHUB_STEP_SUMMARY=str(summary))
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), str(profile)],
-                capture_output=True, text=True, env=env, timeout=60,
+                capture_output=True, text=True, env=env, timeout=60, cwd=cwd,
             )
             text = summary.read_text()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -287,14 +771,15 @@ class CommandLineTests(unittest.TestCase):
                 }
                 for label, token_env in cases.items():
                     with self.subTest(label):
-                        self.assertEqual(self.run_cli(profile, token_env), SILENT)
+                        self.assertEqual(self.run_cli(profile, token_env, profile.parent.parent), SILENT)
         finally:
             stub.close()
         self.assertEqual(stub.connections, 0)
 
     def test_an_unreadable_profile_still_exits_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(self.run_cli(Path(tmp) / "absent.json", {}), SILENT)
+            root = Path(tmp).resolve()
+            self.assertEqual(self.run_cli(root / "absent.json", {}, root), SILENT)
 
 
 if __name__ == "__main__":

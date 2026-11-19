@@ -175,25 +175,108 @@ the artifact `wac-cd-release-<version>`. Last, `health_url` must serve the
 expected source SHA (and `db: ok`, unless `health_expect_db_ok` is `false`)
 within a fixed 300 seconds.
 
+**Installing Helm.** `publish` and `shadow` both run `scripts/install-helm.sh`,
+the one way wac-cd installs Helm (`install-tools.sh` still installs `crane` for
+`build`). It downloads exactly
+`https://get.helm.sh/helm-v3.16.3-linux-<arch>.tar.gz` for amd64 or arm64 with
+`curl --proto '=https' --proto-redir '=https' --tlsv1.2`, checks it with `sha256sum -c` against the two
+digests committed in the script beside the version, extracts only
+`linux-<arch>/helm` into `$RUNNER_TEMP/bin` and appends that directory to
+`GITHUB_PATH`. A failed or partial download is deleted, and every attempt must
+pass the digest check. Two arguments set the bound: `--max-time <seconds>` for
+one attempt (default 120) and `--attempts <n>` (default 3, five seconds apart).
+`publish` passes `--max-time 120 --attempts 3`, so a slow fetch of the roughly
+16 MB tarball cannot fail a release that a retry would save; `shadow` passes
+`--max-time 25 --attempts 1`. A digest mismatch, no good download or an unknown
+architecture exits non-zero and installs nothing. It never runs a fetched
+script: the upstream `get-helm-3` installer that `install-tools.sh` uses runs
+code from `helm/helm` `main` before any checksum is checked, and `shadow` holds
+`id-token: write`, so the GitHub token request URL and bearer are in the
+environment of every step it runs. The install stays in that job, with the
+tarball pinned, because a separate job without the permission that passed the
+binary on as an artifact would cost a fleet runner per release.
+
 **Shadow.** In every mode but `none`, the `shadow` job asks hemi whether its
 stored copy of the app's configuration matches the files. It mints a GitHub
 OIDC job token with audience `wacwini:hemi` for each request, reads
 `GET http://hemi-app.hemi.svc.cluster.local:3000/api/v1/contract` for the copy
-number (`identity.revision`), then posts `{"revision", "profile", "values"}`
-to `/api/v1/shadow`: the copy number, `.github/wacd.json` parsed as JSON, and the text of the values
-file the profile names. Each request has a 10-second timeout, no proxy and no
-redirects. The job summary gets one line, `hemi's copy matched the files
-(copy <n>).` or `hemi's copy differs from the files in <k> places (copy <n>).`
-(`in 1 place` for a single difference) followed by one line per difference, or `hemi did not answer; nothing was
-compared.` for any other status, a timeout, a dropped connection or a missing
-token. It is observation only: the files stay the truth and nothing acts on the
-answer. The job is `continue-on-error`, no other job lists it in `needs`, and
-`scripts/wacd-shadow.py` exits 0 on every path, so a hemi outage never fails or
-delays a release. The job is bounded at two minutes, because the run holds its
-concurrency group until every job ends and the next queued release waits for
-it. It asks for `contents: read` and `id-token: write`, which the calling job
-already grants. Neither token is ever printed: every token it minted is
-replaced with `[token]` in any line it writes, even one hemi echoed back.
+number (`identity.revision`), then posts `{"revision", "profile", "values"}` and,
+when Helm could read the file, `"helmValues"` to `/api/v1/shadow`: the copy
+number, `.github/wacd.json` parsed as JSON, the text of the values file the
+profile names, and `helmValues`, Helm's own reading of that file. YAML 1.1,
+which Helm uses, reads `yes` and `on` as true, `010` as 8 and a key written `y`
+as the string `true`, and applies `<<` merges; hemi reads the same text as
+YAML 1.2, so with `helmValues` hemi compares JSON with JSON.
+
+The script reads only regular files inside the repository checkout (the working
+directory). A `.github/wacd.json` or values file that is a symbolic link, sits
+behind one, lies outside the checkout (`..`, an absolute path) or is not a
+regular file is refused, and so is a values path containing a comma (Helm
+splits `-f` on commas). So is a file over 256 KiB, and a profile and values
+that together would make a request body over 256 KiB, which is the limit of
+hemi's shadow route. A refusal skips the whole comparison, mints no token,
+posts nothing and writes its own summary line, for example `the values file is
+a symbolic link or sits behind one; nothing was compared.`, `the values file
+lies outside the repository checkout; nothing was compared.`, `the values file
+path contains a comma; nothing was compared.` or `the values file is larger
+than 256 KiB; nothing was compared.`
+
+The script uses Helm only when `helm version --template '{{.Version}}'` prints
+exactly `v3.16.3` (any other Helm, such as one the runner image ships, is
+treated as absent). Helm is never given a path the repository chose: the bytes
+the script read and checked are written to `values.yaml` in a scratch directory
+and only that file is passed, as `helm template probe
+scripts/fixtures/values-probe -f <scratch>/values.yaml --show-only
+templates/values.json`. Helm runs with no standard input, no cluster
+(`KUBECONFIG=/dev/null`), none of the job's token variables, and empty throwaway
+`HELM_PLUGINS`, `HELM_CACHE_HOME`, `HELM_CONFIG_HOME` and `HELM_DATA_HOME`
+directories, and its output is read to at most 256 KiB. The probe chart's only
+template is `{{ toJson .Values }}` and it ships no `values.yaml`, because with
+chart defaults Helm removes a key the user set to null and without them it keeps
+every null where it was written. If Helm is absent, is another version, fails,
+times out, is skipped for lack of time, or prints more than 256 KiB or anything
+but a JSON object, or if its reading would push the request body over 256 KiB,
+the body carries no `helmValues` and the summary ends with `Helm could not read
+the values; hemi compared its own reading.`
+
+Each socket operation of a request has a 5-second timeout, there is no proxy and there are no redirects. The job summary
+gets one line, `hemi's copy matched the files (copy <n>).` or `hemi's copy
+differs from the files in <k> places (copy <n>).` (`in 1 place` for a single
+difference) followed by one line per difference, or `hemi did not answer;
+nothing was compared.` for any other status, a timeout, a dropped connection or
+a missing token. It is observation only: the files stay the truth and nothing
+acts on the answer. The job is `continue-on-error`, no other job lists it in
+`needs`, and `scripts/wacd-shadow.py` exits 0 on every path, so a hemi outage
+never fails or delays a release. It asks for `contents: read` and
+`id-token: write`, which the calling job already grants. Neither token is ever
+printed: every token it minted is replaced with `[token]` in any line it
+writes, even one hemi echoed back.
+
+The job is bounded at two minutes, because the run holds its concurrency group
+until every job ends and the next queued release waits for it. The summary has
+to be written inside that bound, and a socket timeout cannot promise that: it
+applies to each operation, not to a DNS lookup, and not to a reply that trickles
+in. So the exchange has one deadline. The job's first step records
+`WACD_SHADOW_STARTED`, the time in epoch seconds, before any checkout (which
+sleeps 10 to 20 seconds before a retry), and the script ends the exchange 95
+seconds after it (after the script's own start if the stamp is absent, not a
+number, in the future or older than the job). In seconds:
+
+| Part | Seconds |
+| --- | --- |
+| "Set up job" before the stamp, assumed at most | 10 |
+| deadline after the stamp, shared by both checkouts, `setup-python`, the install step and the script | 95 |
+| reserve for writing the summary | 15 |
+| total | 120 |
+
+The install step (`--max-time 25 --attempts 1`, `timeout-minutes: 1` as a kill
+switch) only uses up part of the 95. Helm gets what is left minus 10 seconds
+kept for the exchange, each call limited to its own 5 or 10 seconds, and is
+skipped as unread when under 5 seconds are left. The token mints and the
+exchange with hemi run in a worker thread that is joined against what is left;
+when the deadline passes the summary says `hemi did not answer; nothing was
+compared.` and the script exits 0. `.github/scripts/test_reusable_workflows.py`
+checks that the three parts add up to the job's bound.
 
 ## Where releases live
 
