@@ -313,11 +313,15 @@ skips the fleet checks and is not recorded again, and the Application is
 patched only when it is not already synced at that digest. A second loss
 fails with `The gateway dropped the release of <version> after it was sent,
 twice, and its status does not show <version> targeted, so the release
-stopped; run the deploy again.` A lost release whose status then cannot be
-read (every read a 503 or unanswered) until `wait_timeout` ends fails with
+stopped; run the deploy again.` A lost release whose status reads then
+answer 503 until `wait_timeout` ends (unanswered reads among them only when
+each run of them was answered again within the restart window) fails with
 `The gateway dropped the release of <version> after it was sent, and its
 status could not be read before the deadline, so whether it acted is unknown;
-run the deploy again.`, never sending it again blind. The settings plan's
+run the deploy again.`, never sending it again blind. Status reads that go
+unanswered for the whole restart window, or until `wait_timeout` ends, fail
+instead with the could-not-be-reached sentence above, `The gateway could not
+be reached for <n> s, ...`. The settings plan's
 status read in `plan` (`Plan the settings release`) does not ride out a
 restart: a refused connection there fails the step as a transport fault, as
 in `v1.35.0`. A certificate that fails verification and

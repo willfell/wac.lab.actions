@@ -1059,6 +1059,12 @@ class PullRequestDecisionTests(PullRequestCase):
                     self.assertFails(self.run_pr((403, {"error": "not registered"}), main={}, head=head),
                                      NOT_REGISTERED)
                     self.assertEqual(len(self.hemi.seen), 1, "a refusal is not asked again")
+        self.event = "pull_request"
+        for label, body in (("whitespace", b' {\n  "error" : "not registered"\n} '),
+                            ("an escaped letter", b'{"error": "not \\u0072egistered"}')):
+            with self.subTest(body=label):
+                self.summary.unlink(missing_ok=True)
+                self.assertFails(self.run_pr((403, body), main={}, head={}), NOT_REGISTERED)
 
     def test_any_other_403_body_reads_as_an_uncoded_refusal(self):
         """The body is parsed defensively and bounded: anything but hemi's exact code is the generic sentence."""
@@ -1072,7 +1078,15 @@ class PullRequestDecisionTests(PullRequestCase):
             ("the code under another key", (403, {"reason": "not registered"})),
             ("past the bound", (403, oversized)),
             ("deeply nested", (403, b"[" * 4000)),
-            ("not UTF-8", (403, b"\xff\xfe")),
+            ("not UTF-8", (403, b'{"error": "not registered\xff"}')),
+            ("UTF-16 with its BOM", (403, '{"error": "not registered"}'.encode("utf-16"))),
+            ("UTF-16 without a BOM", (403, '{"error": "not registered"}'.encode("utf-16-le"))),
+            ("UTF-32", (403, '{"error": "not registered"}'.encode("utf-32"))),
+            ("UTF-8 with a BOM", (403, b'\xef\xbb\xbf{"error": "not registered"}')),
+            ("an extra key", (403, {"error": "not registered", "detail": "x"})),
+            ("a duplicate key ending in the code", (403, b'{"error": "forbidden", "error": "not registered"}')),
+            ("a duplicate key of the code", (403, b'{"error": "not registered", "error": "not registered"}')),
+            ("the code as a list", (403, {"error": ["not registered"]})),
             ("the code on a 401", (401, {"error": "not registered"})),
         ):
             with self.subTest(body=label):

@@ -87,11 +87,15 @@ FAKE
 chmod +x "$workdir/tools/"*
 export TEST_STATE="$workdir"
 
-# The runs see no aws of this machine's unless a case puts one first.
-clean_path=""
-IFS=: read -ra entries <<<"$PATH"
-for entry in "${entries[@]}"; do
-  if [ -n "$entry" ] && [ ! -e "$entry/aws" ]; then clean_path="${clean_path:+$clean_path:}$entry"; fi
+# The runs see the fake curl and uname first, then a case's own directory
+# (first_path), then only the tools the installer and its stand-ins run,
+# linked one by one from this machine. No system directory is on their PATH,
+# so none can shadow a fake, none drops bash for holding an aws, and no aws of
+# this machine's is found unless a case puts its directory in first_path.
+mkdir -p "$workdir/sysbin"
+for tool in bash sh env dirname find readlink mktemp rm mkdir cp chmod cat touch sed grep sha256sum gpgv base64 unzip; do
+  found="$(command -v "$tool")" || { echo "FAIL: this machine has no $tool, which the installer runs" >&2; exit 1; }
+  ln -s "$found" "$workdir/sysbin/$tool"
 done
 first_path=""
 
@@ -102,7 +106,7 @@ run() {
   : >"$workdir/requests"
   status=0
   TEST_MODE="$mode" TEST_ZIP="$zip" TEST_SIG="$sig" TEST_UNAME="$machine" \
-    PATH="${first_path:+$first_path:}$workdir/tools:$clean_path" RUNNER_TEMP="$workdir/$name" GITHUB_PATH="$workdir/$name/github-path" \
+    PATH="$workdir/tools:${first_path:+$first_path:}$workdir/sysbin" RUNNER_TEMP="$workdir/$name" GITHUB_PATH="$workdir/$name/github-path" \
     bash "$workdir/copy/install-awscli.sh" >"$workdir/$name/result" 2>&1 || status=$?
 }
 nothing_ran() {

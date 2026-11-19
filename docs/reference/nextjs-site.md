@@ -115,8 +115,15 @@ Each token job runs `scripts/install-awscli.sh` before it assumes the role.
 It uses the runner's own `aws` only when the `aws` on `PATH` is
 `/usr/bin/aws` or `/usr/local/bin/aws` and that directory, the file it
 resolves to and that file's directory are all owned by root (uid 0) and
-neither group- nor world-writable, so the job's user could not have put it
-there. Any other `aws` is never run: the script says it is not used and
+neither group- nor world-writable. Those three paths are all it checks: not
+their parent directories, not the directory of a link between the two, and
+not what the CLI loads at run time, and the later steps find `aws` by `PATH`
+again. Root ownership keeps out an `aws` planted by a build without root, but
+the job's user may have sudo (it does on GitHub's hosted runners and the
+fleet's pools; `build`'s own fallback runs `sudo apt-get`), and a build with
+sudo can put a root-owned `aws` there. So the check is not what keeps a
+build's files out of a token job: the fresh runner each job starts on is
+(below). Any other `aws` is never run: the script says it is not used and
 installs AWS CLI 2.39.4 under `$RUNNER_TEMP` (no sudo), first on `PATH` for
 the later steps: it downloads AWS's per-architecture zip and its `.sig`, and runs
 nothing from it until the zip matches the sha256 committed in the script and
@@ -130,10 +137,11 @@ which fails on any other values.
 
 The split assumes each job starts on a fresh runner, as the fleet's
 ephemeral pools and GitHub's hosted runners give. On a runner reused between
-jobs, `build`, which runs the site's code, could leave files for a later
-token job to run; the `aws` rule above closes that path for the one tool the
-token jobs would otherwise take from the runner as they found it, and nothing
-else does, so never pass a persistent runner as `runner`.
+jobs, `build`, which runs the site's code with a user that may have sudo,
+could leave files for a later token job to run, a root-owned `aws` among
+them, and nothing here would catch it; the `aws` rule above stops only a
+build without root. That assumption is the defence, so never pass a
+persistent runner as `runner`.
 
 The three jobs each take a runner from `runner` (or the caller's
 `CI_RUNNER_SMALL`), so a deploy now holds three runner slots in turn rather

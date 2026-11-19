@@ -3,8 +3,10 @@
 # deploy role. A runner's own aws is used only when the aws on PATH is
 # /usr/bin/aws or /usr/local/bin/aws and that directory, the file it resolves
 # to and that file's directory are all owned by root and neither group- nor
-# world-writable, so the job's user could not have put it there (an aws a
-# site's build left on a reused runner must never run with the role).
+# world-writable, so a build without root could not have put it there. Those
+# three paths are all it checks, and the job's user may have sudo, so an aws
+# a site's build left on a reused runner is kept out by the fresh runner each
+# job starts on, not by this check.
 # Otherwise it installs the one pinned AWS CLI v2 from AWS's zip, checked
 # against a sha256 committed here and AWS's signature by the key committed
 # beside this script, before anything in it runs.

@@ -125,12 +125,15 @@ by name**, one of:
 - its first segment is literally `docs`, `doc` or `documentation`, whatever
   follows: `docs/**`, `doc/api/*`;
 - an exact path, with no `*`, that is `mkdocs.yml` at the root or ends in
-  `.md`, `.mdx`, `.rst`, `.txt` or `.adoc`: `README.md`, `guides/intro.rst`;
-- a last segment `*.md`, `*.mdx`, `*.rst`, `*.txt` or `*.adoc` below segments
+  `.md`, `.mdx`, `.rst` or `.adoc`: `README.md`, `guides/intro.rst`;
+- a last segment `*.md`, `*.mdx`, `*.rst` or `*.adoc` below segments
   that are literal or `**`: `*.md`, `**/*.md`, `guides/*.adoc`.
 
 Everything else is refused, `**`, `*`, `src/**`, `*.json`, `*.MD` and
-`guides*/*.md` included. It is also refused when it matches a path the checks
+`guides*/*.md` included. `.txt` is not a documentation extension, so
+`*.txt`, `**/*.txt` and `requirements.txt` are refused too: a `.txt` file is
+as often a dependency list (`requirements.txt`), a build file
+(`CMakeLists.txt`) or content the app serves (`public/robots.txt`). It is also refused when it matches a path the checks
 or the release read, in this order: `.github/wacd.json`; the values file;
 each image's `dockerfile`; `package.json`, `package-lock.json`, `go.mod` and
 `go.sum` at the root and in each image's `context`; and every path-like token
@@ -155,7 +158,7 @@ Each refusal is one sentence, `<field>: <message>`, where the field is
 | an entry that is not a string, or empty | `ci.docs_paths[<i>]: must be a non-empty string` |
 | a leading `/` or `./`, a `..` or empty segment, a trailing `/`, a backslash, or any character but letters, digits and `. _ - / *` | `ci.docs_paths[<i>]: '<pattern>' must be a path relative to the repository root, using only letters, digits and . _ - / *, with no empty, . or .. segment` |
 | `**` inside a segment (`docs/**.md`, `***`) | `ci.docs_paths[<i>]: '<pattern>' may use ** only as a whole segment` |
-| a pattern that could match code | `ci.docs_paths[<i>]: '<pattern>' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments` |
+| a pattern that could match code | `ci.docs_paths[<i>]: '<pattern>' could match a file that is not documentation; a pattern must start with docs/, doc/ or documentation/, name one .md, .mdx, .rst or .adoc file or mkdocs.yml, or end in *.md, *.mdx, *.rst or *.adoc below literal or ** segments` |
 | a pattern that matches a protected path | `ci.docs_paths[<i>]: '<pattern>' matches <path>, which the checks or the release read, so it is not documentation` |
 | a default pattern that matches a protected path | `ci.docs_paths: the default pattern '<pattern>' matches <path>, which the checks or the release read; set ci.docs_paths without it` |
 

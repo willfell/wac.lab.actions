@@ -99,8 +99,9 @@ never cut over with `version`, `identity.repositoryId`, `identity.repository`,
 repository than the token's or does not derive a profile is treated as an
 answer but a 200, and so is a job with no `id-token` grant. A 403's body is
 read only to tell hemi's `{"error":"not registered"}` apart, at most
-MAX_REFUSAL_BODY bytes; a longer body, or one that is not that JSON, reads as
-any other 403.
+MAX_REFUSAL_BODY bytes, and only exactly that: UTF-8 with no BOM, one object
+whose one key is `error` and whose value is that string, no key twice. A
+longer body, or any other, reads as any other 403.
 No answer (a connection closed or reset after the request, or an answer
 shorter than its Content-Length), a 5xx and an address that does not resolve are asked again, PR_ATTEMPTS times in all, PR_BACKOFF
 apart; each attempt, token mint included, is bounded at PR_ATTEMPT_SECONDS by
@@ -625,19 +626,35 @@ def hemi_attempt():
     return response.status, raw, token
 
 
-def not_registered(raw):
-    """True only when a 403's body is hemi's {"error": "not registered"}.
+class DuplicateKey(ValueError):
+    """A JSON object names one key twice."""
 
-    The body is the server's and is never printed; anything longer than
-    MAX_REFUSAL_BODY, not JSON, or any other shape reads as an uncoded 403.
+
+def unique_keys(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise DuplicateKey("duplicate key")
+    return dict(pairs)
+
+
+def not_registered(raw):
+    """True only when a 403's body is exactly hemi's {"error": "not registered"}.
+
+    The body must be UTF-8 with no BOM and decode to a JSON object with one
+    key, `error`, whose value is the string NOT_REGISTERED; whitespace and
+    escapes that decode to the same text are the same body. A duplicate key,
+    another key, another encoding (json.loads would guess UTF-16 or UTF-32
+    from bytes, so the bytes are decoded here first), anything longer than
+    MAX_REFUSAL_BODY, or any other shape reads as an uncoded 403. The body is
+    the server's and is never printed.
     """
     if not isinstance(raw, bytes) or len(raw) > MAX_REFUSAL_BODY:
         return False
     try:
-        body = json.loads(raw)
+        body = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_keys)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return False
-    return isinstance(body, dict) and body.get("error") == NOT_REGISTERED
+    return type(body) is dict and body == {"error": NOT_REGISTERED}
 
 
 def bounded_attempt():

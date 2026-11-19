@@ -20,7 +20,9 @@ A pattern is accepted only when every path it can match is documentation by
 name: its first segment is literally `docs`, `doc` or `documentation`; or it
 is an exact path (no `*`) that is `mkdocs.yml` or ends in one of
 DOC_EXTENSIONS; or its last segment is `*.<ext>` with ext one of
-DOC_EXTENSIONS and every earlier segment literal or `**`. It is also refused
+DOC_EXTENSIONS and every earlier segment literal or `**`. `.txt` is not one:
+`requirements.txt`, `CMakeLists.txt` and a served `robots.txt` are code or
+content the release ships. It is also refused
 when it matches a path the checks or the release read (protected_paths()).
 
 `match <pattern> <path>` checks the pattern's grammar and prints `match=true`
@@ -73,7 +75,7 @@ from pathlib import Path
 
 DEFAULT = ("docs/**", "mkdocs.yml", "*.md")
 DOC_DIRS = ("docs", "doc", "documentation")
-DOC_EXTENSIONS = ("md", "mdx", "rst", "txt", "adoc")
+DOC_EXTENSIONS = ("md", "mdx", "rst", "adoc")
 ALLOWED = re.compile(r"[A-Za-z0-9._*/-]+")
 PACKAGE_FILES = ("package.json", "package-lock.json", "go.mod", "go.sum")
 PROFILE_FILE = ".github/wacd.json"
@@ -161,8 +163,8 @@ def is_documentation(pattern):
 def check_documentation(pattern, path):
     if not is_documentation(pattern):
         fail(path, f"{pattern!r} could match a file that is not documentation; a pattern must start with "
-             "docs/, doc/ or documentation/, name one .md, .mdx, .rst, .txt or .adoc file or mkdocs.yml, "
-             "or end in *.md, *.mdx, *.rst, *.txt or *.adoc below literal or ** segments")
+             "docs/, doc/ or documentation/, name one .md, .mdx, .rst or .adoc file or mkdocs.yml, "
+             "or end in *.md, *.mdx, *.rst or *.adoc below literal or ** segments")
 
 
 def segment_matches(pattern, segment):
