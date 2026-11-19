@@ -217,12 +217,12 @@ module the scripts these jobs run import (`ssl`, `json`, `http.client`,
 test), and names the first one it cannot import together with the runner, the
 `python3` path and the version, instead of failing later inside the gateway
 call.
-`.github/scripts/test_reusable_workflows.py` holds every job of `wac-cd` and
-`wac-ci`, and every job holding a write permission in a workflow they call, to
-an allowlist of actions pinned by full commit SHA, one commit per action, each
+`.github/scripts/test_reusable_workflows.py` holds every job of every reusable
+workflow here, and every job anywhere that holds `id-token: write`, to an
+allowlist of actions pinned by full commit SHA, one commit per action, each
 recorded with the release tag it was resolved from and named with that tag in
-its step. A job that holds `id-token: write` may use only the checkout and
-artifact actions on that list, exempts none, and is refused a step that runs
+its step. A job of `wac-cd` or `wac-ci` that holds `id-token: write` may use
+only the checkout and artifact actions on that list, exempts none, and is refused a step that runs
 `install-tools.sh`, `pip`, `npm`, `npx`, `uvx`, `curl` piped to a shell, or
 `get-helm`. `install-helm.sh` is allowed: it checks a committed digest before
 it runs anything.

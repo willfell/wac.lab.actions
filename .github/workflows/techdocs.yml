@@ -18,7 +18,8 @@ jobs:
     outputs:
       mkdocs: ${{ steps.probe.outputs.mkdocs }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the repository (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - id: probe
         run: |
           set -euo pipefail
@@ -35,21 +36,25 @@ jobs:
     runs-on: ${{ inputs.runner || vars.CI_RUNNER_SMALL }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the repository (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Require the defining workflow commit
         env:
           SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@v4
+      - name: Check out the shared scripts (actions/checkout v7.0.1)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: willfell/wac.lab.actions
           ref: ${{ job.workflow_sha }}
           path: .techdocs-gate
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - name: Set up Python (actions/setup-python v7.1.0)
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: "3.12"
-      - uses: astral-sh/setup-uv@v5
+      - name: Set up uv (astral-sh/setup-uv v10.3.3)
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
       - name: Nav matches the fleet category standard
         run: bash .techdocs-gate/scripts/check-docs-nav.sh mkdocs.yml
       - name: Strict TechDocs build

@@ -15,7 +15,7 @@ spec.loader.exec_module(module)
 
 GUARD_RUN = '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
 
-# Every action wac-ci and wac-cd use, pinned by commit with the release tag the
+# Every action a reusable workflow here uses, pinned by commit with the release tag the
 # commit was resolved from; the step that uses one says "<action> <tag>" in its
 # name. A tag can be moved, so a job holding a write token (or able to mint one)
 # would otherwise run whatever the tag points at today. One commit per action,
@@ -28,6 +28,8 @@ PINNED_ACTIONS = {
     "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1": "v7.1.0",
     "actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5": "v7.1.0",
     "astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2": "v10.3.3",
+    "raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7": "v2.2.0",
+    "aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd": "v6.3.0",
 }
 # A GitHub OIDC token does not say which step minted it, so any code that runs
 # in a job holding id-token: write can mint a gateway token. Such a job may use
@@ -86,15 +88,10 @@ def holds_id_token(doc, job):
     return isinstance(permissions, dict) and permissions.get("id-token") == "write"
 
 
-def holds_write(doc, job, inherited=None):
-    """Whether a job holds any write permission: its own, else its workflow's, else its caller's."""
+def holds_write(doc, job):
+    """Whether a job holds any write permission, its own or else its workflow's."""
     job = job or {}
-    if "permissions" in job:
-        permissions = job["permissions"]
-    elif "permissions" in doc:
-        permissions = doc["permissions"]
-    else:
-        permissions = inherited
+    permissions = job["permissions"] if "permissions" in job else doc.get("permissions")
     if permissions == "write-all":
         return True
     return isinstance(permissions, dict) and "write" in permissions.values()
@@ -748,36 +745,32 @@ class ReusableWorkflowTests(unittest.TestCase):
         self.assertTrue(holds_id_token({}, {"permissions": "write-all"}))
 
     def test_jobs_run_only_commit_pinned_allowlisted_actions(self):
-        """Every job of wac-ci and wac-cd, and every job holding a write permission in a workflow they call."""
+        """Every job of every reusable workflow, and every job anywhere that holds id-token: write."""
         import yaml
 
         root = Path(__file__).resolve().parents[1] / "workflows"
-        writers, nested = [], []
-        for name in ("wac-cd.yml", "wac-ci.yml"):
-            doc = yaml.safe_load((root / name).read_text())
+        reusable, writers, id_token = [], [], []
+        for path in sorted(root.glob("*.yml")):
+            doc = yaml.safe_load(path.read_text())
+            is_reusable = module._is_reusable(doc)
+            if is_reusable:
+                reusable.append(path.name)
             for job_name, job in doc["jobs"].items():
                 if holds_write(doc, job):
-                    writers.append((name, job_name))
-                if "uses" not in job:
-                    with self.subTest(workflow=name, job=job_name):
-                        self.assertEqual(pinned_action_problems(job_name, job), [])
+                    writers.append((path.name, job_name))
+                if holds_id_token(doc, job):
+                    id_token.append((path.name, job_name))
+                if not is_reusable and not holds_id_token(doc, job):
                     continue
-                called = job["uses"]
-                self.assertTrue(called.startswith("./.github/workflows/"), called)
-                callee = yaml.safe_load((root / Path(called).name).read_text())
-                inherited = job.get("permissions", doc.get("permissions"))
-                nested.append(Path(called).name)
-                for inner_name, inner in callee["jobs"].items():
-                    if not holds_write(callee, inner, inherited):
-                        continue
-                    writers.append((Path(called).name, inner_name))
-                    with self.subTest(workflow=called, job=inner_name):
-                        self.assertNotIn("uses", inner)
-                        self.assertEqual(pinned_action_problems(inner_name, inner), [])
-        self.assertTrue(nested, "wac-ci calls its gates as nested workflows")
+                with self.subTest(workflow=path.name, job=job_name):
+                    self.assertEqual(pinned_action_problems(job_name, job), [])
+        for name in ("wac-cd.yml", "wac-ci.yml", "actionlint.yml", "techdocs.yml", "agents-md.yml",
+                     "nextjs-site-check.yml", "nextjs-site-deploy.yml"):
+            self.assertIn(name, reusable)
         for expected in (("wac-cd.yml", "publish"), ("wac-cd.yml", "github-release"), ("wac-cd.yml", "plan"),
-                         ("wac-ci.yml", "contract")):
+                         ("wac-ci.yml", "contract"), ("nextjs-site-deploy.yml", "build-and-deploy")):
             self.assertIn(expected, writers)
+        self.assertIn(("nextjs-site-deploy.yml", "build-and-deploy"), id_token)
 
     def test_the_pinned_action_rule_names_each_way_in(self):
         self.assertEqual(len({uses.split("@")[0] for uses in PINNED_ACTIONS}), len(PINNED_ACTIONS),
@@ -802,21 +795,18 @@ class ReusableWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(problems), 1, problems)
                 self.assertIn(expected, problems[0])
         self.assertEqual(pinned_action_problems("job", {"steps": [good, {"run": "true"}]}), [])
-        for label, doc, job, inherited, expected in (
-            ("contents write", {}, {"permissions": {"contents": "write"}}, None, True),
-            ("packages write", {}, {"permissions": {"contents": "read", "packages": "write"}}, None, True),
-            ("id-token write", {}, {"permissions": {"id-token": "write"}}, None, True),
-            ("write-all", {}, {"permissions": "write-all"}, None, True),
-            ("read only", {}, {"permissions": {"contents": "read", "packages": "read"}}, None, False),
-            ("the workflow's", {"permissions": {"contents": "write"}}, {"steps": []}, None, True),
+        for label, doc, job, expected in (
+            ("contents write", {}, {"permissions": {"contents": "write"}}, True),
+            ("packages write", {}, {"permissions": {"contents": "read", "packages": "write"}}, True),
+            ("id-token write", {}, {"permissions": {"id-token": "write"}}, True),
+            ("write-all", {}, {"permissions": "write-all"}, True),
+            ("read only", {}, {"permissions": {"contents": "read", "packages": "read"}}, False),
+            ("the workflow's", {"permissions": {"contents": "write"}}, {"steps": []}, True),
             ("the job's over the workflow's", {"permissions": {"contents": "write"}},
-             {"permissions": {"contents": "read"}}, None, False),
-            ("the caller's", {}, {"steps": []}, {"pull-requests": "write"}, True),
-            ("the callee's over the caller's", {"permissions": {"contents": "read"}}, {"steps": []},
-             {"contents": "write"}, False),
+             {"permissions": {"contents": "read"}}, False),
         ):
             with self.subTest(permissions=label):
-                self.assertIs(holds_write(doc, job, inherited), expected)
+                self.assertIs(holds_write(doc, job), expected)
 
     def token_step_env(self, head):
         """The env each run step of a token job gets in the planted-repository run, keyed by job and step."""

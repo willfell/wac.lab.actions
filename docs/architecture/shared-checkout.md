@@ -13,7 +13,8 @@ exact commit the caller pinned.
 - env:
     SHARED_WORKFLOW_SHA: ${{ job.workflow_sha }}
   run: '[[ "$SHARED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]'
-- uses: actions/checkout@v4
+- name: Check out the shared scripts (actions/checkout v7.0.1)
+  uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
   with:
     repository: willfell/wac.lab.actions
     ref: ${{ job.workflow_sha }}
