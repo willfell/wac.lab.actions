@@ -99,6 +99,22 @@ class Unreachable(ReleaseError):
     """The gateway could not be reached or dropped the answer."""
 
 
+class Unanswered(Unreachable):
+    """The connection was refused or reset before any response: nothing is listening.
+
+    The release path treats it as any Unreachable (same message, fails at
+    once). Only wacd-contract.py's plan call tells it apart, to ride out the
+    gateway's Recreate rollout, which leaves a short gap with no endpoint.
+    """
+
+
+def no_connection(error):
+    """Whether a transport error is a refused or reset connection, not TLS or a timeout."""
+    if isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError):
+        error = error.reason
+    return isinstance(error, (ConnectionRefusedError, ConnectionResetError))
+
+
 class Refused(ReleaseError):
     """The gateway answered 403; the message ends with the refusal's sentence."""
 
@@ -166,8 +182,8 @@ def post(body, trust, timeout):
         response = opener.open(request, timeout=timeout)
     except urllib.error.HTTPError as error:
         response = error
-    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
-        raise Unreachable(unreachable) from None
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError) as error:
+        raise (Unanswered if no_connection(error) else Unreachable)(unreachable) from None
     try:
         with response:
             status = response.code if isinstance(response, urllib.error.HTTPError) else response.status

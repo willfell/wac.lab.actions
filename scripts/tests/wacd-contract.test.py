@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -151,7 +152,8 @@ class FetchCase(unittest.TestCase):
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(contract.ci, "URL", getattr(self, "dead_url", gateway.url)))
                 stack.enter_context(patch.object(contract.ci, "oidc_token", self.mint))
-                stack.enter_context(patch.object(contract, "trust_context", lambda: None))
+                if not getattr(self, "keep_trust", False):
+                    stack.enter_context(patch.object(contract, "trust_context", lambda: None))
                 stack.enter_context(patch.object(contract.time, "monotonic", clock.monotonic))
                 stack.enter_context(patch.object(contract.time, "sleep", clock.sleep))
                 stack.enter_context(patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(self.summary)}))
@@ -170,6 +172,13 @@ class FetchCase(unittest.TestCase):
             self.assertNotIn(minted.split(".")[1], everything, "a job token's claims were printed")
         self.assertNotIn(BODY_MARKER, everything, "the gateway's body was printed raw")
         return code
+
+    def fetch_with_trust(self, *responses):
+        self.keep_trust = True
+        try:
+            return self.fetch(*responses)
+        finally:
+            self.keep_trust = False
 
     def outputs(self):
         return dict(line.split("=", 1) for line in self.stdout.splitlines())
@@ -375,13 +384,63 @@ class AnswerTests(FetchCase):
                 self.assertNotIn(contract.REFUSALS["fleet_copy_missing"], self.stderr)
                 self.assertEqual(len(self.gateway.seen), 1)
 
-    def test_a_refused_connection_fails_at_once(self):
+    def dead_port_url(self):
         dead = Gateway((200, {}))
         dead.close()
-        self.dead_url = dead.url
-        code = self.fetch((200, {}), wait=WAIT)
+        return dead.url
+
+    def refused_then(self, refusals):
+        """Send the first `refusals` attempts to a closed port, the rest to the stub gateway."""
+        real_post = contract.release.post
+        dead = self.dead_port_url()
+        attempts = []
+
+        def post(body, trust, timeout):
+            attempts.append(timeout)
+            url = dead if len(attempts) <= refusals else self.gateway.url
+            with patch.object(contract.ci, "URL", url):
+                return real_post(body, trust, timeout)
+
+        return patch.object(contract.release, "post", post), attempts
+
+    def test_a_gateway_restart_is_ridden_out(self):
+        """The gateway is Recreate: a rollout leaves about 35 s with no endpoint behind it."""
+        spy, attempts = self.refused_then(2)
+        with spy:
+            code = self.fetch(answer(None), wait=WAIT)
+        self.assertEqual(code, 0, self.stderr)
+        self.assertEqual(self.outputs()["source"], "files")
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(self.minted), 3, "each attempt mints its own token")
+        self.assertEqual(len(self.gateway.seen), 1)
+        self.assertEqual(self.clock.sleeps, [5, 10])
+
+    def test_refusals_past_the_restart_window_could_not_be_reached(self):
+        self.dead_url = self.dead_port_url()
+        with patch.object(contract, "RESTART_WINDOW", 20):
+            code = self.fetch((200, {}), wait=WAIT)
         self.assertRefused(code, "could not be reached")
-        self.assertEqual(len(self.minted), 1, "a refused connection is not retried, as for a release")
+        self.assertGreater(len(self.minted), 1)
+        self.assertLess(self.clock.now - 1000.0, 20 + contract.MAX_POLL_SECONDS)
+
+    def test_the_restart_window_never_outlasts_the_wait(self):
+        self.dead_url = self.dead_port_url()
+        code = self.fetch((200, {}), wait=12)
+        self.assertRefused(code, "could not be reached")
+        self.assertLessEqual(self.clock.now - 1000.0, 12)
+
+    def test_the_restart_window_is_ninety_seconds(self):
+        self.assertEqual(contract.RESTART_WINDOW, 90)
+
+    def test_a_tls_failure_fails_at_once(self):
+        """Wrong trust or address is not a restart: an https request to a plain-http port."""
+        gateway = Gateway((200, {"copy": None, "fleet_commit": None}))
+        self.addCleanup(gateway.close)
+        self.dead_url = gateway.url.replace("http://", "https://")
+        with patch.object(contract, "trust_context", ssl.create_default_context):
+            code = self.fetch_with_trust((200, {}))
+        self.assertRefused(code, "could not be reached")
+        self.assertEqual(len(self.minted), 1)
         self.assertEqual(self.clock.sleeps, [])
 
     def test_a_slow_answer_is_waited_for_with_the_whole_time_left(self):

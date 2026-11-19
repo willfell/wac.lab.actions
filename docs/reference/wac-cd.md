@@ -188,9 +188,18 @@ summary line rather than the job timeout. The interval starts at 5 seconds and
 doubles up to 30, so a long outage costs about two requests a minute. Each
 request may wait the whole time left for its answer, as `deploy`'s requests
 do, because the gateway checks the caller against `main` with several GitHub
-calls before it reads wac.fleet and can be slow. A refused or reset connection
-or a TLS failure fails at once, as for a `release`, and so does a request
-still unanswered at the deadline; both read `could not be reached`.
+calls before it reads wac.fleet and can be slow. A TLS failure (wrong trust
+or address) fails at once, as for a `release`, and so does a request still
+unanswered at the deadline; both read `could not be reached`.
+
+**A gateway restart is ridden out.** The gateway's Deployment is `Recreate`,
+so a rollout leaves about 35 seconds with no endpoint, and from `v1.35.0`
+every release's first step calls it. In the `contract` call only, a
+connection refused or reset before any response is retried with a fresh
+token and the same back-off for at most 90 seconds from the first refusal in
+a row, and never past the wait above; after that it reads `could not be
+reached`. `deploy`'s own calls are unchanged: there a refused connection
+still fails at once.
 
 Every other `plan` step has its own `timeout-minutes` (one to six minutes), so
 only the gateway wait can use the job's 40 minutes: a stalled checkout,

@@ -37,7 +37,11 @@ as `deploy`'s requests do: the gateway first checks the caller's revision
 against main with several GitHub calls and can be slow under a slow GitHub,
 and a slow answer is still an answer. A refused or reset connection or a TLS
 failure fails at once, as it does for a `release`, and so does a timeout at
-the deadline. The interval between 503s starts at FIRST_POLL_SECONDS and
+the deadline. The one exception is a connection refused or reset before any
+response (the gateway's Recreate rollout leaves about 35 s with nothing
+listening): that is retried with a fresh token and the same back-off for at
+most RESTART_WINDOW seconds from the first refusal in a row, and then fails
+as unreachable. The interval between 503s starts at FIRST_POLL_SECONDS and
 doubles up to MAX_POLL_SECONDS, so a long outage costs about two requests a
 minute. A 403 is a denial, told
 apart from a 503 by its status, never its body: a coded one carries one of
@@ -82,6 +86,10 @@ MAX_WAIT = release.MAX_WAIT
 # and a workflow test ties the two. A larger wait_timeout still bounds deploy,
 # but plan stops here so it fails with its summary line, not the job timeout.
 PLAN_WAIT_CAP = 2100
+# The gateway's Deployment is Recreate: a rollout leaves about 35 s with no
+# endpoint. A refused or reset connection is retried for at most this long
+# from the first refusal in a row, and never past the overall wait.
+RESTART_WINDOW = 90
 FILES_PROFILE = Path(".github") / "wacd.json"
 SOURCES = ("files", "hemi")
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -146,9 +154,15 @@ def trust_context():
 
 
 def post(trust, timeout):
-    """One contract request with a token minted for it: (status, parsed body or None, token)."""
+    """One contract request with a token minted for it: (status, parsed body or None, token).
+
+    A refused or reset connection passes through as release.Unanswered for
+    ask() to retry; any other transport failure is final.
+    """
     try:
         return release.post(CONTRACT_BODY, trust, timeout)
+    except release.Unanswered:
+        raise
     except release.Unreachable:
         raise Refusal(SENTENCES["unreachable"]) from None
     except ci.ReleaseError:
@@ -156,11 +170,27 @@ def post(trust, timeout):
 
 
 def ask(trust, wait):
-    """The gateway's 200 answer and the token that got it; 503 is retried within wait seconds."""
+    """The gateway's 200 answer and the token that got it.
+
+    A 503 is retried within wait seconds; a refused or reset connection
+    within RESTART_WINDOW seconds of the first refusal in a row, and never past
+    wait. Each retry mints a fresh token and backs off as a 503 does.
+    """
     deadline = time.monotonic() + wait
     interval = FIRST_POLL_SECONDS
+    refused_since = None
     while time.monotonic() < deadline:
-        status, value, token = post(trust, max(1, deadline - time.monotonic()))
+        try:
+            status, value, token = post(trust, max(1, deadline - time.monotonic()))
+        except release.Unanswered:
+            now = time.monotonic()
+            refused_since = now if refused_since is None else refused_since
+            if now - refused_since >= RESTART_WINDOW:
+                raise Refusal(SENTENCES["unreachable"]) from None
+            time.sleep(min(interval, RESTART_WINDOW - (now - refused_since), max(0, deadline - now)))
+            interval = min(interval * 2, MAX_POLL_SECONDS)
+            continue
+        refused_since = None
         if status == 200:
             return value, token
         if status == 403:
@@ -172,6 +202,8 @@ def ask(trust, wait):
             raise Refusal(SENTENCES["status"].format(status=status))
         time.sleep(min(interval, max(0, deadline - time.monotonic())))
         interval = min(interval * 2, MAX_POLL_SECONDS)
+    if refused_since is not None:
+        raise Refusal(SENTENCES["unreachable"])
     raise Refusal(SENTENCES["unavailable"].format(wait=wait))
 
 
